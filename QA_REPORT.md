@@ -1,81 +1,92 @@
-# Fillip QA round 6
+# Fillip QA round 7
 
-Head: `09f5abd` (`09f5abdcf7ee24aa54c1889c7a3c28bfedb2c943`) on PR #1.
+Head: `e24b51b` (`e24b51bcb219a5ba11f10fdc76452b6ffe9a13e8`) on PR #1.
 Product code was not changed. New tests and this report are the only additions.
 
-The author said 251 tests pass. Before `tests/qa/round6.test.ts`, this head is **251 passed, 0 failed**. `npx tsc -p tsconfig.json --noEmit` exits 0. With the new file the suite is **262 passed, 1 failed (263)**.
+The author said 279 tests pass and PR #7's test is unchanged. Before `tests/qa/round7.test.ts`, this head is **279 passed, 0 failed**. `tests/qa/round6.test.ts` has an empty diff from `ccf1563`. `npx tsc -p tsconfig.json --noEmit` exits 0. With the new file the suite is **289 passed, 3 failed (292)**.
 
-Severity: **0 blockers, 1 major, 0 minors**.
+Severity: **0 blockers, 3 majors, 0 minors**.
 
-Fillip does not pass code QA. The round-5 success-view and duplicate-notice majors are fixed. One over-cap invariant is not: a cap error can be returned for a row that was kept.
+Fillip does not pass code QA.
 
-Cap, daily, and notice-claim races use Postgres 16 at `127.0.0.1`, role `fillip_qa`, database `fillip_round6`, loaded from `supabase/schema.sql`. Each insert race uses its own session (12 clients). The notice claim uses a pool of 16 and 14 parallel `claimNotice` calls. The hosted over-cap cases use a double that answers the same PostgREST paths `refuseIfReadOverCap` calls.
+Cap races and the token hook use Postgres 16 at `127.0.0.1`, role `fillip_qa`, database `fillip_round7`. Both `supabase/schema.sql` and `supabase/oauth_resource_binding.sql` are applied. The hook is called as `public.fillip_access_token_hook`. Sign-in cases use the Fillip process in front of a GoTrue stand-in.
 
 ## Assertion diff
 
-Compared test files from `cd55d42` (`qa/bellion-fillip-5`) to `09f5abd`. Seven test files changed (`+268/−37`). No `it.skip`, `describe.skip`, `test.skip`, `xit`, or `xdescribe`.
+Compared test files from `ccf1563` (`qa/bellion-fillip-6`) to `e24b51b`. Nine test files changed. `tests/qa/round6.test.ts` did not. No `it.skip`, `describe.skip`, `test.skip`, `xit`, or `xdescribe`.
 
-Accepted, and checked on this head:
+Not weakened:
 
-- `tests/qa/round4.test.ts` renames the tied-timestamp case and expects the free-plan cap error, including the upgrade sentence, with `deleted` equal to `[freshId]`. Older ids stay out of `deleted`. That matches the new design. The test passes inside the 251.
-- `tests/qa/round5.test.ts` renames the sibling and expects the same throw, `deleted` length 1 equal to this call's id, the older id still stored, and `getReminder` of the new id null. That passes inside the 251. The round-5 Telegram `QA-FAIL` was not edited, and it passes on this head.
-- `tests/qa/round3.test.ts` changes the trigger-less hosted double from "active ≤ 10" to "9 or 10 active, the original 9 remain, at least one rejection, and every fulfilled id is still stored." That range is accepted for the double. Real Postgres does not use the range: twelve parallel inserts at nine open leave exactly ten (one success, eleven raise the free-plan sentence, all nine older rows remain).
-- `tests/schema-reapply.test.ts` and the round-4 reserve calls pass `null::integer, null::timestamptz` because the 3-argument `fillip_reserve_ping` was dropped. The reapply test now expects that identity to be gone, and a second daily call at the cap still returns `-1`. That is tighter, and it matches the schema. Calling the old 3-argument form throws. A newer `day_start` resets `emails_sent_today` to 1.
-
-Judged, not filed:
-
-- Consent HTML order changed in `tests/qa/round4.test.ts`, `tests/http.test.ts`, and `tests/oauth-pkce-consent.test.ts`. The old expect was: unhide consent before any `redirect_url` assignment, and do not contain `if(details.data.redirect_url){location.assign(...)}`. The new expect requires `if(details.data&&details.data.redirect_url){location.assign(details.data.redirect_url);return}` before the PKCE proof fetch, before the client read, and before `el('consent').hidden=false`. `supabase/README-oauth.md` states that when the details already include `redirect_url` the page assigns it immediately and does not approve again, because a second approve burns the single-use code. When `redirect_url` is absent, Connect is still shown. Fillip's own `GET /oauth/authorize` still rejects `plain` and a missing S256 challenge. This replaces the round-4 "consent before any redirect" check. It is a documented contract change, not a silent weaken of an unchanged path.
-- `tests/oauth-signin.test.ts` adds a vm check that sign-in uses `signInWithOtp` with `shouldCreateUser: true` and `verifyOtp` of type `email`. Nothing previous was removed.
-
-## Round-5 majors, checked again
-
-| Round 5 finding | On 09f5abd |
-| --- | --- |
-| A hosted read over the cap deletes the inserted row and still returns it as saved | Fixed for the success-view half. The tool is `isError`, the body has no `"status":"active"`, `deleted` is `[own id]`, the older id stays active, and a later read of the new id is empty. A list inside the cap returns the new row and deletes nothing. The kept-row half below is the remaining major. |
-| Telegram past the lease emails the miss once per worker | Fixed. Fourteen workers that do not share a process send one notice. A later job sends 0. Telegram `sendMessage` is not called. |
+- The round-6 keep-or-throw test is byte-for-byte the same. On this head it passes: a DELETE that leaves the row does not throw, and the row stays `active`. If a throw does happen, the test still requires the row to be gone.
+- `tests/qa/round5.test.ts` adds cases. A DELETE that returns its id throws the free-plan sentence and is not repeated. A service-role retry that removes the row throws. A retry that leaves the row returns it with the over-cap note. The old "still returns it as saved" test still expects `isError` and passes, because an empty DELETE plus a re-read that finds the row gone is an error.
+- `tests/qa/round4.test.ts` changes the tied-timestamp expect from `The free plan allows 10 open reminders` to `You're over the free plan's 10 open reminders`. That double's DELETE returns `[]` and the following GET still lists the new id, so `createReminder` throws `OpenCapKeptError`. The DELETE is still only the inserted id. The tool path turns that error into a saved view. This matches the new design. It also expects `fillip_code_attempts` to be unreadable by `authenticated`.
+- `tests/qa/round3.test.ts`, `tests/oauth-signin.test.ts`, and `tests/http.test.ts` replace `signInWithOtp` / `verifyOtp` with `POST /auth/code/send` and `POST /auth/code/verify`. The identical-response check for an unknown email is still there. `tools/list` with a bad bearer is a new 401 `invalid_token` expect. `delete_reminder` must set `destructiveHint` and must not say permanently, erases, or cannot be undone.
+- `tests/schema-reapply.test.ts` adds the attempt table: RLS on, no SELECT for `authenticated`, `subject_hash` present, no `email` or `code` column.
+- `tests/code-auth.test.ts` and the new `tests/crud.test.ts` cases are additions. The author lockout test expects a new send to clear the counter. That is the behavior below, not a hidden skip.
 
 ## Findings
 
 | Severity | What happens | Expected | Actual | Test |
 | --- | --- | --- | --- | --- |
-| Major | The over-cap DELETE is acknowledged and the new row is still stored | Do not return the cap error for a row that was kept | Throws the free-plan error and `getReminder` still returns that row as `active` | `QA-FAIL: a cap error is not returned when the delete leaves that row in place` |
+| Major | Two live S256 codes share a user, client, and scope | The token still gets the `/mcp` audience | `aud` stays `authenticated`. `/mcp` answers 401 `invalid_token` | `QA-FAIL: two live S256 codes for one reconnect still receive the audience` |
+| Major | Over-cap DELETE and the re-read both throw after the row was removed | Do not return that row as saved | `setReminder` returns `status: "active"` and a later read is empty | `QA-FAIL: a failed re-read after a delete does not claim a removed row was saved` |
+| Major | Five wrong emailed codes | The lock survives a new send and a changed IP header | A new send clears it. `X-Forwarded-For` moves the per-IP verify cap | `QA-FAIL: five wrong codes stay locked after a new send and after a changed IP header` |
 
-### Major: a cap error for a row that was kept
+### Major: two agreeing S256 codes are a 401
 
-`refuseIfReadOverCap` deletes `id=eq.<saved.id>` and then always throws `OpenCapError`. It does not read the row back. PostgREST answers a DELETE that matches nothing with success (`Prefer: return=minimal` is an empty 204). The function comment says the throw exists so the caller is not told it failed while that row stays due. The throw still happens when the row stays.
+`fillip_access_token_hook` counts approved, unexpired `auth.oauth_authorizations` rows for the same client, user, and scope with a non-null `authorization_code`. The audience is added only when that count is exactly 1, every row's resource equals `mcp_resource`, and every `code_challenge_method` is `s256`. The hook payload has no authorization id. `auth.sessions`, as this hook is allowed to read it, has no authorization id either.
 
-A list that is already inside the cap returns without deleting. On real Postgres the `BEFORE INSERT OR UPDATE` trigger holds the same cap, so this branch does not run for a normal insert. The branch runs when the active list comes back longer than `open.cap`. If that DELETE then matches nothing, the tool error and the live reminder disagree.
+Two rows that both use S256 and both name `https://fillip.example/mcp` produce `aud` of `authenticated` only. `validateMcpClaims` then throws `Reconnect Fillip`. `POST /mcp` turns that into 401 with `error="invalid_token"`.
+
+That is a normal second code, not only an attacker. A double-click on Connect, two tabs, or a reconnect while the earlier code is still approved and unexpired creates two issued codes for the same client, user, and scope. Supabase can skip the consent page when a session cookie and an existing grant are already present, so both clicks can be issued without a second approval. The author's test covers one evil resource beside one real resource. That disagreement should still be refused. Two legitimate rows should not.
+
+One S256 grant is bound. A second user with their own grant is bound. A grant whose resource is null is not bound.
+
+Proposed rule: add the audience when every unexpired approved code for that client, user, and scope agrees: resource string-equals `mcp_resource` and `code_challenge_method` is `s256`. The count may be greater than 1. Withhold the audience when any of those rows has a different resource, a null resource, or a method other than `s256`. If a later Supabase session column or hook claim carries the authorization id, match that id and ignore the other rows.
+
+A grant with no resource gets no audience. Confirmed. The risk: a client that omits `resource` can never call `/mcp`, even with S256, and Fillip cannot tell that client from a grant that named the wrong resource. The README states this residual. It is not a separate defect.
+
+### Major: a thrown re-read says a removed reminder was saved
+
+The three steady paths match the design.
+
+- DELETE `Prefer: return=representation` returns the id. The call throws `The free plan allows 10 open reminders`. The row is gone. The older row stays.
+- DELETE returns `[]` and the re-read still finds the row. `setReminder` returns `status: "active"` and the note `You're over the free plan's 10 open reminders. Upgrade to Pro for a higher allowance. The trial is 14 days, then Pro.` The older row stays.
+- DELETE returns `[]` and the re-read finds nothing. The call throws. The row is gone.
+
+`rowStillStored` returns true when the re-read throws, and when the body is the empty-representation marker. `refuseIfReadOverCap` then throws `OpenCapKeptError`. `createOrRefuse` turns that into a saved view. A DELETE that removes the row and then throws, followed by a re-read that throws, still returns that view. A later `getReminder` is null. The log line is `open_cap_delete_failed` and does not include the reminder text.
 
 Repro:
 
-1. The pre-insert active count stays under 10, so the create is allowed and the insert returns the new row.
-2. The post-insert active list is longer than 10.
-3. `DELETE` for the new id is acknowledged and does not remove the row.
-4. Call `setReminder` with `what: "still due"`.
+1. The post-insert active list is longer than 10.
+2. DELETE of the new id removes it and the HTTP call throws.
+3. The follow-up GET of that id throws.
+4. Call `setReminder`.
 
-The call throws `The free plan allows 10 open reminders...`. `getReminder` of the deleted id still returns `status: "active"`. The older id is not deleted. The user is told the reminder was not saved, and it remains due.
+The result is a reminder view with `status: "active"` and the over-cap note. The row is not stored.
+
+### Major: the five-wrong lock does not stick
+
+After five wrong codes the email answers 429 `Too many wrong codes. Request a new one.` A verify from a different `X-Forwarded-For` stays 429. That part holds. `POST /auth/code/send` then sets `wrong_count` back to 0, and the next correct code returns session tokens. The stand-in saw the verify. `supabase/README-oauth.md` says a new send resets the count, so the README matches the code. The lock the user was promised does not.
+
+`app.set("trust proxy", 1)` and `requestIp` uses `req.ip`. Ten wrong verifies from `203.0.113.10` are refused on that address. The eleventh, `203.0.113.99`, is accepted and the code `123456` returns tokens. The per-IP cap of 10 verifies and 5 sends in five minutes moves with the header. Together with the reset, a new header and a new send start the five guesses over.
+
+Existing and unknown emails both get 200 and `If that email can sign in, a code is on its way.` The unknown address is the GoTrue `otp_disabled` body. It is not repeated to the browser.
 
 ## What passed
 
-Over-cap, when the DELETE does remove the row: `set_reminder` is `isError: true`, the text matches the free plan, there is no `"status":"active"`, `deleted` is exactly the inserted id, and the older id is still active.
+Repeat edit: `snooze_or_reschedule` with `repeat: weekly` keeps the same id, leaves one row, and does not write a cancelled row or an "older copy". A rejected create (14 March 2027 2:30am America/New_York, a past time, and unreadable text) throws before any reminder POST. No cancelled row is written.
 
-Telegram not-delivered notice: 14 parallel memory workers send exactly one email, key `fillip/<id>/<fireAt>/not-delivered`. A retry job sends 0. `createResendSender` puts that key on the `Idempotency-Key` header. On Postgres, 14 parallel `claimNotice` inserts produce one row. A later claim returns false. Email and Telegram ping rows for the same occurrence still insert beside that one `not-delivered` row. The partial unique index is `(reminder_id, occurrence_at, kind) WHERE kind = 'not-delivered'`.
+`delete_reminder` title is `Delete reminder`, the description is `Removes a reminder the user asked to delete.`, `destructiveHint` is true, and the tool JSON does not say permanently, erases, cannot be undone, destroy, or wipe.
 
-A missed repeating email in `America/New_York`, fire time `2026-10-11T15:30:00.000Z`, lists `delayed` and `Your 11:30 AM ping on Oct 11 couldn't be sent.` plus `NOT_DELIVERED_NOTE`. The note does not say `3:30 PM`. Zero provider sends. A one-time email three minutes past the lease is retried once on `fillip/<id>/<fireAt>` and the list says Fillip retried it, without that repeating line. A one-time attempt older than 24 hours sends 0 and lists `NOT_DELIVERED_NOTE` without that line. A repeating Telegram miss lists `NOT_DELIVERED_NOTE` and does not say `11:30 AM`.
+`tools/list` with no bearer is 200. `tools/list` with `Bearer not-a-jwt` is 401, `WWW-Authenticate` contains `error="invalid_token"`, and the body is `Authentication required.`
 
-## Regression sweep
+Sign out everywhere, with that user's bearer and `X-Fillip-Request: 1`, deletes only that user's grant (`token-a:client-a`) and posts `/auth/v1/logout?scope=global` with that bearer. The other user's grant is untouched. Those are the calls Fillip makes. GoTrue is what turns global logout into revoked sessions and refresh tokens.
 
-The 251 already re-ran the earlier suites, including the rewritten cap and consent expects. No skip was added. Extra adversarial cases on this head:
+README residuals that were checked against the code: identical send text, `otp_disabled` on public `/otp` with `create_user=false`, refresh-token reuse and `refresh_token_already_used`, S256 required for the audience, a null resource gets no audience, two issued codes that share a scope are not bound, and sign-out uses `POST /auth/v1/logout?scope=global`. They match this build. The two-code sentence is accurate and is the first major. Copy in README, src, public, glama.json, server.json, and `supabase/README-oauth.md` has no `$`+digit, USD, dollars, SMS, Slack notification, push notification, WhatsApp, or iMessage.
 
-| Earlier area | Case | Result |
-| --- | --- | --- |
-| Open cap (rounds 3–5) | 12 real inserts at 9 open | Exactly 10 active. The original 9 remain. Eleven raise the free-plan sentence. |
-| Daily counter (rounds 4–5) | Call the dropped 3-argument reserve, then a new local day at a full daily counter | The 3-argument call throws. `emails_sent_today` becomes 1. |
-| Notice claim (round 5) | 14 workers, then a retry, with both ping channels already stored | One claim wins. The retry loses. Both ping rows remain. |
-| Over-cap read (round 5) | Delete removes the new id; a second case stays inside the cap | Error and no success view; the inside-cap row is returned and nothing is deleted. |
-| Missed ping (round 5) | Repeating email, one-time inside 24h, one-time past 24h, repeating Telegram | Local time only on the repeating email. One retry key inside 24h. No second Telegram send. |
-| DST (rounds 3–4) | 14 March 2027 2:30am and 1 November 2026 1:30am, America/New_York | Gap is refused and nothing is stored. The fold saves and the note says ambiguous. |
-| End date and pause (rounds 2–3) | `every 2 weeks until March 31, 2027`, then pause, then `repeat: weekly` | `ends.until` is the exclusive instant `2027-04-01T00:00:00.000Z`. The row stays paused. |
-| PKCE and copy (rounds 3–4) | `plain`, empty S256, and a walk of README, src, public, glama.json, server.json | `plain` and a missing challenge are `invalid_request`. S256 with a challenge is accepted on Fillip's route. No `$`+digit, USD, or dollars. No SMS, Slack notification, push notification, WhatsApp, or iMessage. |
+Twelve real inserts at nine open leave exactly ten. The original nine remain. One S256 grant receives the audience. Plain PKCE is still `invalid_request` on Fillip's own authorize check.
 
-Copy does not advertise a channel or a price that is not implemented. The README says this page does not print a price, and it says Telegram tools are absent when the bot token is unset.
+## Regression
+
+The 279 re-ran every earlier suite, including the unchanged round-6 file, and all passed. The extra cases above cover the open cap, the token hook, in-place edits, rejected creates, delete wording, `tools/list`, emailed codes, sign-out, and copy.
