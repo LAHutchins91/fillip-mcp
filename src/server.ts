@@ -240,7 +240,10 @@ function serviceDb(): Db {
 }
 
 function createUserStore(userId: string, token: string): ReminderStore {
-  if (envValue("SUPABASE_URL") && token) return new SupabaseFillipStore(userId, userDb(token), "user");
+  if (envValue("SUPABASE_URL") && token) {
+    const writer = envValue("SUPABASE_SERVICE_ROLE_KEY") ? serviceDb() : null;
+    return new SupabaseFillipStore(userId, userDb(token), "user", writer);
+  }
   return new FileFillipStore(path.join(DATA_DIR, `${userId}.json`));
 }
 
@@ -553,8 +556,39 @@ app.options("/mcp", (req, res) => {
   res.status(204).end();
 });
 
+function mcpLogIds(token: string): { userId: string | null; clientId: string | null } {
+  const empty = { userId: null, clientId: null };
+  const payload = token.split(".")[1];
+  if (!payload) return empty;
+  try {
+    const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { sub?: unknown; client_id?: unknown };
+    return {
+      userId: typeof claims.sub === "string" ? claims.sub : null,
+      clientId: typeof claims.client_id === "string" ? claims.client_id : null
+    };
+  } catch {
+    return empty;
+  }
+}
+
 app.post("/mcp", ensureStreamableHttpAccept, async (req, res) => {
   if (!guardMcpOrigin(req, res)) return;
+  const started = Date.now();
+  const presented = bearer(req);
+  res.on("finish", () => {
+    const method = typeof req.body?.method === "string" ? req.body.method : "";
+    const called = req.body?.params && typeof req.body.params === "object" ? (req.body.params as { name?: unknown }).name : undefined;
+    const tool = method === "tools/call" && typeof called === "string" ? called : method;
+    const ids = presented ? mcpLogIds(presented) : { userId: null, clientId: null };
+    console.log(JSON.stringify({
+      event: "mcp",
+      userId: ids.userId,
+      clientId: ids.clientId,
+      tool,
+      status: res.statusCode,
+      durationMs: Date.now() - started
+    }));
+  });
   if (!allowPublic(`mcp:${req.ip}`, 300, 60000)) return res.status(429).set("Retry-After", "60").json({ error: "Too many requests. Retry in one minute." });
   let server: McpServer | undefined;
   let actor: Actor = { id: "", email: null, emailVerified: false };
@@ -571,8 +605,9 @@ app.post("/mcp", ensureStreamableHttpAccept, async (req, res) => {
       actor = actorFromUser(auth.user);
       store = createUserStore(actor.id, auth.token);
     } catch {
-      res.set("WWW-Authenticate", `Bearer resource_metadata="${appBaseUrl()}/.well-known/oauth-protected-resource/mcp"`);
-      return res.status(401).json({ error: "Sign in to Fillip to set a reminder." });
+      const metadata = `Bearer resource_metadata="${appBaseUrl()}/.well-known/oauth-protected-resource/mcp"`;
+      res.set("WWW-Authenticate", presented ? `${metadata}, error="invalid_token"` : metadata);
+      return res.status(401).json({ error: "Authentication required." });
     }
     try {
       const state = await subscriptionState(actor.id, bearer(req));

@@ -1,10 +1,10 @@
 import { calendarFeed } from "./ics.js";
 import { OpenCapError, newId, type OpenCap, type ReminderStore, type ServiceStore } from "./store.js";
 import { newSecretToken, telegramDeepLink, telegramUsername } from "./telegram.js";
-import { applyRepeat, attachEndDate, describeRecurrence, nextFire, parseClock, recurrenceFromCadence, resolveWhen, type RepeatChoice, type ResolvedWhen } from "./time.js";
+import { applyRepeat, attachEndDate, describeRecurrence, nextFire, parseClock, recurrenceFromCadence, resolveWhen, WhenError, type RepeatChoice, type ResolvedWhen } from "./time.js";
 import { MAX_ACTIVE_REMINDERS, MAX_CREATES_PER_HOUR, type Actor, type DeliveryChannel, type DigestSettings, type Reminder, type ReminderStatus } from "./types.js";
 import { allowanceFor, assertWithinAllowance, freeOpenMessage, freeOpenReminders, STAND_IN_CAPS, tierFor, type Allowance, type TierCaps } from "./usage.js";
-import { assertTimeZone, formatWhen, localDateKey, zonedParts } from "./zone.js";
+import { assertTimeZone, formatShortWhen, formatWhen, localDateKey, zonedParts } from "./zone.js";
 
 export type ReminderView = {
   id: string;
@@ -41,9 +41,20 @@ export function delayLength(reminder: Pick<Reminder, "fireAt" | "holdUntil" | "s
   return formatDelay(late);
 }
 
+function wouldNextSend(reminder: Reminder, now: Date): string | null {
+  if (reminder.status !== "paused") return null;
+  let when = new Date(reminder.fireAt);
+  if (when.getTime() <= now.getTime() && reminder.recurrence) {
+    const upcoming = nextFire(reminder.recurrence, reminder.timezone, now);
+    if (upcoming) when = upcoming;
+  }
+  return `paused (would next send ${formatShortWhen(when, reminder.timezone)})`;
+}
+
 function view(reminder: Reminder, now: Date, extra?: { corrected?: boolean; note?: string | null }): ReminderView {
   const delay = delayLength(reminder, now);
   const delayed = delay !== null;
+  const note = [extra?.note, wouldNextSend(reminder, now)].filter(Boolean).join(" ") || null;
   return {
     id: reminder.id,
     what: reminder.what,
@@ -60,8 +71,15 @@ function view(reminder: Reminder, now: Date, extra?: { corrected?: boolean; note
     delay,
     overdue: reminder.status === "active" && reminder.fireAt <= now.toISOString(),
     corrected: extra?.corrected ?? false,
-    note: extra?.note ?? null
+    note
   };
+}
+
+function refuseSilentShift(resolved: { note: string | null; fireAt: Date }, accept: boolean | undefined, timeZone: string): void {
+  if (accept || !resolved.note || !/does not exist/i.test(resolved.note)) return;
+  throw new WhenError(
+    `${resolved.note} Fillip did not save that time. Pass accept_shifted_time true to keep ${formatShortWhen(resolved.fireAt, timeZone)}, or give a clock that exists that day.`
+  );
 }
 
 async function gate(store: ReminderStore, actor: Actor, now: Date, caps: TierCaps) {
@@ -132,6 +150,7 @@ export async function setReminder(store: ReminderStore, actor: Actor, input: {
   until?: string;
   context?: string | null;
   channel?: DeliveryChannel;
+  acceptShiftedTime?: boolean;
 }, now: Date, caps: TierCaps = STAND_IN_CAPS, telegramEnabled = false): Promise<ReminderView> {
   await gate(store, actor, now, caps);
   await assertWithinAllowance(store, actor.id, now, caps);
@@ -139,6 +158,7 @@ export async function setReminder(store: ReminderStore, actor: Actor, input: {
   const channel = chosenChannel(input.channel, usage?.defaultChannel, telegramEnabled);
   let resolved = applyRepeat(resolveWhen(input.when, input.timezone, now), input.repeat, input.timezone);
   if (input.until?.trim()) resolved = attachEndDate(resolved, input.until, input.timezone, now);
+  refuseSilentShift(resolved, input.acceptShiftedTime, input.timezone);
   const draft = stamp(actor, input.what, input.context ?? null, input.timezone, resolved, "reminder", channel, now);
   const note = [resolved.note, channelNote(channel)].filter(Boolean).join(" ");
   return createOrRefuse(store, draft, openCapFor(usage, caps), now, { corrected: resolved.corrected, note });
@@ -223,6 +243,9 @@ function applyScheduleEdit(reminder: Reminder, zone: string, now: Date, repeat: 
       const parsed = resolveWhen(repeat, zone, now);
       if (!parsed.recurrence) throw new Error("Fillip could not read that repeat. Try daily, weekdays, every 2 weeks, first Monday of every month, or once to remove it.");
       recurrence = parsed.recurrence;
+      if (!recurrence.ends && reminder.recurrence?.ends && !end?.trim()) {
+        recurrence = { ...recurrence, ends: reminder.recurrence.ends };
+      }
       if (!moved) fireAt = parsed.fireAt.toISOString();
       if (parsed.note) notes.push(parsed.note);
       corrected = corrected || parsed.corrected;
@@ -244,7 +267,7 @@ function applyScheduleEdit(reminder: Reminder, zone: string, now: Date, repeat: 
   return { recurrence, fireAt, notes, corrected };
 }
 
-export async function snoozeOrReschedule(store: ReminderStore, ownerId: string, id: string, until: string | undefined, timezone: string | undefined, now: Date, action: ReminderMove = "reschedule", schedule?: { repeat?: string; end?: string }): Promise<ReminderView> {
+export async function snoozeOrReschedule(store: ReminderStore, ownerId: string, id: string, until: string | undefined, timezone: string | undefined, now: Date, action: ReminderMove = "reschedule", schedule?: { repeat?: string; end?: string }, acceptShiftedTime = false): Promise<ReminderView> {
   const reminder = await store.getReminder(ownerId, id);
   if (!reminder) throw new Error("Reminder not found");
   if (reminder.status === "cancelled" || reminder.status === "completed") {
@@ -268,6 +291,10 @@ export async function snoozeOrReschedule(store: ReminderStore, ownerId: string, 
     updatedAt: now.toISOString()
   };
   const notes = [...edited.notes];
+  if (!acceptShiftedTime && notes.some((note) => /does not exist/i.test(note))) {
+    const shifted = moved?.fireAt ?? new Date(edited.fireAt);
+    refuseSilentShift({ note: notes.find((note) => /does not exist/i.test(note)) ?? "", fireAt: shifted }, false, zone);
+  }
   if (action === "pause") {
     draft = { ...draft, status: "paused", holdUntil: null };
     notes.push("Paused. Fillip will not send this until you resume it.");
@@ -275,6 +302,8 @@ export async function snoozeOrReschedule(store: ReminderStore, ownerId: string, 
     const fireAt = nextOpenFire(draft, zone, now);
     draft = { ...draft, fireAt: fireAt.toISOString(), status: "active", holdUntil: null };
     notes.push(`Resumed. Next ping is ${formatWhen(fireAt, zone)}.`);
+  } else if (reminder.status === "paused") {
+    draft = { ...draft, status: "paused" };
   } else {
     draft = { ...draft, status: "active", holdUntil: null };
     if (moving && moved) notes.push(`Moved to ${formatWhen(moved.fireAt, zone)}.`);
@@ -314,6 +343,7 @@ export async function followUp(store: ReminderStore, actor: Actor, input: {
   timezone: string;
   context?: string | null;
   channel?: DeliveryChannel;
+  acceptShiftedTime?: boolean;
 }, now: Date, caps: TierCaps = STAND_IN_CAPS, telegramEnabled = false): Promise<ReminderView> {
   await gate(store, actor, now, caps);
   await assertWithinAllowance(store, actor.id, now, caps);
@@ -338,6 +368,7 @@ export async function followUp(store: ReminderStore, actor: Actor, input: {
     };
   }
   if (input.until?.trim()) first = attachEndDate(first, input.until, input.timezone, now);
+  refuseSilentShift(first, input.acceptShiftedTime, input.timezone);
   const draft = stamp(actor, input.topic, input.context ?? null, input.timezone, first, "follow_up", channel, now);
   const note = [first.note, followNote(channel, draft.recurrence, input.timezone)].filter(Boolean).join(" ");
   return createOrRefuse(store, draft, openCapFor(usage, caps), now, { corrected: first.corrected, note });

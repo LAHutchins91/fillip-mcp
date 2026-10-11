@@ -76,6 +76,11 @@ export interface ServiceStore extends ReminderStore {
   setProviderBackoffUntil(untilIso: string): Promise<void>;
   saveUsage(ownerId: string, usage: { emailsSentInPeriod: number; emailPeriodStart: string }): Promise<void>;
   /**
+   * True when reserveSend persists emails_sent_in_period itself.
+   * noteSent must not write the counter again from a stale read.
+   */
+  readonly reservePersistsMonthlyCount?: boolean;
+  /**
    * Hold one ping before the provider call.
    * Hosted stores do this with a conditional update so two workers cannot both take the last ping.
    */

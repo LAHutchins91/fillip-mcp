@@ -184,8 +184,17 @@ export class MemoryFillipStore implements ServiceStore {
       this.deliveries.push(delivery);
       return { delivery, outcome: "send" };
     }
-    if (existing.status === "sent" || existing.providerId) return { delivery: existing, outcome: "already-sent" };
-    if (existing.status === "sending" && existing.startedAt > input.staleBeforeIso) {
+    const attempt = existing.providerId === "attempt";
+    const accepted = Boolean(existing.providerId) && !attempt;
+    if (existing.status === "sent" || accepted) return { delivery: existing, outcome: "already-sent" };
+    // Inside the claim lease, "attempt" means the provider may never have been
+    // called, so retry it. After the lease, do not submit again: the process
+    // that wrote the mark may already have been accepted and died before the
+    // sent row was saved.
+    if (attempt && existing.startedAt <= input.staleBeforeIso) {
+      return { delivery: existing, outcome: "already-sent" };
+    }
+    if (existing.status === "sending" && !attempt && existing.startedAt > input.staleBeforeIso) {
       return { delivery: existing, outcome: "in-progress" };
     }
     existing.status = "sending";

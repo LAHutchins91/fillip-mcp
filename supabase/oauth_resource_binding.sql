@@ -35,7 +35,6 @@ declare
   sid uuid;
   resource text;
   expected text;
-  matching boolean;
 begin
   if cid is null or cid = '' then
     return event;
@@ -46,32 +45,41 @@ begin
     return event;
   end if;
 
-  sid := (claims->>'session_id')::uuid;
-  select r.resource into resource from fillip_private.oauth_resources r where r.session_id = sid;
+  begin
+    sid := (claims->>'session_id')::uuid;
+  exception when others then
+    sid := null;
+  end;
 
-  -- Bind on the approved authorization for this resource, including a refresh
-  -- whose session row was never stored. Another client's authorization must
-  -- not make bool_and fail the match. Trailing slashes are ignored.
-  if resource is null then
-    select exists (
-      select 1
-        from auth.oauth_authorizations a
-       where a.client_id = cid::uuid
-         and a.user_id = (claims->>'sub')::uuid
-         and a.status::text = 'approved'
-         and a.expires_at > now()
-         and rtrim(a.resource, '/') = rtrim(expected, '/')
-    ) into matching;
-    if matching and sid is not null then
-      resource := expected;
+  if sid is not null then
+    select r.resource into resource from fillip_private.oauth_resources r where r.session_id = sid;
+  end if;
+
+  -- A stored session covers refresh. The audience is added only when that
+  -- stored value still equals mcp_resource exactly. A missing session row
+  -- uses the latest approved authorization for this client and user, and
+  -- only when its resource string-equals mcp_resource. Another client's
+  -- authorization does not count. Trailing slashes are not trimmed.
+  if resource is null and sid is not null then
+    select a.resource into resource
+      from auth.oauth_authorizations a
+     where a.client_id = cid::uuid
+       and a.user_id = (claims->>'sub')::uuid
+       and a.status::text = 'approved'
+       and a.expires_at > now()
+     order by a.created_at desc
+     limit 1;
+    if resource is not null and resource = expected then
       insert into fillip_private.oauth_resources (session_id, resource)
       values (sid, resource)
       on conflict do nothing;
+    else
+      resource := null;
     end if;
   end if;
 
-  if resource is not null then
-    claims := jsonb_set(claims, '{aud}', jsonb_build_array('authenticated', resource));
+  if resource is not null and resource = expected then
+    claims := jsonb_set(claims, '{aud}', jsonb_build_array('authenticated', expected));
   end if;
 
   return jsonb_set(event, '{claims}', claims);

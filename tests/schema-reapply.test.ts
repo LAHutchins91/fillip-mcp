@@ -94,9 +94,11 @@ describe("schema re-run", () => {
       expect(policies.rows.map((row) => row.polname)).toEqual([
         "deliveries_owner_delete",
         "deliveries_owner_select",
-        "digest_owner",
+        "digest_owner_delete",
+        "digest_owner_select",
         "profiles_select",
-        "reminders_owner"
+        "reminders_owner_delete",
+        "reminders_owner_select"
       ]);
       for (const row of policies.rows) {
         expect(row.qual ?? "", row.polname).toMatch(/select auth\.uid\(\)/i);
@@ -111,6 +113,7 @@ describe("schema re-run", () => {
       `);
       expect(functions.rows.map((row) => row.proname)).toEqual(expect.arrayContaining([
         "fillip_enforce_open_cap",
+        "fillip_reserve_ping",
         "fillip_set_mail_opt_in",
         "handle_new_fillip_user"
       ]));
@@ -129,6 +132,83 @@ describe("schema re-run", () => {
       ]);
     } finally {
       await db.end();
+    }
+  });
+
+  it("rejects an authenticated insert and update on reminders and still allows select and delete", async () => {
+    const db = client(database);
+    await db.connect();
+    const owner = "11111111-1111-4111-8111-111111111111";
+    const reminderId = "12121212-1212-4121-8121-121212121212";
+    try {
+      await db.query("insert into auth.users (id) values ($1) on conflict do nothing", [owner]);
+      await db.query(
+        `insert into public.reminders (id, owner_id, kind, what, timezone, fire_at, status)
+         values ($1, $2, 'reminder', 'Own', 'UTC', now() + interval '1 day', 'active')`,
+        [reminderId, owner]
+      );
+      await db.query("select set_config('request.jwt.claim.sub', $1, false)", [owner]);
+      await db.query("set role authenticated");
+      await expect(db.query(
+        `insert into public.reminders (id, owner_id, kind, what, timezone, fire_at, status)
+         values ('13131313-1313-4131-8131-131313131313', $1, 'reminder', 'Blocked', 'UTC', now() + interval '1 day', 'active')`,
+        [owner]
+      )).rejects.toThrow(/permission denied|42501/);
+      await expect(db.query("update public.reminders set what = 'nope' where id = $1", [reminderId])).rejects.toThrow(/permission denied|42501/);
+      const seen = await db.query("select id from public.reminders where id = $1", [reminderId]);
+      expect(seen.rowCount).toBe(1);
+      const removed = await db.query("delete from public.reminders where id = $1", [reminderId]);
+      expect(removed.rowCount).toBe(1);
+    } finally {
+      await db.query("reset role").catch(() => undefined);
+      await db.end();
+    }
+  });
+
+  it("lets only one of two connections pass the free open cap, and reserves two pings", async () => {
+    const owner = "14141414-1414-4141-8141-141414141414";
+    const setup = client(database);
+    await setup.connect();
+    try {
+      await setup.query("insert into auth.users (id) values ($1) on conflict do nothing", [owner]);
+      await setup.query(
+        `insert into public.reminders (id, owner_id, kind, what, timezone, fire_at, status)
+         select gen_random_uuid(), $1, 'reminder', 'n' || g, 'UTC', now() + interval '1 day', 'active'
+         from generate_series(1, 9) g`,
+        [owner]
+      );
+    } finally {
+      await setup.end();
+    }
+    const left = client(database);
+    const right = client(database);
+    await left.connect();
+    await right.connect();
+    try {
+      const insert = `insert into public.reminders (id, owner_id, kind, what, timezone, fire_at, status)
+        values (gen_random_uuid(), $1, 'reminder', $2, 'UTC', now() + interval '1 day', 'active')`;
+      const raced = await Promise.allSettled([
+        left.query(insert, [owner, "tenth"]),
+        right.query(insert, [owner, "eleventh"])
+      ]);
+      expect(raced.filter((result) => result.status === "rejected")).toHaveLength(1);
+      const active = await left.query(
+        "select count(*)::int as n from public.reminders where owner_id = $1 and status = 'active'",
+        [owner]
+      );
+      expect(active.rows[0]?.n).toBe(10);
+      const period = "2026-10-01T00:00:00.000Z";
+      const [first, second] = await Promise.all([
+        left.query("select public.fillip_reserve_ping($1::uuid, 30, $2::timestamptz) as n", [owner, period]),
+        right.query("select public.fillip_reserve_ping($1::uuid, 30, $2::timestamptz) as n", [owner, period])
+      ]);
+      const counts = [first.rows[0]?.n, second.rows[0]?.n].map(Number).sort((a, b) => a - b);
+      expect(counts).toEqual([1, 2]);
+      const stored = await left.query("select emails_sent_in_period from public.profiles where id = $1", [owner]);
+      expect(stored.rows[0]?.emails_sent_in_period).toBe(2);
+    } finally {
+      await left.end();
+      await right.end();
     }
   });
 });

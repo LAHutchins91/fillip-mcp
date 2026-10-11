@@ -51,7 +51,7 @@ ${fallbackHtml}
     }
   }
 }</code></pre>
-<p>Do not add headers. Cursor registers a client and opens sign-in. Any other MCP client uses the same address when it supports Streamable HTTP and OAuth. An unauthenticated tool call returns <code>401</code> with a <code>WWW-Authenticate</code> challenge pointing at <code>/.well-known/oauth-protected-resource/mcp</code>.</p>
+<p>Do not add headers. Cursor registers a client and opens sign-in. Any other MCP client uses the same address when it supports Streamable HTTP and OAuth. <code>initialize</code> and tool calls return <code>401</code> with a <code>WWW-Authenticate</code> challenge pointing at <code>/.well-known/oauth-protected-resource/mcp</code>. <code>tools/list</code> stays available without a token so a client can read the catalog.</p>
 </section>
 <section><h2>After it connects</h2>
 <p>“Remind me to follow up on this next Tuesday at 2pm, and actually ping me.” Fillip emails only you, at the verified address on the account you just signed in with.</p>

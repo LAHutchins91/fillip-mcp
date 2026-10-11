@@ -62,7 +62,7 @@ describe("streamable HTTP", () => {
     const body = await response.json() as { result?: { tools?: Array<{ name: string; description?: string; inputSchema?: { properties?: Record<string, unknown> } }> } };
     const tools = body.result?.tools ?? [];
     const names = tools.map((tool) => tool.name);
-    expect(names).toEqual(["set_reminder", "list_reminders", "snooze_or_reschedule", "complete_or_cancel", "follow_up", "digest_settings", "calendar_feed"]);
+    expect(names).toEqual(["set_reminder", "list_reminders", "snooze_or_reschedule", "complete_or_cancel", "delete_reminder", "follow_up", "digest_settings", "calendar_feed"]);
     expect(names).not.toContain("delivery_settings");
     const text = JSON.stringify(tools);
     expect(text).not.toMatch(/\$\d/);
@@ -88,9 +88,47 @@ describe("streamable HTTP", () => {
       })
     });
     expect(response.status).toBe(401);
-    expect(response.headers.get("www-authenticate")).toContain("oauth-protected-resource");
+    const challenge = response.headers.get("www-authenticate") ?? "";
+    expect(challenge).toContain("oauth-protected-resource");
+    expect(challenge).not.toContain("invalid_token");
     const body = await response.json() as { error?: string };
-    expect(body.error).toMatch(/Sign in to Fillip/);
+    expect(body.error).toBe("Authentication required.");
+  });
+
+  it("marks a presented bad token as invalid_token and logs the MCP request without the token", async () => {
+    const lines: string[] = [];
+    const original = console.log;
+    console.log = (...args: unknown[]) => {
+      lines.push(args.map(String).join(" "));
+    };
+    try {
+      const response = await fetch(`${base}/mcp`, {
+        method: "POST",
+        headers: { ...headers, authorization: "Bearer not-a-jwt" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 4,
+          method: "tools/call",
+          params: { name: "list_reminders", arguments: {} }
+        })
+      });
+      expect(response.status).toBe(401);
+      expect(response.headers.get("www-authenticate")).toContain('error="invalid_token"');
+      const body = await response.json() as { error?: string };
+      expect(body.error).toBe("Authentication required.");
+    } finally {
+      console.log = original;
+    }
+    const logged = lines.map((line) => {
+      try {
+        return JSON.parse(line) as { event?: string; tool?: string; status?: number; userId?: string | null };
+      } catch {
+        return null;
+      }
+    }).find((row) => row?.event === "mcp" && row.tool === "list_reminders");
+    expect(logged?.status).toBe(401);
+    expect(logged?.userId ?? null).toBeNull();
+    expect(lines.join("\n")).not.toContain("not-a-jwt");
   });
 
   it("asks for sign-in on initialize and keeps tools/list public", async () => {
@@ -126,6 +164,35 @@ describe("streamable HTTP", () => {
     const shown = await fetch(`${base}/oauth/consent`);
     expect(await shown.text()).toContain("Continue with Google");
     delete process.env.FILLIP_AUTH_GOOGLE_ENABLED;
+  });
+
+  it("rejects a missing or non-S256 PKCE challenge and shows consent without auto-redirect", async () => {
+    const plain = await fetch(`${base}/oauth/authorize?redirect_uri=${encodeURIComponent("https://client.example/cb")}&code_challenge_method=plain&code_challenge=abc&state=xyz`, { redirect: "manual" });
+    expect(plain.status).toBeGreaterThanOrEqual(300);
+    expect(plain.status).toBeLessThan(400);
+    const plainLocation = plain.headers.get("location") ?? "";
+    expect(plainLocation).toContain("error=invalid_request");
+    expect(plainLocation).toContain("client.example");
+    const missing = await fetch(`${base}/oauth/authorize?redirect_uri=${encodeURIComponent("https://client.example/cb")}&state=xyz`, { redirect: "manual" });
+    expect(missing.headers.get("location") ?? "").toContain("error=invalid_request");
+    const bare = await fetch(`${base}/oauth/authorize?code_challenge_method=plain`);
+    expect(bare.status).toBe(400);
+    const previousSupabase = process.env.SUPABASE_URL;
+    process.env.SUPABASE_URL = "https://qa.supabase.co";
+    const forward = await fetch(`${base}/oauth/authorize?redirect_uri=${encodeURIComponent("https://client.example/cb")}&code_challenge_method=S256&code_challenge=abc&state=xyz`, { redirect: "manual" });
+    if (previousSupabase === undefined) delete process.env.SUPABASE_URL;
+    else process.env.SUPABASE_URL = previousSupabase;
+    const forwardLocation = forward.headers.get("location") ?? "";
+    expect(forwardLocation).toContain("https://qa.supabase.co/auth/v1/oauth/authorize");
+    expect(forwardLocation).toContain("code_challenge_method=S256");
+    expect(forwardLocation).not.toContain("error=invalid_request");
+    const consent = await fetch(`${base}/oauth/consent?authorization_id=auth-1`);
+    const html = await consent.text();
+    expect(html).toContain("denyAuthorization");
+    expect(html).toContain("code_challenge_method");
+    expect(html).toContain("S256");
+    expect(html).not.toContain("if(details.data.redirect_url){location.assign(details.data.redirect_url);return}");
+    expect(html).toContain("el('consent').hidden=false");
   });
 
   it("serves connect, health, and OAuth metadata", async () => {

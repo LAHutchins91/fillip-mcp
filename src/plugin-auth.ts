@@ -13,6 +13,29 @@ export function protectedResourceMetadata(baseUrl: string, supabaseUrl: string) 
   };
 }
 
+/** Missing challenge, missing method, and every method other than S256 are rejected. */
+export function pkceRejection(method: string | null | undefined, challenge: string | null | undefined): { error: "invalid_request"; error_description: string } | null {
+  const challengeText = typeof challenge === "string" ? challenge.trim() : "";
+  const methodText = typeof method === "string" ? method.trim() : "";
+  if (!challengeText || !methodText || methodText !== "S256") {
+    return {
+      error: "invalid_request",
+      error_description: "Fillip accepts only PKCE S256. Send code_challenge and code_challenge_method=S256."
+    };
+  }
+  return null;
+}
+
+export function oauthErrorRedirect(redirectUri: string, error: string, description: string, state?: string | null): string {
+  const url = new URL(redirectUri);
+  if (!url.searchParams.get("error")) {
+    url.searchParams.set("error", error);
+    url.searchParams.set("error_description", description);
+  }
+  if (state && !url.searchParams.get("state")) url.searchParams.set("state", state);
+  return url.toString();
+}
+
 export function otpFailure(message: string): string {
   const text = message.toLowerCase();
   if (text.includes("rate") || text.includes("too many") || text.includes("only request this after") || text.includes("over_request") || text.includes("security purposes")) {
@@ -32,6 +55,28 @@ export function installPluginAuth(app: Express, fallbackBase: string, fallbackSu
     const base = (process.env.APP_BASE_URL || fallbackBase).replace(/\/$/, "");
     const supabaseUrl = (process.env.SUPABASE_URL || fallbackSupabase).trim().replace(/\/+$/, "");
     res.set("Access-Control-Allow-Origin", "*").json(protectedResourceMetadata(base, supabaseUrl));
+  });
+  app.get("/oauth/authorize", (req, res) => {
+    const supabaseUrl = (process.env.SUPABASE_URL || fallbackSupabase).trim().replace(/\/+$/, "");
+    const method = typeof req.query.code_challenge_method === "string" ? req.query.code_challenge_method : "";
+    const challenge = typeof req.query.code_challenge === "string" ? req.query.code_challenge : "";
+    const redirectUri = typeof req.query.redirect_uri === "string" ? req.query.redirect_uri : "";
+    const state = typeof req.query.state === "string" ? req.query.state : "";
+    const rejection = pkceRejection(method, challenge);
+    if (rejection) {
+      if (!redirectUri) return res.status(400).json(rejection);
+      try {
+        return res.redirect(oauthErrorRedirect(redirectUri, rejection.error, rejection.error_description, state));
+      } catch {
+        return res.status(400).json(rejection);
+      }
+    }
+    if (!supabaseUrl) return res.status(400).json({ error: "invalid_request", error_description: "Fillip sign-in is not configured." });
+    const target = new URL(`${supabaseUrl}/auth/v1/oauth/authorize`);
+    for (const [key, value] of Object.entries(req.query)) {
+      if (typeof value === "string") target.searchParams.set(key, value);
+    }
+    res.redirect(target.toString());
   });
   app.get(["/oauth/consent", "//oauth/consent", "/connections"], (_req, res) => {
     const supabaseUrl = (process.env.SUPABASE_URL || fallbackSupabase).trim().replace(/\/+$/, "");
@@ -62,6 +107,8 @@ ${googleButton}
 (async function(){
 var cfg=${config}, id=new URLSearchParams(location.search).get('authorization_id');
 var explain=${otpFailure.toString()};
+var rejectPkce=${pkceRejection.toString()};
+var oauthErrorRedirect=${oauthErrorRedirect.toString()};
 var el=function(name){return document.getElementById(name)};
 function fail(error){el('status').textContent='';el('error').textContent=error.message||String(error)}
 function showSignIn(){
@@ -104,12 +151,23 @@ try{
  }
  if(!id)throw new Error('Open Fillip from your assistant connection to start a new authorization request.');
  var details=await client.auth.oauth.getAuthorizationDetails(id);if(details.error)throw details.error;
- if(details.data.redirect_url){location.assign(details.data.redirect_url);return}
+ var query=new URLSearchParams(location.search);
+ var nested=details.data&&details.data.authorization?details.data.authorization:{};
+ var method=(details.data&&details.data.code_challenge_method)||nested.code_challenge_method||query.get('code_challenge_method')||'';
+ var challenge=(details.data&&details.data.code_challenge)||nested.code_challenge||query.get('code_challenge')||'';
+ var rejection=rejectPkce(method, challenge);
+ if(rejection){
+   var denied=await client.auth.oauth.denyAuthorization(id,{skipBrowserRedirect:true});
+   var back=(denied.data&&denied.data.redirect_url)||details.data.redirect_uri||'';
+   if(!back)throw new Error(rejection.error_description);
+   location.assign(oauthErrorRedirect(back, rejection.error, rejection.error_description, details.data.state||query.get('state')));
+   return;
+ }
  el('client').textContent='Connect '+(details.data.client.name||'this application')+'?';
  el('destination').textContent='Return address: '+details.data.redirect_uri;
  el('scopes').textContent='Requested scopes: '+details.data.scope;
  el('consent').hidden=false;
- async function decide(approved){el('approve').disabled=true;el('deny').disabled=true;try{var r=await client.auth.oauth[approved?'approveAuthorization':'denyAuthorization'](id,{skipBrowserRedirect:true});if(r.error)throw r.error;location.assign(r.data.redirect_url)}catch(e){fail(e);el('approve').disabled=false;el('deny').disabled=false}}
+ async function decide(approved){el('approve').disabled=true;el('deny').disabled=true;try{if(approved&&details.data.redirect_url){location.assign(details.data.redirect_url);return}var r=await client.auth.oauth[approved?'approveAuthorization':'denyAuthorization'](id,{skipBrowserRedirect:true});if(r.error)throw r.error;location.assign(r.data.redirect_url)}catch(e){fail(e);el('approve').disabled=false;el('deny').disabled=false}}
  el('approve').onclick=function(){decide(true)};el('deny').onclick=function(){decide(false)};
 }catch(error){fail(error)}
 })();</script></body></html>`);

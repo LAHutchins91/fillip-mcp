@@ -109,6 +109,7 @@ describe("reminder CRUD", () => {
     const paused = await snoozeOrReschedule(store, actor.id, created.id, undefined, undefined, now, "pause");
     expect(paused.status).toBe("paused");
     expect(paused.note).toMatch(/will not send/);
+    expect(paused.note).toMatch(/paused \(would next send /);
     const found = await listReminders(store, actor.id, { status: "paused" }, now);
     expect(found.map((row) => row.id)).toEqual([created.id]);
     expect(await listReminders(store, actor.id, { status: "active" }, now)).toHaveLength(0);
@@ -298,5 +299,25 @@ describe("reminder CRUD", () => {
     expect(cleared.repeats).toBe("once");
     await expect(setReminder(store, actor, { what: "Bad", when: "tomorrow 9am", timezone: "UTC", until: "not a date" }, now))
       .rejects.toThrow(/March 31, 2027/);
+  });
+
+  it("refuses a missing spring-forward hour unless the caller accepts the shifted time", async () => {
+    const store = storeWithActor();
+    const at = new Date("2027-03-01T15:00:00.000Z");
+    await expect(setReminder(store, actor, {
+      what: "Gap",
+      when: "2027-03-14 2:30 AM",
+      timezone: "America/New_York"
+    }, at)).rejects.toBeInstanceOf(WhenError);
+    expect(await listReminders(store, actor.id, {}, at)).toHaveLength(0);
+    const saved = await setReminder(store, actor, {
+      what: "Gap",
+      when: "2027-03-14 2:30 AM",
+      timezone: "America/New_York",
+      acceptShiftedTime: true
+    }, at);
+    expect(saved.fireAt).toBe("2027-03-14T07:30:00.000Z");
+    expect(saved.note).toMatch(/does not exist/);
+    expect(saved.note).toMatch(/3:30/);
   });
 });

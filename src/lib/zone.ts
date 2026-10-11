@@ -146,6 +146,18 @@ export function isRealDate(year: number, month: number, day: number): boolean {
   return utc.getUTCFullYear() === year && utc.getUTCMonth() === month - 1 && utc.getUTCDate() === day;
 }
 
+/** "Nov 2 at 9:00 AM" — month, day, and clock, without the weekday or year. */
+export function formatShortWhen(date: Date, timeZone: string): string {
+  const formatted = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  }).format(date);
+  return formatted.replace(",", " at");
+}
+
 export function formatWhen(date: Date, timeZone: string): string {
   return new Intl.DateTimeFormat("en-US", {
     timeZone,

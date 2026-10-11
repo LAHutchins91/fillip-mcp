@@ -90,7 +90,15 @@ function localMonthStartIso(now: Date, timeZone: string): string {
   return zonedTimeToUtc(parts.year, parts.month, 1, 0, 0, timeZone).toISOString();
 }
 
-/** Written on the delivery row before the provider call. A later process must not call the provider again. */
+/**
+ * Written on the delivery row before the provider call.
+ * It is not a provider message id. While the row is inside the claim lease, a
+ * later run retries it with the same idempotency key and leaves the reminder
+ * due. After the lease, the occurrence is not submitted again: the process
+ * that wrote the mark may already have been accepted and died before the sent
+ * row was saved. Telegram cannot dedupe, so a retry inside the lease after
+ * Telegram has accepted and before the message id is stored can deliver twice.
+ */
 const ATTEMPT_MARK = "attempt";
 
 async function markAttempt(store: ServiceStore, delivery: Delivery): Promise<Delivery> {
@@ -105,6 +113,9 @@ async function noteSent(store: ServiceStore, contact: OwnerContact, now: Date, t
   const emailsSentInPeriod = (current ? sentThisMonth(contact, now, timeZone) : 0) + 1;
   contact.emailsSentInPeriod = emailsSentInPeriod;
   contact.emailPeriodStart = emailPeriodStart;
+  // Hosted reserveSend already did UPDATE n = n + 1. Writing this contact's
+  // stale count would erase the other worker's increment.
+  if (store.reservePersistsMonthlyCount) return;
   await store.saveUsage(contact.id, { emailsSentInPeriod, emailPeriodStart });
 }
 
@@ -382,6 +393,7 @@ export async function runDueJob(options: {
     let emailDone = !mode.email;
     let telegramDone = !mode.telegram;
     let delivered = false;
+    let retryingAttempt = false;
 
     if (mode.telegram && options.telegram && contact.telegramChatId) {
       if (!(await underUserCap())) {
@@ -427,6 +439,7 @@ export async function runDueJob(options: {
             });
             if (claim.outcome === "already-sent") telegramDone = true;
             else if (claim.outcome === "send" && options.store.beginSend(idempotencyKey)) {
+              if (claim.delivery.providerId === ATTEMPT_MARK) retryingAttempt = true;
               const marked = await markAttempt(options.store, claim.delivery);
               try {
                 const result = await options.telegram.sender.send(contact.telegramChatId, telegramText(reminder, options.now), idempotencyKey);
@@ -549,6 +562,7 @@ export async function runDueJob(options: {
           else if (!options.store.beginSend(idempotencyKey)) report.skipped += 1;
           else {
             release = false;
+            if (claim.delivery.providerId === ATTEMPT_MARK) retryingAttempt = true;
             let accepted = false;
             let marked = claim.delivery;
             try {
@@ -614,7 +628,7 @@ export async function runDueJob(options: {
       }
     }
 
-    if (emailDone && telegramDone && (delivered || emailDone)) {
+    if (emailDone && telegramDone && (delivered || emailDone) && !retryingAttempt) {
       const current = await options.store.getReminder(reminder.ownerId, reminder.id);
       if (current) await advanceIfSent(options.store, current, reminder.fireAt, options.now);
     }

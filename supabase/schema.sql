@@ -87,20 +87,37 @@ create policy profiles_select on public.profiles
   using (id = (select auth.uid()));
 
 drop policy if exists reminders_owner on public.reminders;
-create policy reminders_owner on public.reminders
-  for all to authenticated
-  using (owner_id = (select auth.uid()))
-  with check (owner_id = (select auth.uid()));
+drop policy if exists reminders_owner_select on public.reminders;
+create policy reminders_owner_select on public.reminders
+  for select to authenticated
+  using (owner_id = (select auth.uid()));
+
+drop policy if exists reminders_owner_delete on public.reminders;
+create policy reminders_owner_delete on public.reminders
+  for delete to authenticated
+  using (owner_id = (select auth.uid()));
 
 drop policy if exists digest_owner on public.digest_settings;
-create policy digest_owner on public.digest_settings
-  for all to authenticated
-  using (owner_id = (select auth.uid()))
-  with check (owner_id = (select auth.uid()));
+drop policy if exists digest_owner_select on public.digest_settings;
+create policy digest_owner_select on public.digest_settings
+  for select to authenticated
+  using (owner_id = (select auth.uid()));
 
+drop policy if exists digest_owner_delete on public.digest_settings;
+create policy digest_owner_delete on public.digest_settings
+  for delete to authenticated
+  using (owner_id = (select auth.uid()));
+
+-- Authenticated sessions read and delete their own rows. Inserts and updates
+-- go through the service role so date, length, recurrence, and plan holds
+-- cannot be skipped with the anon key and a user token.
+revoke all on table public.profiles from public, anon, authenticated;
 grant select on public.profiles to authenticated;
-grant select, insert, update, delete on public.reminders to authenticated;
-grant select, insert, update, delete on public.digest_settings to authenticated;
+revoke all on table public.reminders from public, anon, authenticated;
+grant select, delete on public.reminders to authenticated;
+revoke all on table public.digest_settings from public, anon, authenticated;
+grant select, delete on public.digest_settings to authenticated;
+revoke all on table public.fillip_support_requests from public, anon, authenticated;
 
 -- Deliveries are written by the service role. Owners may delete only their own
 -- rows. PostgreSQL requires SELECT as well as DELETE: without a SELECT grant
@@ -117,6 +134,7 @@ create policy deliveries_owner_delete on public.deliveries
   for delete to authenticated
   using (owner_id = (select auth.uid()));
 
+revoke insert, update on table public.deliveries from public, anon, authenticated;
 grant select on public.deliveries to authenticated;
 grant delete on public.deliveries to authenticated;
 
@@ -167,6 +185,7 @@ create table if not exists public.fillip_runtime (
 insert into public.fillip_runtime (id) values (1) on conflict (id) do nothing;
 
 alter table public.fillip_runtime enable row level security;
+revoke all on table public.fillip_runtime from public, anon, authenticated;
 
 alter table public.profiles add column if not exists default_channel text not null default 'email';
 alter table public.profiles add column if not exists telegram_chat_id text;
@@ -272,8 +291,49 @@ grant execute on function public.fillip_set_telegram_link(text, timestamptz) to 
 grant execute on function public.fillip_clear_telegram() to authenticated;
 grant execute on function public.fillip_set_calendar_token(text) to authenticated;
 
--- Parallel creates must not pass the free open cap. The lock is per owner,
--- so two transactions cannot both count 9 and insert.
+-- One conditional update for the monthly ping counter. A number is the new
+-- count. Null means the cap already held. Service role only.
+create or replace function public.fillip_reserve_ping(owner uuid, max_count integer, period_start timestamptz)
+returns integer
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  next_count integer;
+begin
+  update public.profiles
+  set emails_sent_in_period = case
+        when email_period_start is null or email_period_start < period_start then 1
+        else emails_sent_in_period + 1
+      end,
+      email_period_start = case
+        when email_period_start is null or email_period_start < period_start then period_start
+        else email_period_start
+      end,
+      updated_at = now()
+  where id = owner
+    and (
+      email_period_start is null
+      or email_period_start < period_start
+      or emails_sent_in_period < max_count
+    )
+  returning emails_sent_in_period into next_count;
+  return next_count;
+end;
+$$;
+
+revoke all on function public.fillip_reserve_ping(uuid, integer, timestamptz) from public, anon, authenticated;
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    grant execute on function public.fillip_reserve_ping(uuid, integer, timestamptz) to service_role;
+  end if;
+end
+$$;
+
+-- Parallel creates must not pass the free open cap. The advisory lock and the
+-- profile row lock are per owner, so two transactions cannot both count 9 and insert.
 create or replace function public.fillip_enforce_open_cap()
 returns trigger
 language plpgsql
@@ -291,7 +351,8 @@ begin
   perform pg_advisory_xact_lock(hashtext(new.owner_id::text));
   select p.plan, p.subscription_status into plan, sub_status
   from public.profiles p
-  where p.id = new.owner_id;
+  where p.id = new.owner_id
+  for update;
   if sub_status = 'trialing' or (sub_status = 'active' and plan in ('pro', 'annual')) then
     cap := 100;
   else

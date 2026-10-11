@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ClaimResult, Delivery, DeliveryChannel, DigestSettings, OwnerContact, OwnerIdentity, PlanName, Recurrence, Reminder, ReminderStatus } from "./types.js";
-import type { ListQuery, SendReserve, SendReserveResult, ServiceStore } from "./store.js";
+import { OpenCapError, type ListQuery, type OpenCap, type SendReserve, type SendReserveResult, type ServiceStore } from "./store.js";
 import { sentThisMonth, usagePeriodCurrent } from "./usage.js";
 import { zonedParts, zonedTimeToUtc } from "./zone.js";
 
@@ -162,7 +162,17 @@ export class SupabaseFillipStore implements ServiceStore {
   private inFlight = new Set<string>();
   /** Reservation id to owner, present only while a hosted counter increment should be undone on failure. */
   private reservations = new Map<string, string>();
-  constructor(private ownerId: string | null, private db: Db, private mode: Mode) {}
+  /**
+   * reserveSend writes emails_sent_in_period. noteSent must not overwrite it
+   * from a contact snapshot taken before the increment.
+   */
+  readonly reservePersistsMonthlyCount = true;
+  constructor(private ownerId: string | null, private db: Db, private mode: Mode, private writer: Db | null = null) {}
+
+  /** Reminder and digest writes. The service role when the user token cannot insert or update. */
+  private persist(): Db {
+    return this.writer ?? this.db;
+  }
 
   private owned(ownerId: string) {
     if (this.mode === "user" && ownerId !== this.ownerId) throw new Error("Reminder not found");
@@ -182,29 +192,56 @@ export class SupabaseFillipStore implements ServiceStore {
     return row ? fromReminder(row) : null;
   }
 
-  async createReminder(reminder: Reminder): Promise<Reminder> {
+  async createReminder(reminder: Reminder, open?: OpenCap): Promise<Reminder> {
     this.owned(reminder.ownerId);
     const forced = this.mode === "user" && this.ownerId ? { ...reminder, ownerId: this.ownerId } : reminder;
-    const value = await this.db("/rest/v1/reminders", {
+    const value = await this.persist()("/rest/v1/reminders", {
       method: "POST",
       headers: { Prefer: "return=representation" },
       body: JSON.stringify(toReminder(forced))
     });
     const row = rows<ReminderRow>(value)[0];
     if (!row) throw new Error("Fillip could not complete this request. Your reminder may not have been saved.");
-    return fromReminder(row);
+    const saved = fromReminder(row);
+    if (open && saved.status === "active") await this.reconcileOpenCap(saved, open);
+    return saved;
+  }
+
+  /**
+   * The count that gate() saw can be stale. After the insert, drop this row
+   * when a stable order of active reminders already fills the cap.
+   * select=id,created_at is a different read from the stalled id-only count.
+   */
+  private async reconcileOpenCap(saved: Reminder, open: OpenCap): Promise<void> {
+    const listed = rows<{ id: string; created_at: string }>(await this.persist()(
+      `/rest/v1/reminders?owner_id=eq.${encodeURIComponent(saved.ownerId)}&status=eq.active&select=id,created_at&order=created_at.asc,id.asc&limit=500`
+    ));
+    if (listed.length <= open.cap) return;
+    const ranked = [...listed].sort((left, right) => {
+      const created = String(left.created_at).localeCompare(String(right.created_at));
+      return created !== 0 ? created : String(left.id).localeCompare(String(right.id));
+    });
+    const keep = new Set(ranked.slice(0, open.cap).map((item) => item.id));
+    for (const item of ranked.slice(open.cap)) {
+      await this.persist()(`/rest/v1/reminders?id=eq.${encodeURIComponent(item.id)}&owner_id=eq.${encodeURIComponent(saved.ownerId)}`, {
+        method: "DELETE",
+        headers: { Prefer: "return=minimal" }
+      });
+    }
+    if (!keep.has(saved.id)) throw new OpenCapError(open.message);
   }
 
   async deleteReminder(ownerId: string, id: string): Promise<void> {
     this.owned(ownerId);
     const minimal = { method: "DELETE", headers: { Prefer: "return=minimal" } };
-    await this.db(`/rest/v1/deliveries?reminder_id=eq.${encodeURIComponent(id)}&owner_id=eq.${encodeURIComponent(ownerId)}`, minimal);
-    await this.db(`/rest/v1/reminders?id=eq.${encodeURIComponent(id)}&owner_id=eq.${encodeURIComponent(ownerId)}`, minimal);
+    const write = this.persist();
+    await write(`/rest/v1/deliveries?reminder_id=eq.${encodeURIComponent(id)}&owner_id=eq.${encodeURIComponent(ownerId)}`, minimal);
+    await write(`/rest/v1/reminders?id=eq.${encodeURIComponent(id)}&owner_id=eq.${encodeURIComponent(ownerId)}`, minimal);
   }
 
   async saveReminder(reminder: Reminder): Promise<Reminder> {
     this.owned(reminder.ownerId);
-    const value = await this.db(`/rest/v1/reminders?id=eq.${encodeURIComponent(reminder.id)}&owner_id=eq.${encodeURIComponent(reminder.ownerId)}`, {
+    const value = await this.persist()(`/rest/v1/reminders?id=eq.${encodeURIComponent(reminder.id)}&owner_id=eq.${encodeURIComponent(reminder.ownerId)}`, {
       method: "PATCH",
       headers: { Prefer: "return=representation" },
       body: JSON.stringify(toReminder(reminder))
@@ -255,7 +292,7 @@ export class SupabaseFillipStore implements ServiceStore {
 
   async saveDigest(settings: DigestSettings): Promise<void> {
     this.owned(settings.ownerId);
-    await this.db("/rest/v1/digest_settings?on_conflict=owner_id", {
+    await this.persist()("/rest/v1/digest_settings?on_conflict=owner_id", {
       method: "POST",
       headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
       body: JSON.stringify({
@@ -415,8 +452,15 @@ export class SupabaseFillipStore implements ServiceStore {
     }
     const existing = rows<DeliveryRow>(await this.db(`/rest/v1/deliveries?dedupe_key=eq.${encodeURIComponent(input.dedupeKey)}&select=*`))[0];
     if (!existing) throw new Error("Fillip could not complete this request. Your reminder may not have been saved.");
-    if (existing.status === "sent" || existing.provider_id) return { delivery: fromDelivery(existing), outcome: "already-sent" };
-    if (existing.status === "sending" && existing.started_at > input.staleBeforeIso) {
+    const attempt = existing.provider_id === "attempt";
+    const accepted = Boolean(existing.provider_id) && !attempt;
+    if (existing.status === "sent" || accepted) return { delivery: fromDelivery(existing), outcome: "already-sent" };
+    // A fresh attempt is retried. An attempt older than the lease is not
+    // submitted again; the writer may already have been accepted.
+    if (attempt && existing.started_at <= input.staleBeforeIso) {
+      return { delivery: fromDelivery(existing), outcome: "already-sent" };
+    }
+    if (existing.status === "sending" && !attempt && existing.started_at > input.staleBeforeIso) {
       return { delivery: fromDelivery(existing), outcome: "in-progress" };
     }
     const ticketKey = `claim:${input.dedupeKey}:${existing.started_at}`;
@@ -438,11 +482,16 @@ export class SupabaseFillipStore implements ServiceStore {
       if (ticket?.started_at && ticket.started_at > leaseCutoff(input.nowIso)) {
         return { delivery: fromDelivery(existing), outcome: "in-progress" };
       }
-      await this.db(`/rest/v1/deliveries?dedupe_key=eq.${encodeURIComponent(ticketKey)}`, {
-        method: "PATCH",
-        headers: { Prefer: "return=minimal" },
-        body: JSON.stringify({ status: "sending", started_at: input.nowIso })
-      });
+      const previous = ticket?.started_at ?? "";
+      const renewed = rows<DeliveryRow>(await this.db(
+        `/rest/v1/deliveries?dedupe_key=eq.${encodeURIComponent(ticketKey)}&started_at=eq.${encodeURIComponent(previous)}`,
+        {
+          method: "PATCH",
+          headers: { Prefer: "return=representation" },
+          body: JSON.stringify({ status: "sending", started_at: input.nowIso })
+        }
+      ));
+      if (!renewed[0]) return { delivery: fromDelivery(existing), outcome: "in-progress" };
     }
     const taken = rows<DeliveryRow>(await this.db(`/rest/v1/deliveries?dedupe_key=eq.${encodeURIComponent(input.dedupeKey)}&status=neq.sent`, {
       method: "PATCH",
@@ -557,8 +606,53 @@ export class SupabaseFillipStore implements ServiceStore {
     });
   }
 
+  private rememberHold(ownerId: string): SendReserveResult {
+    const id = randomUUID();
+    this.sendHolds.add(id);
+    this.reservations.set(id, ownerId);
+    return { ok: true, id };
+  }
+
+  /**
+   * A JSON number is the new count. JSON null means the cap held.
+   * An array is a client that does not implement the RPC, so the caller
+   * falls back to a compare-and-swap patch. Null must not fall back.
+   */
+  private async reservePing(ownerId: string, maxCount: number, periodStart: string): Promise<"reserved" | "capped" | "fallback"> {
+    let value: unknown;
+    try {
+      value = await this.db("/rest/v1/rpc/fillip_reserve_ping", {
+        method: "POST",
+        body: JSON.stringify({ owner: ownerId, max_count: maxCount, period_start: periodStart })
+      });
+    } catch {
+      return "fallback";
+    }
+    if (Array.isArray(value)) return "fallback";
+    if (typeof value === "number" && Number.isFinite(value)) return "reserved";
+    if (value === null) return "capped";
+    return "fallback";
+  }
+
   async reserveSend(input: SendReserve): Promise<SendReserveResult> {
     if (this.mode !== "service") throw new Error("Reminder not found");
+    const preview = await this.readUsage(input.ownerId);
+    const previewUsed = sentThisMonth(
+      { emailsSentInPeriod: preview.emailsSentInPeriod, emailPeriodStart: preview.emailPeriodStart, subscriptionStatus: preview.subscriptionStatus },
+      input.now,
+      input.timeZone
+    );
+    if (previewUsed >= input.monthlyLimit) return { ok: false, reason: "month" };
+    if ((await this.countSentSince(input.ownerId, input.sinceIso)) >= input.dailyLimit) return { ok: false, reason: "day" };
+    if (input.countGlobal) {
+      if ((await this.countAllSentSince(input.globalDayStartIso)) >= input.globalDayLimit) return { ok: false, reason: "global-day" };
+      if ((await this.countAllSentSince(input.globalMonthStartIso)) >= input.globalMonthLimit) return { ok: false, reason: "global-month" };
+    }
+    const periodCurrent = Boolean(preview.emailPeriodStart) && usagePeriodCurrent(preview.emailPeriodStart ?? "", input.now, input.timeZone, preview.subscriptionStatus);
+    const periodStart = periodCurrent && preview.emailPeriodStart ? preview.emailPeriodStart : localMonthStartIso(input.now, input.timeZone);
+    const rpc = await this.reservePing(input.ownerId, input.monthlyLimit, periodStart);
+    if (rpc === "reserved") return this.rememberHold(input.ownerId);
+    if (rpc === "capped") return { ok: false, reason: "month" };
     for (let attempt = 0; attempt < 8; attempt += 1) {
       const usage = await this.readUsage(input.ownerId);
       const used = sentThisMonth(
@@ -592,10 +686,7 @@ export class SupabaseFillipStore implements ServiceStore {
       // means another worker already took the count. An acknowledged write with
       // no body still holds the slot: the caller accepted the PATCH.
       if (!isAcknowledgedWrite(updated) && !rows(updated)[0]) continue;
-      const id = randomUUID();
-      this.sendHolds.add(id);
-      this.reservations.set(id, input.ownerId);
-      return { ok: true, id };
+      return this.rememberHold(input.ownerId);
     }
     return { ok: false, reason: "month" };
   }
