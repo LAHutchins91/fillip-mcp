@@ -320,7 +320,7 @@ describe("QA round 4 real Postgres concurrency", () => {
     expect(active.length, `resume returned ${resumed.status} ${resumed.note ?? ""}`).toBeLessThanOrEqual(10);
   });
 
-  it("QA-FAIL: an over-cap read with matching timestamps deletes only the inserted row and throws", async () => {
+  it("QA-FAIL: an over-cap read with matching timestamps deletes only the inserted row", async () => {
     const owner = actor.id;
     const stamp = "2026-10-11T16:00:00.000Z";
     const freshId = "00000000-0000-4000-8000-000000000010";
@@ -356,7 +356,7 @@ describe("QA round 4 real Postgres concurrency", () => {
     await expect(store.createReminder(row(freshId, stamp) as unknown as Reminder, {
       cap: 10,
       message: "The free plan allows 10 open reminders."
-    })).rejects.toThrow(/The free plan allows 10 open reminders\. Upgrade to Pro for a higher allowance\. The trial is 14 days, then Pro\./);
+    })).rejects.toThrow(/You're over the free plan's 10 open reminders\. Upgrade to Pro for a higher allowance\. The trial is 14 days, then Pro\./);
     expect(deleted, "only the row this call inserted is removed").toEqual([freshId]);
     for (const id of olderIds) expect(deleted, "an older row stays").not.toContain(id);
   });
