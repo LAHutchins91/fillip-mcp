@@ -61,6 +61,8 @@ type ReminderRow = {
   created_at: string;
   updated_at: string;
   completed_at: string | null;
+  removed_at?: string | null;
+  resume_status?: "active" | "paused" | null;
 };
 
 type DeliveryRow = {
@@ -93,7 +95,9 @@ function fromReminder(row: ReminderRow): Reminder {
     holdUntil: row.hold_until,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-    completedAt: row.completed_at
+    completedAt: row.completed_at,
+    removedAt: row.removed_at ?? null,
+    resumeStatus: row.resume_status === "paused" || row.resume_status === "active" ? row.resume_status : null
   };
 }
 
@@ -112,7 +116,9 @@ function toReminder(reminder: Reminder): ReminderRow {
     hold_until: reminder.holdUntil,
     created_at: reminder.createdAt,
     updated_at: reminder.updatedAt,
-    completed_at: reminder.completedAt
+    completed_at: reminder.completedAt,
+    removed_at: reminder.removedAt ?? null,
+    resume_status: reminder.resumeStatus ?? null
   };
 }
 
@@ -514,6 +520,50 @@ export class SupabaseFillipStore implements ServiceStore {
     return rows<Parameters<typeof fromDigest>[0]>(value).map(fromDigest);
   }
 
+  private async reminderSendable(ownerId: string, reminderId: string | null): Promise<boolean> {
+    if (!reminderId) return true;
+    try {
+      const value = await this.db("/rest/v1/rpc/fillip_claim_sendable", {
+        method: "POST",
+        body: JSON.stringify({ owner: ownerId, reminder: reminderId })
+      });
+      if (typeof value === "boolean") return value;
+    } catch {
+      // The status filter below is the same predicate when the function is not installed.
+    }
+    const found = rows<{ id: string }>(await this.db(
+      `/rest/v1/reminders?id=eq.${encodeURIComponent(reminderId)}&owner_id=eq.${encodeURIComponent(ownerId)}&status=eq.active&select=id&limit=1`
+    ));
+    return found.length > 0;
+  }
+
+  private async withheldClaim(input: {
+    ownerId: string;
+    reminderId: string | null;
+    dedupeKey: string;
+    occurrenceAt: string;
+    idempotencyKey: string;
+    channel: "email" | "telegram";
+    nowIso: string;
+  }): Promise<ClaimResult> {
+    const existing = rows<DeliveryRow>(await this.db(`/rest/v1/deliveries?dedupe_key=eq.${encodeURIComponent(input.dedupeKey)}&select=*`))[0];
+    const delivery = existing ? fromDelivery(existing) : {
+      id: input.dedupeKey,
+      ownerId: input.ownerId,
+      reminderId: input.reminderId,
+      dedupeKey: input.dedupeKey,
+      occurrenceAt: input.occurrenceAt,
+      status: "skipped" as const,
+      idempotencyKey: input.idempotencyKey,
+      channel: input.channel,
+      providerId: null,
+      startedAt: input.nowIso,
+      sentAt: null,
+      error: null
+    };
+    return { delivery, outcome: "withheld" };
+  }
+
   async claimDelivery(input: {
     ownerId: string;
     reminderId: string | null;
@@ -525,6 +575,8 @@ export class SupabaseFillipStore implements ServiceStore {
     staleBeforeIso: string;
   }): Promise<ClaimResult> {
     if (this.mode !== "service") throw new Error("Reminder not found");
+    const allowSend = () => this.reminderSendable(input.ownerId, input.reminderId);
+    if (!(await allowSend())) return this.withheldClaim(input);
     const fresh: DeliveryRow = {
       id: randomUUID(),
       owner_id: input.ownerId,
@@ -547,6 +599,7 @@ export class SupabaseFillipStore implements ServiceStore {
       });
       const row = rows<DeliveryRow>(value)[0];
       if (!row) throw new Error("Fillip could not complete this request. Your reminder may not have been saved.");
+      if (!(await allowSend())) return this.withheldClaim(input);
       return { delivery: fromDelivery(row), outcome: "send" };
     } catch (error) {
       if (!isDuplicate(error)) throw error;
@@ -563,6 +616,7 @@ export class SupabaseFillipStore implements ServiceStore {
       const age = Date.parse(input.nowIso) - Date.parse(existing.started_at);
       const channel = existing.channel === "telegram" ? "telegram" : "email";
       if (channel === "email" && Number.isFinite(age) && age <= 24 * 60 * 60 * 1000) {
+        if (!(await allowSend())) return this.withheldClaim(input);
         return {
           delivery: fromDelivery({ ...existing, idempotency_key: input.idempotencyKey }),
           outcome: "send"
@@ -610,6 +664,7 @@ export class SupabaseFillipStore implements ServiceStore {
     }));
     const row = taken[0] ?? existing;
     if (row.status === "sent") return { delivery: fromDelivery(row), outcome: "already-sent" };
+    if (!(await allowSend())) return this.withheldClaim(input);
     return { delivery: fromDelivery({ ...row, status: "sending", started_at: input.nowIso, idempotency_key: input.idempotencyKey }), outcome: "send" };
   }
 
@@ -781,8 +836,32 @@ export class SupabaseFillipStore implements ServiceStore {
     return "fallback";
   }
 
+  async purgeRemoved(cutoffIso: string): Promise<number> {
+    if (this.mode !== "service") throw new Error("Reminder not found");
+    try {
+      const value = await this.db("/rest/v1/rpc/fillip_purge_removed", {
+        method: "POST",
+        body: JSON.stringify({ cutoff: cutoffIso })
+      });
+      if (typeof value === "number" && Number.isFinite(value)) return value;
+      if (!Array.isArray(value)) return 0;
+    } catch {
+      // Filtered deletes below match the function when it is not installed.
+    }
+    const doomed = rows<{ id: string }>(await this.db(
+      `/rest/v1/reminders?status=eq.removed&removed_at=lt.${encodeURIComponent(cutoffIso)}&select=id&limit=500`
+    ));
+    const minimal = { method: "DELETE", headers: { Prefer: "return=minimal" } };
+    for (const row of doomed) {
+      await this.db(`/rest/v1/deliveries?reminder_id=eq.${encodeURIComponent(row.id)}`, minimal);
+      await this.db(`/rest/v1/reminders?id=eq.${encodeURIComponent(row.id)}&status=eq.removed`, minimal);
+    }
+    return doomed.length;
+  }
+
   async reserveSend(input: SendReserve): Promise<SendReserveResult> {
     if (this.mode !== "service") throw new Error("Reminder not found");
+    if (input.reminderId && !(await this.reminderSendable(input.ownerId, input.reminderId))) return { ok: false, reason: "removed" };
     const preview = await this.readUsage(input.ownerId);
     const previewUsed = sentThisMonth(
       { emailsSentInPeriod: preview.emailsSentInPeriod, emailPeriodStart: preview.emailPeriodStart, subscriptionStatus: preview.subscriptionStatus },

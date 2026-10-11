@@ -131,11 +131,29 @@ describe("schema re-run", () => {
         order by p.proname
       `);
       expect(functions.rows.map((row) => row.proname)).toEqual(expect.arrayContaining([
+        "fillip_claim_sendable",
         "fillip_enforce_open_cap",
+        "fillip_purge_removed",
         "fillip_reserve_ping",
         "fillip_set_mail_opt_in",
         "handle_new_fillip_user"
       ]));
+      const removedColumns = await db.query<{ column_name: string }>(`
+        select column_name from information_schema.columns
+        where table_schema = 'public' and table_name = 'reminders'
+          and column_name in ('removed_at', 'resume_status')
+      `);
+      expect(removedColumns.rows.map((row) => row.column_name).sort()).toEqual(["removed_at", "resume_status"]);
+      const statusCheck = await db.query<{ def: string }>(`
+        select pg_get_constraintdef(oid) as def
+        from pg_constraint
+        where conname = 'reminders_status_check'
+      `);
+      expect(statusCheck.rows[0]?.def ?? "").toContain("removed");
+      const purgeIndex = await db.query<{ indexname: string }>(
+        "select indexname from pg_indexes where schemaname = 'public' and indexname = 'reminders_removed_purge'"
+      );
+      expect(purgeIndex.rows).toHaveLength(1);
       for (const row of functions.rows) {
         expect(row.proconfig ?? [], row.proname).toEqual(expect.arrayContaining(["search_path=public"]));
       }

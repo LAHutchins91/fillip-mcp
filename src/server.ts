@@ -26,7 +26,7 @@ import type { Actor } from "./lib/types.js";
 import { validateMcpClaims } from "./mcp-claims.js";
 import { MCP_CORS_HEADERS, ensureStreamableHttpAccept, mcpBrowserOriginAllowed } from "./mcp-clients.js";
 import { installCodeAuth, lockoutSecretProblem } from "./code-auth.js";
-import { installPluginAuth } from "./plugin-auth.js";
+import { installPluginAuth, pkceSecretProblem } from "./plugin-auth.js";
 import { installPublicPages } from "./public-pages.js";
 import { useStdioTransport } from "./transport.js";
 import { FILLIP_VERSION } from "./version.js";
@@ -662,8 +662,10 @@ app.use((error: unknown, _req: Request, res: Response, _next: express.NextFuncti
 const port = Number(envValue("PORT") || 3000);
 if (process.env.NODE_ENV !== "test") {
   const lockoutProblem = lockoutSecretProblem();
-  if (lockoutProblem) {
-    console.error(lockoutProblem);
+  const pkceProblem = pkceSecretProblem();
+  if (lockoutProblem || pkceProblem) {
+    if (lockoutProblem) console.error(lockoutProblem);
+    if (pkceProblem) console.error(pkceProblem);
     process.exit(1);
   }
   const stdio = useStdioTransport();

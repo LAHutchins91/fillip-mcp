@@ -80,11 +80,13 @@ export type SendReserve = {
   globalDayLimit: number;
   globalMonthLimit: number;
   countGlobal: boolean;
+  /** When set, the reserve is refused unless this reminder is still active. */
+  reminderId?: string;
 };
 
 export type SendReserveResult =
   | { ok: true; id: string }
-  | { ok: false; reason: "month" | "day" | "global-day" | "global-month" };
+  | { ok: false; reason: "month" | "day" | "global-day" | "global-month" | "removed" };
 
 export interface ServiceStore extends ReminderStore {
   getContact(ownerId: string): Promise<OwnerContact | null>;
@@ -118,6 +120,8 @@ export interface ServiceStore extends ReminderStore {
   }): boolean | Promise<boolean>;
   countSentSince(ownerId: string, sinceIso: string): Promise<number>;
   countAllSentSince(sinceIso: string): Promise<number>;
+  /** Hard-delete removed reminders whose removed_at is older than cutoff, and their deliveries. */
+  purgeRemoved(cutoffIso: string): Promise<number>;
   getProviderBackoffUntil(): Promise<string | null>;
   setProviderBackoffUntil(untilIso: string): Promise<void>;
   saveUsage(ownerId: string, usage: { emailsSentInPeriod: number; emailPeriodStart: string }): Promise<void>;

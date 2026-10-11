@@ -3,13 +3,15 @@ import type { Express, Request, Response } from "express";
 import { z } from "zod";
 
 export const CODE_SENT = "If that email can sign in, a code is on its way.";
-export const CODE_LOCKED = "Too many wrong codes. Request a new one.";
+export const CODE_LOCKED = "Too many tries. Try again in 15 minutes, or sign in with your password.";
 export const CODE_WRONG = "That code is wrong or expired.";
 export const SIGNED_OUT_EVERYWHERE = "Signed out of every app and device.";
 
 const SEND_WAIT = "Too many code emails were requested. Wait a minute, then send a new code.";
 const SIGN_IN_FAILED = "Fillip could not finish sign-in. Send a new code and try again.";
 const AUTH_REQUIRED = "Authentication required.";
+const WRONG_TOKEN = "Sign out everywhere needs the session from signing in, not a connection token.";
+const SIGN_OUT_FAILED = "Fillip could not sign out every session. Try again.";
 const PAD_MS = 500;
 const EMAIL_WRONG_LIMIT = 5;
 const IP_SEND_LIMIT = 5;
@@ -386,10 +388,32 @@ function grantClientId(grant: unknown): string {
   return "";
 }
 
-async function revokeGrants(jwt: string): Promise<void> {
+function jwtClaims(token: string): Record<string, unknown> | null {
+  const parts = token.split(".");
+  if (parts.length !== 3 || !parts[1]) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as unknown;
+    return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+/** An MCP OAuth access token is a valid bearer of the wrong type for global logout. */
+function oauthAccessToken(token: string): boolean {
+  const claims = jwtClaims(token);
+  if (!claims) return false;
+  if (typeof claims.client_id === "string" && claims.client_id) return true;
+  const aud = claims.aud;
+  const audiences = Array.isArray(aud) ? aud : typeof aud === "string" ? [aud] : [];
+  return audiences.some((item) => typeof item === "string" && item.replace(/\/+$/, "").endsWith("/mcp"));
+}
+
+async function revokeGrants(jwt: string): Promise<"ok" | "wrong-type" | "failed"> {
   const listed = await userGotrue("GET", "/auth/v1/user/oauth/grants", jwt);
-  if (listed.status === 404) return;
-  if (listed.status < 200 || listed.status >= 300) throw new Error("grants");
+  if (listed.status === 404) return "ok";
+  if (listed.status === 401 || listed.status === 403) return "wrong-type";
+  if (listed.status < 200 || listed.status >= 300) return "failed";
   const body = listed.json;
   const rows = Array.isArray(body)
     ? body
@@ -401,8 +425,10 @@ async function revokeGrants(jwt: string): Promise<void> {
     if (!id) continue;
     const deleted = await userGotrue("DELETE", `/auth/v1/user/oauth/grants?client_id=${encodeURIComponent(id)}`, jwt);
     if (deleted.status === 404) continue;
-    if (deleted.status < 200 || deleted.status >= 300) throw new Error("revoke");
+    if (deleted.status === 401 || deleted.status === 403) return "wrong-type";
+    if (deleted.status < 200 || deleted.status >= 300) return "failed";
   }
+  return "ok";
 }
 
 async function signOutEverywhere(req: Request, res: Response): Promise<void> {
@@ -421,10 +447,30 @@ async function signOutEverywhere(req: Request, res: Response): Promise<void> {
     res.status(401).json({ ok: false, message: AUTH_REQUIRED });
     return;
   }
-  await revokeGrants(token);
+  if (oauthAccessToken(token)) {
+    res.status(403).json({ ok: false, message: WRONG_TOKEN });
+    return;
+  }
+  const grants = await revokeGrants(token);
+  if (grants === "wrong-type") {
+    res.status(403).json({ ok: false, message: WRONG_TOKEN });
+    return;
+  }
+  if (grants === "failed") {
+    res.status(502).json({ ok: false, message: SIGN_OUT_FAILED });
+    return;
+  }
   const loggedOut = await gotrue("/auth/v1/logout?scope=global", {}, serviceKey() || anonKey(), token);
+  if (loggedOut.status === 401) {
+    res.status(401).json({ ok: false, message: AUTH_REQUIRED });
+    return;
+  }
+  if (loggedOut.status === 403) {
+    res.status(403).json({ ok: false, message: WRONG_TOKEN });
+    return;
+  }
   if (loggedOut.status < 200 || loggedOut.status >= 300) {
-    res.status(502).json({ ok: false, message: "Fillip could not sign out every session. Try again." });
+    res.status(502).json({ ok: false, message: SIGN_OUT_FAILED });
     return;
   }
   res.set("Cache-Control", "no-store").json({ ok: true, message: SIGNED_OUT_EVERYWHERE });
@@ -449,7 +495,7 @@ export function installCodeAuth(app: Express): void {
     try {
       await signOutEverywhere(req, res);
     } catch {
-      if (!res.headersSent) res.status(502).json({ ok: false, message: "Fillip could not sign out every session. Try again." });
+      if (!res.headersSent) res.status(502).json({ ok: false, message: SIGN_OUT_FAILED });
     }
   });
 }

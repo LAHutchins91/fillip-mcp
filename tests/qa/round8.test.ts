@@ -5,6 +5,7 @@
  */
 import http, { type IncomingMessage, type Server } from "node:http";
 import { spawn, type ChildProcess } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -745,8 +746,8 @@ const booted: ChildProcess[] = [];
 function boot(overrides: Record<string, string>): Promise<{ code: number | null; output: string; listened: boolean }> {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, ["--import", "tsx", "src/server.ts"], {
-      cwd: "/workspace",
-      env: { ...process.env, PORT: "0", ...overrides },
+      cwd: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.."),
+      env: { ...process.env, PORT: "0", FILLIP_PKCE_SECRET: "p".repeat(32), ...overrides },
       stdio: ["ignore", "pipe", "pipe"]
     });
     booted.push(child);

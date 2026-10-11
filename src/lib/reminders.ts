@@ -1,10 +1,14 @@
+import { openCapMessage } from "./errors.js";
 import { calendarFeed } from "./ics.js";
-import { newId, OpenCapKeptError, type DeliveryMark, type OpenCap, type ReminderStore, type ServiceStore } from "./store.js";
+import { newId, OpenCapError, OpenCapKeptError, type DeliveryMark, type OpenCap, type ReminderStore, type ServiceStore } from "./store.js";
 import { newSecretToken, telegramDeepLink, telegramUsername } from "./telegram.js";
 import { applyRepeat, attachEndDate, describeRecurrence, nextFire, parseClock, recurrenceFromCadence, resolveWhen, WhenError, type RepeatChoice, type ResolvedWhen } from "./time.js";
 import { MAX_ACTIVE_REMINDERS, MAX_CREATES_PER_HOUR, type Actor, type DeliveryChannel, type DigestSettings, type Reminder, type ReminderStatus } from "./types.js";
 import { allowanceFor, assertWithinAllowance, freeOpenMessage, freeOpenReminders, STAND_IN_CAPS, tierFor, type Allowance, type TierCaps } from "./usage.js";
 import { assertTimeZone, formatClock, formatShortWhen, formatWhen, localDateKey, zonedParts } from "./zone.js";
+
+/** A removed reminder can be restored until this long after removed_at. The delivery cron then deletes it. */
+export const REMOVE_RETAIN_MS = 30 * 24 * 60 * 60 * 1000;
 
 export type ReminderView = {
   id: string;
@@ -204,9 +208,10 @@ export async function listReminders(store: ReminderStore, ownerId: string, input
   timezone?: string;
 }, now: Date, caps: TierCaps = STAND_IN_CAPS): Promise<ReminderView[]> {
   const rows = await store.listReminders(ownerId, { status: input.status ?? "all" });
+  const kept = rows.filter((row) => row.status !== "removed");
   const visible = input.status || input.includeDone
-    ? rows
-    : rows.filter((row) => row.status !== "completed" && row.status !== "cancelled");
+    ? kept
+    : kept.filter((row) => row.status !== "completed" && row.status !== "cancelled");
   const usage = await store.getUsage(ownerId);
   const marks = await store.listDeliveryMarks(ownerId);
   const weekEnd = now.getTime() + 7 * 86_400_000;
@@ -300,6 +305,7 @@ function applyScheduleEdit(reminder: Reminder, zone: string, now: Date, repeat: 
 export async function snoozeOrReschedule(store: ReminderStore, ownerId: string, id: string, until: string | undefined, timezone: string | undefined, now: Date, action: ReminderMove = "reschedule", schedule?: { repeat?: string; end?: string; what?: string }, acceptShiftedTime = false): Promise<ReminderView> {
   const reminder = await store.getReminder(ownerId, id);
   if (!reminder) throw new Error("Reminder not found");
+  if (reminder.status === "removed") throw new Error("That reminder was removed. Restore it to change it.");
   if (reminder.status === "cancelled" || reminder.status === "completed") {
     throw new Error(`That reminder is already ${reminder.status}.`);
   }
@@ -366,15 +372,76 @@ async function sendInFlight(store: ReminderStore, ownerId: string, id: string, n
   return store.reminderSendInFlight(ownerId, id, now);
 }
 
-export type DeleteResult = { id: string; what: string; status: "deleted"; note: string };
+const REMOVED_NOTE = "Removed. It can be restored for 30 days.";
 
-export async function completeOrCancel(store: ReminderStore, ownerId: string, id: string, action: "complete" | "cancel" | "delete", now: Date): Promise<ReminderView | DeleteResult> {
+export type RemoveResult = { id: string; what: string; status: "removed"; note: string };
+
+export async function removeReminder(store: ReminderStore, ownerId: string, id: string, now: Date): Promise<RemoveResult> {
   const reminder = await store.getReminder(ownerId, id);
   if (!reminder) throw new Error("Reminder not found");
-  if (action === "delete") {
-    await store.deleteReminder(ownerId, id);
-    return { id: reminder.id, what: reminder.what, status: "deleted", note: "Deleted." };
+  if (reminder.status === "removed") return { id: reminder.id, what: reminder.what, status: "removed", note: REMOVED_NOTE };
+  const saved = await store.saveReminder({
+    ...reminder,
+    status: "removed",
+    resumeStatus: reminder.status === "paused" ? "paused" : "active",
+    removedAt: now.toISOString(),
+    holdUntil: null,
+    updatedAt: now.toISOString()
+  });
+  return { id: saved.id, what: saved.what, status: "removed", note: REMOVED_NOTE };
+}
+
+function restoredFireAt(reminder: Reminder, now: Date, prior: "active" | "paused"): string {
+  if (new Date(reminder.fireAt).getTime() > now.getTime()) return reminder.fireAt;
+  if (reminder.recurrence) {
+    const upcoming = nextFire(reminder.recurrence, reminder.timezone, now);
+    if (!upcoming) throw new Error("That repeating reminder has already ended.");
+    return upcoming.toISOString();
   }
+  if (prior === "paused") return reminder.fireAt;
+  throw new Error("That one-time reminder is already in the past. Name a new time to move it.");
+}
+
+export async function restoreReminder(store: ReminderStore, ownerId: string, id: string, now: Date): Promise<ReminderView> {
+  const reminder = await store.getReminder(ownerId, id);
+  if (!reminder || reminder.status !== "removed") throw new Error("Reminder not found");
+  const removedAt = Date.parse(reminder.removedAt ?? "");
+  if (!Number.isFinite(removedAt) || now.getTime() - removedAt > REMOVE_RETAIN_MS) {
+    throw new Error("That reminder can no longer be restored.");
+  }
+  const prior = reminder.resumeStatus === "paused" ? "paused" : "active";
+  const fireAt = restoredFireAt(reminder, now, prior);
+  if (prior === "active") {
+    const usage = await store.getUsage(ownerId);
+    const open = openCapFor(usage, STAND_IN_CAPS);
+    if ((await store.countActive(ownerId)) >= open.cap) throw new OpenCapError(open.message);
+  }
+  let saved: Reminder;
+  try {
+    saved = await store.saveReminder({
+      ...reminder,
+      status: prior,
+      fireAt,
+      removedAt: null,
+      resumeStatus: null,
+      holdUntil: null,
+      updatedAt: now.toISOString()
+    });
+  } catch (error) {
+    const cap = openCapMessage(error);
+    if (cap) throw new OpenCapError(cap);
+    throw error;
+  }
+  const note = prior === "paused"
+    ? "Restored. It stays paused until you resume it."
+    : `Restored. Next ping is ${formatWhen(new Date(saved.fireAt), saved.timezone)}.`;
+  return view(saved, now, { note });
+}
+
+export async function completeOrCancel(store: ReminderStore, ownerId: string, id: string, action: "complete" | "cancel", now: Date): Promise<ReminderView> {
+  const reminder = await store.getReminder(ownerId, id);
+  if (!reminder) throw new Error("Reminder not found");
+  if (reminder.status === "removed") throw new Error("That reminder was removed. Restore it to change it.");
   const status: ReminderStatus = action === "complete" ? "completed" : "cancelled";
   const saved = await store.saveReminder({
     ...reminder,

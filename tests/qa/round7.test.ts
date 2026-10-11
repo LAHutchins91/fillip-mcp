@@ -597,10 +597,10 @@ describe("QA round 7 HTTP catalog, lockout, and sign-out", () => {
     });
     expect(open.status).toBe(200);
     const tools = (JSON.parse(open.text) as { result?: { tools?: Array<{ name: string; title?: string; description?: string; annotations?: { destructiveHint?: boolean } }> } }).result?.tools ?? [];
-    const deleting = tools.find((tool) => tool.name === "delete_reminder");
-    expect(deleting?.title).toBe("Delete reminder");
-    expect(deleting?.description).toBe("Removes a reminder the user asked to delete.");
-    expect(deleting?.annotations?.destructiveHint).toBe(true);
+    const deleting = tools.find((tool) => tool.name === "remove_reminder");
+    expect(deleting?.title).toBe("Remove reminder");
+    expect(deleting?.description).toBe("Stops a reminder and removes it from the user's list. It can be restored for 30 days.");
+    expect(deleting?.annotations?.destructiveHint).toBe(false);
     expect(JSON.stringify(deleting)).not.toMatch(/permanently|erases|cannot be undone|destroy|wipe/i);
     const closed = await httpCall(base, "POST", "/mcp", JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }), {
       "content-type": "application/json",

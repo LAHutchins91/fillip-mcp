@@ -780,16 +780,17 @@ describe("QA round 4 crash recovery and schedule edits", () => {
     expect(overlap.note).toMatch(/ambiguous/);
   });
 
-  it("QA-PASS: delete_reminder removes one user's reminder and is marked destructive", async () => {
+  it("QA-PASS: remove_reminder hides one user's reminder and is not destructive", async () => {
     const store = new MemoryFillipStore();
     freeUser(store);
     freeUser(store, other);
     const mine = await setReminder(store, actor, { what: "Mine", when: "tomorrow at 9am", timezone: "UTC" }, now, caps);
     const theirs = await setReminder(store, other, { what: "Theirs", when: "tomorrow at 9am", timezone: "UTC" }, now, caps);
-    const { completeOrCancel } = await import("../../src/lib/reminders.js");
-    const removed = await completeOrCancel(store, actor.id, mine.id, "delete", now);
-    expect(removed).toMatchObject({ status: "deleted" });
-    expect(store.reminders.map((row) => row.id)).toEqual([theirs.id]);
+    const { removeReminder } = await import("../../src/lib/reminders.js");
+    const removed = await removeReminder(store, actor.id, mine.id, now);
+    expect(removed).toMatchObject({ status: "removed", id: mine.id });
+    expect(store.reminders.find((row) => row.id === mine.id)?.status).toBe("removed");
+    expect(store.reminders.find((row) => row.id === theirs.id)?.status).toBe("active");
     expect(OpenCapError).toBeTruthy();
   });
 });
@@ -831,9 +832,10 @@ describe("QA round 4 auth, logs, and copy", () => {
     expect(listed.status).toBe(200);
     const tools = JSON.parse(listed.text) as { result?: { tools?: Array<{ name: string; annotations?: { destructiveHint?: boolean } }> } };
     const names = tools.result?.tools?.map((tool) => tool.name) ?? [];
-    expect(names).toContain("delete_reminder");
-    const deleting = tools.result?.tools?.find((tool) => tool.name === "delete_reminder");
-    expect(deleting?.annotations?.destructiveHint).toBe(true);
+    expect(names).toContain("remove_reminder");
+    expect(names).not.toContain("delete_reminder");
+    const deleting = tools.result?.tools?.find((tool) => tool.name === "remove_reminder");
+    expect(deleting?.annotations?.destructiveHint).toBe(false);
     const methods = ["initialize", "tools/call", "resources/list", "ping", "notifications/initialized"];
     for (const method of methods) {
       const response = await post("POST", { jsonrpc: "2.0", id: 2, method, params: method === "tools/call" ? { name: "list_reminders", arguments: {} } : {} });

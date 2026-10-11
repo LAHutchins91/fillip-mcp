@@ -61,6 +61,12 @@ export class FileFillipStore extends MemoryFillipStore {
     this.persist();
   }
 
+  override async purgeRemoved(cutoffIso: string): Promise<number> {
+    const count = await super.purgeRemoved(cutoffIso);
+    if (count > 0) this.persist();
+    return count;
+  }
+
   override async rememberOwner(contact: OwnerContact): Promise<void> {
     await super.rememberOwner(contact);
     this.persist();

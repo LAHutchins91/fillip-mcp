@@ -51,8 +51,27 @@ export function otpFailure(message: string): string {
   return "Fillip could not finish sign-in. Send a new code and try again.";
 }
 
+const DEV_PKCE_SECRET = "fillip-dev-pkce";
+
+function productionPkce(): boolean {
+  return process.env.NODE_ENV === "production" || process.env.VERCEL_ENV === "production";
+}
+
+/** Production must set this itself. The message never includes the secret. */
+export function pkceSecretProblem(): string | null {
+  if (!productionPkce()) return null;
+  const secret = (process.env.FILLIP_PKCE_SECRET || "").trim();
+  if (secret.length >= 32) return null;
+  return "FILLIP_PKCE_SECRET must be set to at least 32 characters before Fillip starts in production.";
+}
+
 function pkceSecret(): string {
-  return process.env.FILLIP_UNSUBSCRIBE_SECRET || process.env.CRON_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || "fillip-pkce";
+  const secret = (process.env.FILLIP_PKCE_SECRET || "").trim();
+  if (secret.length >= 32) return secret;
+  if (productionPkce()) {
+    throw new Error("FILLIP_PKCE_SECRET must be set to at least 32 characters before Fillip starts in production.");
+  }
+  return DEV_PKCE_SECRET;
 }
 
 export function signPkceProof(method: string, challenge: string, nowMs = Date.now()): string {

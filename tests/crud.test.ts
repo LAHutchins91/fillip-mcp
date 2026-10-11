@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MemoryFillipStore } from "../src/lib/memory-store.js";
-import { completeOrCancel, followUp, listReminders, saveDigestSettings, setReminder, snoozeOrReschedule } from "../src/lib/reminders.js";
+import { completeOrCancel, followUp, listReminders, removeReminder, saveDigestSettings, setReminder, snoozeOrReschedule } from "../src/lib/reminders.js";
 import { ReminderConflictError } from "../src/lib/store.js";
 import { WhenError } from "../src/lib/time.js";
 import { MAX_ACTIVE_REMINDERS, type Actor, type Delivery, type Reminder } from "../src/lib/types.js";
@@ -246,7 +246,7 @@ describe("reminder CRUD", () => {
     expect(off.enabled).toBe(false);
   });
 
-  it("hides cancelled and completed reminders until include_done, and delete removes deliveries", async () => {
+  it("hides cancelled and completed reminders until include_done, and remove hides the reminder", async () => {
     const store = storeWithActor();
     const open = await setReminder(store, actor, { what: "Still open", when: "tomorrow 9am", timezone: "UTC" }, now);
     const done = await setReminder(store, actor, { what: "Finished", when: "tomorrow 10am", timezone: "UTC" }, now);
@@ -271,10 +271,10 @@ describe("reminder CRUD", () => {
     expect(listed.map((row) => row.what).sort()).toEqual(["Drop me", "Still open"]);
     const withDone = await listReminders(store, actor.id, { includeDone: true }, now);
     expect(withDone.map((row) => row.what)).toContain("Finished");
-    const removed = await completeOrCancel(store, actor.id, dropped.id, "delete", now);
-    expect(removed).toMatchObject({ status: "deleted", what: "Drop me" });
-    expect(await store.getReminder(actor.id, dropped.id)).toBeNull();
-    expect(store.deliveries.filter((row) => row.reminderId === dropped.id)).toHaveLength(0);
+    const removed = await removeReminder(store, actor.id, dropped.id, now);
+    expect(removed).toMatchObject({ status: "removed", what: "Drop me" });
+    expect((await store.getReminder(actor.id, dropped.id))?.status).toBe("removed");
+    expect(store.deliveries.filter((row) => row.reminderId === dropped.id)).toHaveLength(1);
     expect((await listReminders(store, actor.id, {}, now)).map((row) => row.id)).toEqual([open.id]);
   });
 
@@ -429,11 +429,12 @@ describe("reminder CRUD", () => {
     expect(store.reminders.filter((row) => row.status === "cancelled" || row.what === "DST check")).toHaveLength(0);
   });
 
-  it("says Deleted when a reminder is removed", async () => {
+  it("says a removed reminder can be restored for 30 days", async () => {
     const store = storeWithActor();
     const created = await setReminder(store, actor, { what: "QA two", when: "tomorrow at 9am", timezone: "UTC" }, now);
-    const removed = await completeOrCancel(store, actor.id, created.id, "delete", now);
-    expect(removed).toEqual({ id: created.id, what: "QA two", status: "deleted", note: "Deleted." });
-    expect(store.reminders).toHaveLength(0);
+    const removed = await removeReminder(store, actor.id, created.id, now);
+    expect(removed).toEqual({ id: created.id, what: "QA two", status: "removed", note: "Removed. It can be restored for 30 days." });
+    expect(store.reminders).toHaveLength(1);
+    expect(store.reminders[0]?.status).toBe("removed");
   });
 });

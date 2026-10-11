@@ -1,6 +1,6 @@
 import { assertSingleRecipient, ProviderQuotaError, type MailSender, type OutboundEmail } from "./email.js";
 import { reminderCalendar } from "./ics.js";
-import { delayLength, NOT_DELIVERED_NOTE } from "./reminders.js";
+import { delayLength, NOT_DELIVERED_NOTE, REMOVE_RETAIN_MS } from "./reminders.js";
 import { ReminderConflictError, type ServiceStore } from "./store.js";
 import { signStopToken } from "./stop-token.js";
 import { isTelegramBackoff, type TelegramSender } from "./telegram.js";
@@ -323,6 +323,7 @@ export async function runDueJob(options: {
   if (!options.from.trim()) throw new Error("Sender identity is not configured");
   if (!options.unsubscribeSecret.trim()) throw new Error("Unsubscribe secret is not configured");
   const nowIso = options.now.toISOString();
+  await options.store.purgeRemoved(new Date(options.now.getTime() - REMOVE_RETAIN_MS).toISOString());
   const since = new Date(options.now.getTime() - DAY_MS).toISOString();
   const staleBefore = new Date(options.now.getTime() - STALE_MS).toISOString();
   const global = await readGlobalEmailSnapshot(options.store, options.now, options.global);
@@ -474,9 +475,14 @@ export async function runDueJob(options: {
           globalMonthStartIso: monthStart(options.now).toISOString(),
           globalDayLimit: options.global.perDay,
           globalMonthLimit: options.global.perMonth,
-          countGlobal: false
+          countGlobal: false,
+          reminderId: reminder.id
         });
         if (!slot.ok) {
+          if (slot.reason === "removed") {
+            report.skipped += 1;
+            continue;
+          }
           const until = slot.reason === "month" || slot.reason === "global-month"
             ? nextLocalMonthStart(options.now, reminder.timezone).toISOString()
             : nextLocalDayStart(options.now, reminder.timezone).toISOString();
@@ -501,6 +507,10 @@ export async function runDueJob(options: {
               nowIso,
               staleBeforeIso: staleBefore
             });
+            if (claim.outcome === "withheld") {
+              report.skipped += 1;
+              continue;
+            }
             if (claim.outcome === "already-sent") {
               telegramDone = true;
               if (missedAttempt(claim.delivery, staleBefore)) {
@@ -604,9 +614,14 @@ export async function runDueJob(options: {
           globalMonthStartIso: monthStart(options.now).toISOString(),
           globalDayLimit: options.global.perDay,
           globalMonthLimit: options.global.perMonth,
-          countGlobal: true
+          countGlobal: true,
+          reminderId: reminder.id
         });
         if (!slot.ok) {
+          if (slot.reason === "removed") {
+            report.skipped += 1;
+            continue;
+          }
           const until = slot.reason === "global-month"
             ? global.monthResetsAt
             : slot.reason === "month"
@@ -636,6 +651,10 @@ export async function runDueJob(options: {
             staleBeforeIso: staleBefore
           });
           const outsideAttempt = missedAttempt(claim.delivery, staleBefore);
+          if (claim.outcome === "withheld") {
+            report.skipped += 1;
+            continue;
+          }
           if (claim.outcome === "already-sent") {
             if (outsideAttempt) await recordUndelivered(options.store, claim.delivery);
             emailDone = true;
@@ -799,7 +818,7 @@ async function sendDigest(
     nowIso,
     staleBeforeIso: staleBefore
   });
-  if (claim.outcome !== "send") {
+  if (claim.outcome === "withheld" || claim.outcome !== "send") {
     if (claim.outcome === "already-sent" && digest.lastSentOn !== today) {
       await options.store.saveDigest({ ...digest, lastSentOn: today, updatedAt: nowIso });
     }

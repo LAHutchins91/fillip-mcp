@@ -30,7 +30,9 @@ const KNOWN = [
   "Choose a timezone",
   "Digest time",
   "That date is not a real calendar day",
-  "Follow-ups need a first time or a cadence"
+  "Follow-ups need a first time or a cadence",
+  "That reminder was removed",
+  "That reminder can no longer be restored"
 ] as const;
 
 /** The trigger raises P0001 with the cap sentence buried in a PostgREST body. Callers should see that sentence, not the wrapper. */

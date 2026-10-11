@@ -34,11 +34,13 @@ create table if not exists public.reminders (
   timezone text not null,
   fire_at timestamptz not null,
   recurrence jsonb,
-  status text not null check (status in ('active', 'fired', 'completed', 'cancelled', 'paused')),
+  status text not null check (status in ('active', 'fired', 'completed', 'cancelled', 'paused', 'removed')),
   hold_until timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
-  completed_at timestamptz
+  completed_at timestamptz,
+  removed_at timestamptz,
+  resume_status text
 );
 
 create table if not exists public.deliveries (
@@ -72,7 +74,17 @@ create table if not exists public.fillip_support_requests (
   created_at timestamptz not null default now()
 );
 
+alter table public.reminders add column if not exists removed_at timestamptz;
+alter table public.reminders add column if not exists resume_status text;
+alter table public.reminders drop constraint if exists reminders_status_check;
+alter table public.reminders add constraint reminders_status_check
+  check (status in ('active', 'fired', 'completed', 'cancelled', 'paused', 'removed'));
+alter table public.reminders drop constraint if exists reminders_resume_status_check;
+alter table public.reminders add constraint reminders_resume_status_check
+  check (resume_status is null or resume_status in ('active', 'paused'));
+
 create index if not exists reminders_due on public.reminders (fire_at) where status = 'active';
+create index if not exists reminders_removed_purge on public.reminders (removed_at) where status = 'removed';
 create index if not exists deliveries_owner_sent on public.deliveries (owner_id, sent_at);
 
 alter table public.profiles enable row level security;
@@ -497,9 +509,72 @@ begin
 end
 $$;
 
+-- One statement: a removed reminder cannot be claimed for send.
+create or replace function public.fillip_claim_sendable(owner uuid, reminder uuid)
+returns boolean
+language plpgsql
+set search_path = public
+as $$
+declare
+  ok boolean;
+begin
+  select true into ok
+  from public.reminders
+  where id = reminder
+    and owner_id = owner
+    and status = 'active'
+  for update;
+  return coalesce(ok, false);
+end;
+$$;
+
+revoke all on function public.fillip_claim_sendable(uuid, uuid) from public, anon, authenticated;
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    grant execute on function public.fillip_claim_sendable(uuid, uuid) to service_role;
+  end if;
+end
+$$;
+
+-- Hard-delete removed reminders older than the cutoff, and their deliveries.
+-- A second call deletes nothing.
+create or replace function public.fillip_purge_removed(cutoff timestamptz)
+returns integer
+language plpgsql
+set search_path = public
+as $$
+declare
+  removed_count integer;
+begin
+  delete from public.deliveries d
+  using public.reminders r
+  where d.reminder_id = r.id
+    and r.status = 'removed'
+    and r.removed_at is not null
+    and r.removed_at < cutoff;
+  delete from public.reminders
+  where status = 'removed'
+    and removed_at is not null
+    and removed_at < cutoff;
+  get diagnostics removed_count = row_count;
+  return removed_count;
+end;
+$$;
+
+revoke all on function public.fillip_purge_removed(timestamptz) from public, anon, authenticated;
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    grant execute on function public.fillip_purge_removed(timestamptz) to service_role;
+  end if;
+end
+$$;
+
 -- Parallel creates and resumes must not pass the free open cap. The advisory
 -- lock and the profile row lock are per owner. An update counts only when the
--- row is newly becoming active, and that check returns before the lock.
+-- row is newly becoming active, so a removed row does not count and restoring
+-- it to active does. That check returns before the lock.
 create or replace function public.fillip_enforce_open_cap()
 returns trigger
 language plpgsql

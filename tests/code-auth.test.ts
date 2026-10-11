@@ -14,6 +14,7 @@ const accessToken = "user-access-token";
 const refreshToken = "refresh-token-secret";
 const sessionToken = "access-token-secret";
 const clientId = "11111111-1111-4111-8111-111111111111";
+const mcpToken = `eyJhbGciOiJIUzI1NiJ9.${Buffer.from(JSON.stringify({ client_id: clientId, aud: "https://fillip.example/mcp", sub: "user-1" })).toString("base64url")}.sig`;
 
 type AttemptRow = {
   subject_kind: string;
@@ -156,13 +157,17 @@ describe("server-side emailed codes and sign-out everywhere", () => {
       }
       if (req.method === "POST" && url.startsWith("/auth/v1/logout")) {
         logouts.push(url);
+        const header = req.headers.authorization ?? "";
+        if (header === "Bearer session-but-logout-fails") return send(500, { msg: "gotrue database unavailable: secret-detail" });
         res.writeHead(204);
         res.end();
         return;
       }
       if (url.startsWith("/auth/v1/user")) {
         const header = req.headers.authorization ?? "";
-        if (header !== `Bearer ${accessToken}`) return send(401, { message: "bad" });
+        if (header === `Bearer ${mcpToken}`) return send(200, { id: "user-1", email: "owner@example.com", msg: "upstream-oauth-detail" });
+        if (header === "Bearer session-but-logout-fails") return send(200, { id: "user-1", email: "owner@example.com" });
+        if (header !== `Bearer ${accessToken}`) return send(401, { message: "bad-upstream-detail" });
         return send(200, { id: "user-1", email: "owner@example.com" });
       }
       if (url.startsWith("/rest/v1/rpc/fillip_bump_code_counter")) {
@@ -381,5 +386,25 @@ describe("server-side emailed codes and sign-out everywhere", () => {
     expect(logouts).toEqual(["/auth/v1/logout?scope=global"]);
     expect(revoked).toEqual([clientId]);
     expect(grants).toEqual([]);
+  });
+
+  it("returns 401 for a bad token and 403 for an MCP OAuth token without the upstream error", async () => {
+    logouts.length = 0;
+    revoked.length = 0;
+    const missing = await post("/auth/sign-out-everywhere", {}, { authorization: "Bearer nope" });
+    expect(missing.status).toBe(401);
+    expect(JSON.parse(missing.text).message).toBe("Authentication required.");
+    expect(missing.text).not.toContain("bad-upstream-detail");
+    const oauth = await post("/auth/sign-out-everywhere", {}, { authorization: `Bearer ${mcpToken}` });
+    expect(oauth.status).toBe(403);
+    expect(oauth.text).not.toContain("upstream-oauth-detail");
+    expect(oauth.text).not.toContain(mcpToken);
+    expect(oauth.text).not.toContain("gotrue");
+    expect(logouts).toEqual([]);
+    expect(revoked).toEqual([]);
+    const failed = await post("/auth/sign-out-everywhere", {}, { authorization: "Bearer session-but-logout-fails" });
+    expect(failed.status).toBe(502);
+    expect(failed.text).not.toContain("secret-detail");
+    expect(failed.text).not.toContain("gotrue database");
   });
 });

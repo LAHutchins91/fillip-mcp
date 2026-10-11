@@ -62,7 +62,7 @@ describe("streamable HTTP", () => {
     const body = await response.json() as { result?: { tools?: Array<{ name: string; title?: string; description?: string; annotations?: { destructiveHint?: boolean }; inputSchema?: { properties?: Record<string, unknown>; required?: string[] } }> } };
     const tools = body.result?.tools ?? [];
     const names = tools.map((tool) => tool.name);
-    expect(names).toEqual(["set_reminder", "list_reminders", "snooze_or_reschedule", "complete_or_cancel", "delete_reminder", "follow_up", "digest_settings", "calendar_feed"]);
+    expect(names).toEqual(["set_reminder", "list_reminders", "snooze_or_reschedule", "complete_or_cancel", "remove_reminder", "restore_reminder", "follow_up", "digest_settings", "calendar_feed"]);
     expect(names).not.toContain("delivery_settings");
     const text = JSON.stringify(tools);
     expect(text).not.toMatch(/\$\d/);
@@ -72,10 +72,11 @@ describe("streamable HTTP", () => {
     expect(properties).toEqual(expect.arrayContaining(["what", "when", "timezone"]));
     expect(properties).not.toEqual(expect.arrayContaining(["email", "to", "recipient"]));
     expect(properties).not.toContain("channel");
-    const deleting = tools.find((tool) => tool.name === "delete_reminder");
-    expect(deleting?.title).toBe("Delete reminder");
-    expect(deleting?.description).toBe("Removes a reminder the user asked to delete.");
-    expect(deleting?.annotations?.destructiveHint).toBe(true);
+    const deleting = tools.find((tool) => tool.name === "remove_reminder") as { title?: string; description?: string; annotations?: { destructiveHint?: boolean; idempotentHint?: boolean } } | undefined;
+    expect(deleting?.title).toBe("Remove reminder");
+    expect(deleting?.description).toBe("Stops a reminder and removes it from the user's list. It can be restored for 30 days.");
+    expect(deleting?.annotations?.destructiveHint).toBe(false);
+    expect(deleting?.annotations?.idempotentHint).toBe(true);
     expect(deleting?.inputSchema?.required ?? []).not.toContain("confirm");
     expect(JSON.stringify(tools)).not.toMatch(/permanently|erases|cannot be undone/i);
     if (previous === undefined) delete process.env.TELEGRAM_BOT_TOKEN;

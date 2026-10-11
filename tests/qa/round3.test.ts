@@ -12,6 +12,7 @@ import { MemoryFillipStore } from "../../src/lib/memory-store.js";
 import {
   calendarLink,
   completeOrCancel,
+  removeReminder,
   listReminders,
   renderCalendarFeed,
   setReminder,
@@ -763,7 +764,11 @@ describe("QA round 3 product behavior", () => {
         error: null
       }
     );
-    await completeOrCancel(memory, actor.id, mine.id, "delete", now);
+    await removeReminder(memory, actor.id, mine.id, now);
+    expect(memory.reminders.find((row) => row.id === mine.id)?.status).toBe("removed");
+    expect(memory.deliveries.some((row) => row.reminderId === mine.id)).toBe(true);
+    const purged = await memory.purgeRemoved(new Date(now.getTime() + 31 * 24 * 60 * 60 * 1000).toISOString());
+    expect(purged).toBe(1);
     expect(memory.reminders.some((row) => row.id === mine.id)).toBe(false);
     expect(memory.deliveries.some((row) => row.reminderId === mine.id)).toBe(false);
     expect(memory.deliveries.some((row) => row.dedupeKey === "digest:a")).toBe(true);
@@ -823,7 +828,10 @@ describe("QA round 3 product behavior", () => {
       }
     );
     data?.digests.push({ owner_id: actor.id, enabled: true, hour: 8, minute: 0, timezone: "UTC" });
-    await completeOrCancel(hosted, actor.id, hostedMine.id, "delete", now);
+    await removeReminder(hosted, actor.id, hostedMine.id, now);
+    expect(data?.reminders.find((row) => row.id === hostedMine.id)?.status).toBe("removed");
+    expect(data?.deliveries.some((row) => row.dedupe_key === "hosted-mine")).toBe(true);
+    await hosted.purgeRemoved(new Date(now.getTime() + 31 * 24 * 60 * 60 * 1000).toISOString());
     expect(data?.reminders.some((row) => row.id === hostedMine.id)).toBe(false);
     expect(data?.deliveries.some((row) => row.dedupe_key === "hosted-mine")).toBe(false);
     expect(data?.deliveries.some((row) => row.dedupe_key === "hosted-digest")).toBe(true);

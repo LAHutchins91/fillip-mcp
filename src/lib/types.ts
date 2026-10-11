@@ -16,7 +16,7 @@ export type Recurrence =
 
 export type DeliveryChannel = "email" | "telegram" | "both";
 
-export type ReminderStatus = "active" | "fired" | "completed" | "cancelled" | "paused";
+export type ReminderStatus = "active" | "fired" | "completed" | "cancelled" | "paused" | "removed";
 export type ReminderKind = "reminder" | "follow_up";
 
 export type Reminder = {
@@ -34,6 +34,10 @@ export type Reminder = {
   createdAt: string;
   updatedAt: string;
   completedAt: string | null;
+  /** Set while status is removed. Restore is refused after 30 days, and the cron then deletes the row. */
+  removedAt?: string | null;
+  /** active or paused, remembered so restore returns the same reminder to that state. */
+  resumeStatus?: "active" | "paused" | null;
 };
 
 export type DeliveryStatus = "sending" | "sent" | "failed" | "skipped";
@@ -93,7 +97,7 @@ export type OwnerIdentity = {
 
 export type ClaimResult = {
   delivery: Delivery;
-  outcome: "send" | "already-sent" | "in-progress";
+  outcome: "send" | "already-sent" | "in-progress" | "withheld";
 };
 
 export type Actor = {

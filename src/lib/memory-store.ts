@@ -179,6 +179,38 @@ export class MemoryFillipStore implements ServiceStore {
     return [...this.digests.values()].filter((row) => row.enabled);
   }
 
+  private reminderIsActive(ownerId: string, reminderId: string | null): boolean {
+    if (!reminderId) return true;
+    return this.reminders.some((row) => row.ownerId === ownerId && row.id === reminderId && row.status === "active");
+  }
+
+  private withheldClaim(input: {
+    ownerId: string;
+    reminderId: string | null;
+    dedupeKey: string;
+    occurrenceAt: string;
+    idempotencyKey: string;
+    channel: "email" | "telegram";
+    nowIso: string;
+  }): ClaimResult {
+    const existing = this.deliveries.find((row) => row.dedupeKey === input.dedupeKey);
+    const delivery: Delivery = existing ?? {
+      id: input.dedupeKey,
+      ownerId: input.ownerId,
+      reminderId: input.reminderId,
+      dedupeKey: input.dedupeKey,
+      occurrenceAt: input.occurrenceAt,
+      status: "skipped",
+      idempotencyKey: input.idempotencyKey,
+      channel: input.channel,
+      providerId: null,
+      startedAt: input.nowIso,
+      sentAt: null,
+      error: null
+    };
+    return { delivery, outcome: "withheld" };
+  }
+
   async claimDelivery(input: {
     ownerId: string;
     reminderId: string | null;
@@ -189,6 +221,7 @@ export class MemoryFillipStore implements ServiceStore {
     nowIso: string;
     staleBeforeIso: string;
   }): Promise<ClaimResult> {
+    if (!this.reminderIsActive(input.ownerId, input.reminderId)) return this.withheldClaim(input);
     const existing = this.deliveries.find((row) => row.dedupeKey === input.dedupeKey);
     if (!existing) {
       const delivery: Delivery = {
@@ -206,6 +239,7 @@ export class MemoryFillipStore implements ServiceStore {
         error: null
       };
       this.deliveries.push(delivery);
+      if (!this.reminderIsActive(input.ownerId, input.reminderId)) return this.withheldClaim(input);
       return { delivery, outcome: "send" };
     }
     const attempt = existing.providerId === "attempt";
@@ -220,6 +254,7 @@ export class MemoryFillipStore implements ServiceStore {
       const age = Date.parse(input.nowIso) - Date.parse(existing.startedAt);
       if (existing.channel === "email" && Number.isFinite(age) && age <= 24 * 60 * 60 * 1000) {
         existing.idempotencyKey = input.idempotencyKey;
+        if (!this.reminderIsActive(input.ownerId, input.reminderId)) return this.withheldClaim(input);
         return { delivery: existing, outcome: "send" };
       }
       return { delivery: existing, outcome: "already-sent" };
@@ -231,6 +266,7 @@ export class MemoryFillipStore implements ServiceStore {
     existing.startedAt = input.nowIso;
     existing.error = null;
     existing.idempotencyKey = input.idempotencyKey;
+    if (!this.reminderIsActive(input.ownerId, input.reminderId)) return this.withheldClaim(input);
     return { delivery: existing, outcome: "send" };
   }
 
@@ -299,6 +335,7 @@ export class MemoryFillipStore implements ServiceStore {
   }
 
   reserveSend(input: SendReserve): SendReserveResult {
+    if (input.reminderId && !this.reminderIsActive(input.ownerId, input.reminderId)) return { ok: false, reason: "removed" };
     const contact = this.contacts.get(input.ownerId) ?? null;
     const ownerHolds = this.holds.filter((hold) => hold.ownerId === input.ownerId).length;
     const monthUsed = sentThisMonth(contact, input.now, input.timeZone) + ownerHolds;
@@ -330,6 +367,15 @@ export class MemoryFillipStore implements ServiceStore {
 
   finishSend(idempotencyKey: string): void {
     this.inFlight.delete(idempotencyKey);
+  }
+
+  async purgeRemoved(cutoffIso: string): Promise<number> {
+    const doomed = this.reminders.filter((row) => row.status === "removed" && row.removedAt && row.removedAt < cutoffIso);
+    if (!doomed.length) return 0;
+    const ids = new Set(doomed.map((row) => row.id));
+    this.deliveries = this.deliveries.filter((row) => !row.reminderId || !ids.has(row.reminderId));
+    this.reminders = this.reminders.filter((row) => !ids.has(row.id));
+    return doomed.length;
   }
 }
 
