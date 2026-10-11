@@ -34,6 +34,13 @@ export class MemoryFillipStore implements ServiceStore {
     return reminder;
   }
 
+  async deleteReminder(ownerId: string, id: string): Promise<void> {
+    const index = this.reminders.findIndex((row) => row.id === id && row.ownerId === ownerId);
+    if (index < 0) throw new Error("Reminder not found");
+    this.reminders.splice(index, 1);
+    this.deliveries = this.deliveries.filter((row) => !(row.ownerId === ownerId && row.reminderId === id));
+  }
+
   async countCreatedSince(ownerId: string, sinceIso: string): Promise<number> {
     return this.reminders.filter((row) => row.ownerId === ownerId && row.createdAt >= sinceIso).length;
   }

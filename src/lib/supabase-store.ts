@@ -163,6 +163,13 @@ export class SupabaseFillipStore implements ServiceStore {
     return fromReminder(row);
   }
 
+  async deleteReminder(ownerId: string, id: string): Promise<void> {
+    this.owned(ownerId);
+    const minimal = { method: "DELETE", headers: { Prefer: "return=minimal" } };
+    await this.db(`/rest/v1/deliveries?reminder_id=eq.${encodeURIComponent(id)}&owner_id=eq.${encodeURIComponent(ownerId)}`, minimal);
+    await this.db(`/rest/v1/reminders?id=eq.${encodeURIComponent(id)}&owner_id=eq.${encodeURIComponent(ownerId)}`, minimal);
+  }
+
   async saveReminder(reminder: Reminder): Promise<Reminder> {
     this.owned(reminder.ownerId);
     const value = await this.db(`/rest/v1/reminders?id=eq.${encodeURIComponent(reminder.id)}&owner_id=eq.${encodeURIComponent(reminder.ownerId)}`, {

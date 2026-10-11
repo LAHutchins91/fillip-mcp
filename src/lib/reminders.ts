@@ -1,7 +1,7 @@
 import { calendarFeed } from "./ics.js";
 import { newId, type ReminderStore, type ServiceStore } from "./store.js";
 import { newSecretToken, telegramDeepLink, telegramUsername } from "./telegram.js";
-import { applyRepeat, describeRecurrence, nextFire, parseClock, recurrenceFromCadence, resolveWhen, type RepeatChoice, type ResolvedWhen } from "./time.js";
+import { applyRepeat, attachEndDate, describeRecurrence, nextFire, parseClock, recurrenceFromCadence, resolveWhen, type RepeatChoice, type ResolvedWhen } from "./time.js";
 import { MAX_ACTIVE_REMINDERS, MAX_CREATES_PER_HOUR, type Actor, type DeliveryChannel, type DigestSettings, type Reminder, type ReminderStatus } from "./types.js";
 import { allowanceFor, assertWithinAllowance, freeOpenMessage, freeOpenReminders, STAND_IN_CAPS, tierFor, type Allowance, type TierCaps } from "./usage.js";
 import { assertTimeZone, formatWhen, localDateKey, zonedParts } from "./zone.js";
@@ -53,7 +53,7 @@ function view(reminder: Reminder, now: Date, extra?: { corrected?: boolean; note
     timezone: reminder.timezone,
     fireAt: reminder.fireAt,
     localTime: formatWhen(new Date(reminder.fireAt), reminder.timezone),
-    repeats: describeRecurrence(reminder.recurrence),
+    repeats: describeRecurrence(reminder.recurrence, reminder.timezone),
     channel: reminder.channel ?? "email",
     state: delayed ? "delayed" : reminder.status,
     delayed,
@@ -88,8 +88,8 @@ function channelNote(channel: DeliveryChannel): string {
   return "Fillip will email the verified address on this account.";
 }
 
-function followNote(channel: DeliveryChannel, recurrence: Reminder["recurrence"]): string {
-  const repeats = describeRecurrence(recurrence);
+function followNote(channel: DeliveryChannel, recurrence: Reminder["recurrence"], timeZone: string): string {
+  const repeats = describeRecurrence(recurrence, timeZone);
   const ended = Boolean(recurrence?.ends && (recurrence.ends.until || recurrence.ends.count));
   const stop = ended
     ? "It stops at that limit even if it is not marked done."
@@ -129,6 +129,7 @@ export async function setReminder(store: ReminderStore, actor: Actor, input: {
   when: string;
   timezone: string;
   repeat?: RepeatChoice;
+  until?: string;
   context?: string | null;
   channel?: DeliveryChannel;
 }, now: Date, caps: TierCaps = STAND_IN_CAPS, telegramEnabled = false): Promise<ReminderView> {
@@ -136,7 +137,8 @@ export async function setReminder(store: ReminderStore, actor: Actor, input: {
   await assertWithinAllowance(store, actor.id, now, caps);
   const usage = await store.getUsage(actor.id);
   const channel = chosenChannel(input.channel, usage?.defaultChannel, telegramEnabled);
-  const resolved = applyRepeat(resolveWhen(input.when, input.timezone, now), input.repeat, input.timezone);
+  let resolved = applyRepeat(resolveWhen(input.when, input.timezone, now), input.repeat, input.timezone);
+  if (input.until?.trim()) resolved = attachEndDate(resolved, input.until, input.timezone, now);
   const reminder = await store.createReminder(stamp(actor, input.what, input.context ?? null, input.timezone, resolved, "reminder", channel, now));
   const note = [resolved.note, channelNote(channel)].filter(Boolean).join(" ");
   return view(reminder, now, { corrected: resolved.corrected, note });
@@ -150,13 +152,17 @@ function holdExplanation(reminder: Reminder, allowance: Allowance): string | nul
 
 export async function listReminders(store: ReminderStore, ownerId: string, input: {
   status?: ReminderStatus | "all";
+  includeDone?: boolean;
   range?: "upcoming" | "today" | "week" | "past" | "any";
   timezone?: string;
 }, now: Date, caps: TierCaps = STAND_IN_CAPS): Promise<ReminderView[]> {
-  const rows = await store.listReminders(ownerId, { status: input.status ?? "active" });
+  const rows = await store.listReminders(ownerId, { status: input.status ?? "all" });
+  const visible = input.status || input.includeDone
+    ? rows
+    : rows.filter((row) => row.status !== "completed" && row.status !== "cancelled");
   const usage = await store.getUsage(ownerId);
   const weekEnd = now.getTime() + 7 * 86_400_000;
-  const filtered = rows.filter((row) => {
+  const filtered = visible.filter((row) => {
     const fire = new Date(row.fireAt).getTime();
     if (input.range === "past") return fire < now.getTime() || row.status === "fired" || row.status === "completed";
     if (input.range === "today") return localDateKey(new Date(row.fireAt), input.timezone || row.timezone) === localDateKey(now, input.timezone || row.timezone);
@@ -182,52 +188,110 @@ function nextOpenFire(reminder: Reminder, zone: string, now: Date): Date {
   throw new Error("That one-time reminder is already in the past. Name a new time to move it.");
 }
 
-export async function snoozeOrReschedule(store: ReminderStore, ownerId: string, id: string, until: string | undefined, timezone: string | undefined, now: Date, action: ReminderMove = "reschedule"): Promise<ReminderView> {
+function withoutEnds(recurrence: NonNullable<Reminder["recurrence"]>): NonNullable<Reminder["recurrence"]> {
+  const next = { ...recurrence };
+  delete next.ends;
+  return next;
+}
+
+function applyScheduleEdit(reminder: Reminder, zone: string, now: Date, repeat: string | undefined, end: string | undefined, moved: ResolvedWhen | null): { recurrence: Reminder["recurrence"]; fireAt: string; notes: string[]; corrected: boolean } {
+  let recurrence = reminder.recurrence;
+  let fireAt = reminder.fireAt;
+  const notes: string[] = [];
+  let corrected = false;
+  if (moved) {
+    fireAt = moved.fireAt.toISOString();
+    if (moved.recurrence) recurrence = moved.recurrence;
+    if (moved.note) notes.push(moved.note);
+    corrected = moved.corrected;
+  }
+  if (repeat?.trim()) {
+    const word = repeat.trim().toLowerCase();
+    if (word === "once" || word === "none" || word === "off") {
+      recurrence = null;
+      notes.push("Repeat removed. This reminder happens once.");
+    } else if (word === "daily" || word === "weekdays" || word === "weekly") {
+      const parts = zonedParts(new Date(fireAt), zone);
+      const ends = recurrence?.ends;
+      recurrence = word === "daily"
+        ? { kind: "daily", hour: parts.hour, minute: parts.minute, ...(ends ? { ends } : {}) }
+        : word === "weekdays"
+          ? { kind: "weekdays", hour: parts.hour, minute: parts.minute, ...(ends ? { ends } : {}) }
+          : { kind: "weekly", weekday: parts.weekday, hour: parts.hour, minute: parts.minute, ...(ends ? { ends } : {}) };
+      notes.push(`Repeat is now ${describeRecurrence(recurrence, zone)}.`);
+    } else {
+      const parsed = resolveWhen(repeat, zone, now);
+      if (!parsed.recurrence) throw new Error("Fillip could not read that repeat. Try daily, weekdays, every 2 weeks, first Monday of every month, or once to remove it.");
+      recurrence = parsed.recurrence;
+      if (!moved) fireAt = parsed.fireAt.toISOString();
+      if (parsed.note) notes.push(parsed.note);
+      corrected = corrected || parsed.corrected;
+      notes.push(`Repeat is now ${describeRecurrence(recurrence, zone)}.`);
+    }
+  }
+  if (end?.trim()) {
+    const word = end.trim().toLowerCase();
+    if (word === "none" || word === "never" || word === "off") {
+      if (recurrence) recurrence = withoutEnds(recurrence);
+      notes.push("End date removed.");
+    } else {
+      if (!recurrence) throw new Error("An end date needs a repeating reminder. Set a repeat, such as daily or every 2 weeks.");
+      const attached = attachEndDate({ fireAt: new Date(fireAt), recurrence, corrected: false, note: null }, end, zone, now);
+      recurrence = attached.recurrence;
+      notes.push(`It now repeats ${describeRecurrence(recurrence, zone)}.`);
+    }
+  }
+  return { recurrence, fireAt, notes, corrected };
+}
+
+export async function snoozeOrReschedule(store: ReminderStore, ownerId: string, id: string, until: string | undefined, timezone: string | undefined, now: Date, action: ReminderMove = "reschedule", schedule?: { repeat?: string; end?: string }): Promise<ReminderView> {
   const reminder = await store.getReminder(ownerId, id);
   if (!reminder) throw new Error("Reminder not found");
   if (reminder.status === "cancelled" || reminder.status === "completed") {
     throw new Error(`That reminder is already ${reminder.status}.`);
   }
   const zone = timezone || reminder.timezone;
-  if (action === "pause") {
-    const saved = await store.saveReminder({
-      ...reminder,
-      status: "paused",
-      holdUntil: null,
-      updatedAt: now.toISOString()
-    });
-    return view(saved, now, { note: "Paused. Fillip will not send this until you resume it." });
-  }
-  if (action === "resume") {
-    const fireAt = nextOpenFire(reminder, zone, now);
-    const saved = await store.saveReminder({
-      ...reminder,
-      timezone: zone,
-      fireAt: fireAt.toISOString(),
-      status: "active",
-      holdUntil: null,
-      updatedAt: now.toISOString()
-    });
-    return view(saved, now, { note: `Resumed. Next ping is ${formatWhen(fireAt, zone)}.` });
-  }
-  if (!until?.trim()) throw new Error("Name a time to move this reminder.");
-  await store.setMailOptIn(ownerId, true);
-  const resolved = resolveWhen(until, zone, now);
-  const saved = await store.saveReminder({
+  const repeat = schedule?.repeat?.trim();
+  const end = schedule?.end?.trim();
+  const moving = action === "reschedule" && Boolean(until?.trim());
+  if (action === "reschedule" && !moving && !repeat && !end) throw new Error("Name a time to move this reminder, or a repeat or end date to change.");
+  if (moving || repeat || end) await store.setMailOptIn(ownerId, true);
+  const moved = moving ? resolveWhen(until ?? "", zone, now) : null;
+  const edited = moving || repeat || end
+    ? applyScheduleEdit(reminder, zone, now, repeat, end, moved)
+    : { recurrence: reminder.recurrence, fireAt: reminder.fireAt, notes: [] as string[], corrected: false };
+  let draft: Reminder = {
     ...reminder,
     timezone: zone,
-    fireAt: resolved.fireAt.toISOString(),
-    status: "active",
-    holdUntil: null,
+    fireAt: edited.fireAt,
+    recurrence: edited.recurrence,
     updatedAt: now.toISOString()
-  });
-  const note = [resolved.note, `Moved to ${formatWhen(resolved.fireAt, zone)}.`].filter(Boolean).join(" ");
-  return view(saved, now, { corrected: resolved.corrected, note });
+  };
+  const notes = [...edited.notes];
+  if (action === "pause") {
+    draft = { ...draft, status: "paused", holdUntil: null };
+    notes.push("Paused. Fillip will not send this until you resume it.");
+  } else if (action === "resume") {
+    const fireAt = nextOpenFire(draft, zone, now);
+    draft = { ...draft, fireAt: fireAt.toISOString(), status: "active", holdUntil: null };
+    notes.push(`Resumed. Next ping is ${formatWhen(fireAt, zone)}.`);
+  } else {
+    draft = { ...draft, status: "active", holdUntil: null };
+    if (moving && moved) notes.push(`Moved to ${formatWhen(moved.fireAt, zone)}.`);
+  }
+  const saved = await store.saveReminder(draft);
+  return view(saved, now, { corrected: edited.corrected, note: notes.filter(Boolean).join(" ") || null });
 }
 
-export async function completeOrCancel(store: ReminderStore, ownerId: string, id: string, action: "complete" | "cancel", now: Date): Promise<ReminderView> {
+export type DeleteResult = { id: string; what: string; status: "deleted"; note: string };
+
+export async function completeOrCancel(store: ReminderStore, ownerId: string, id: string, action: "complete" | "cancel" | "delete", now: Date): Promise<ReminderView | DeleteResult> {
   const reminder = await store.getReminder(ownerId, id);
   if (!reminder) throw new Error("Reminder not found");
+  if (action === "delete") {
+    await store.deleteReminder(ownerId, id);
+    return { id: reminder.id, what: reminder.what, status: "deleted", note: "Deleted. The reminder and its delivery history are gone." };
+  }
   const status: ReminderStatus = action === "complete" ? "completed" : "cancelled";
   const saved = await store.saveReminder({
     ...reminder,
@@ -246,6 +310,7 @@ export async function followUp(store: ReminderStore, actor: Actor, input: {
   topic: string;
   after?: string;
   cadence?: string;
+  until?: string;
   timezone: string;
   context?: string | null;
   channel?: DeliveryChannel;
@@ -272,8 +337,9 @@ export async function followUp(store: ReminderStore, actor: Actor, input: {
       recurrence: { kind: "weekly", weekday: parts.weekday, hour: parts.hour, minute: parts.minute }
     };
   }
+  if (input.until?.trim()) first = attachEndDate(first, input.until, input.timezone, now);
   const reminder = await store.createReminder(stamp(actor, input.topic, input.context ?? null, input.timezone, first, "follow_up", channel, now));
-  const note = [first.note, followNote(channel, reminder.recurrence)].filter(Boolean).join(" ");
+  const note = [first.note, followNote(channel, reminder.recurrence, input.timezone)].filter(Boolean).join(" ");
   return view(reminder, now, { corrected: first.corrected, note });
 }
 

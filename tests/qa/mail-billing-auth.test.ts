@@ -593,7 +593,11 @@ describe("QA Stripe and HTTP behavior", () => {
     globalCountStatus = 200;
     providerBackoff = null;
     dueRows = [reminderRow()];
-    const response = await get("/health");
+    const publicHealth = await get("/health");
+    expect(publicHealth.status).toBe(200);
+    expect(JSON.parse(publicHealth.text)).toMatchObject({ ok: true, service: "fillip" });
+    expect(publicHealth.text).not.toContain("globalEmails");
+    const response = await authorizedGet("/internal/status");
     expect(response.status).toBe(200);
     const body = JSON.parse(response.text) as { globalEmails: { daySent: number; monthSent: number; dayLimit: number; monthLimit: number; stopped: boolean; reason: string | null } };
     expect(body.globalEmails).toMatchObject({ daySent: 59, monthSent: 59, dayLimit: 60, monthLimit: 1800, stopped: false, reason: null });
@@ -618,7 +622,7 @@ describe("QA Stripe and HTTP behavior", () => {
     sentRows = [];
     profileUsage = { emails: 0, period: "2026-10-01T00:00:00.000Z" };
     fetches = [];
-    const health = await get("/health");
+    const health = await authorizedGet("/internal/status");
     const healthBody = JSON.parse(health.text) as { globalEmails: { daySent: number | null; stopped: boolean } };
     const deliver = await authorizedGet("/internal/deliver");
     const claimed = fetches.some((call) => call.method === "POST" && call.url.includes("/rest/v1/deliveries"));
@@ -640,7 +644,7 @@ describe("QA Stripe and HTTP behavior", () => {
     globalCount = 0;
     globalCountStatus = 200;
     providerBackoff = new Date(Date.now() + 15 * 60 * 1000).toISOString();
-    const response = await get("/health");
+    const response = await authorizedGet("/internal/status");
     const body = JSON.parse(response.text) as { globalEmails: { stopped: boolean; reason: string | null; daySent: number | null } };
     expect(body.globalEmails.stopped).toBe(true);
     expect(body.globalEmails.reason).toBe("provider");

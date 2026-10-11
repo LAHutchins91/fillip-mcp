@@ -93,12 +93,56 @@ describe("streamable HTTP", () => {
     expect(body.error).toMatch(/Sign in to Fillip/);
   });
 
+  it("asks for sign-in on initialize and keeps tools/list public", async () => {
+    const initialize = await fetch(`${base}/mcp`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "qa", version: "0" } } })
+    });
+    expect(initialize.status).toBe(401);
+    expect(initialize.headers.get("www-authenticate")).toContain("resource_metadata=");
+    expect(initialize.headers.get("www-authenticate")).toContain("oauth-protected-resource/mcp");
+    const listed = await fetch(`${base}/mcp`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list", params: {} })
+    });
+    expect(listed.status).toBe(200);
+  });
+
+  it("offers an emailed code first and hides Google unless the flag is set", async () => {
+    delete process.env.FILLIP_AUTH_GOOGLE_ENABLED;
+    const hidden = await fetch(`${base}/oauth/consent`);
+    const hiddenHtml = await hidden.text();
+    expect(hidden.status).toBe(200);
+    expect(hiddenHtml).toContain("Email me a code");
+    expect(hiddenHtml).toContain("signInWithOtp");
+    expect(hiddenHtml).toContain("verifyOtp");
+    expect(hiddenHtml).toContain("Use a password instead");
+    expect(hiddenHtml).not.toContain("Continue with Google");
+    expect(hiddenHtml).toContain("That code has expired");
+    expect(hiddenHtml).toContain("Too many code emails");
+    process.env.FILLIP_AUTH_GOOGLE_ENABLED = "true";
+    const shown = await fetch(`${base}/oauth/consent`);
+    expect(await shown.text()).toContain("Continue with Google");
+    delete process.env.FILLIP_AUTH_GOOGLE_ENABLED;
+  });
+
   it("serves connect, health, and OAuth metadata", async () => {
     const health = await fetch(`${base}/health`);
     expect(health.status).toBe(200);
-    const healthBody = await health.json() as {
-      service: string;
-      telegramConfigured: boolean;
+    const healthBody = await health.json() as { ok: boolean; service: string; version: string; globalEmails?: unknown };
+    expect(healthBody).toMatchObject({ ok: true, service: "fillip" });
+    expect(healthBody.version).toBeTruthy();
+    expect(healthBody.globalEmails).toBeUndefined();
+    expect(JSON.stringify(healthBody)).not.toMatch(/telegram|stripe|resend|globalEmails/i);
+
+    const locked = await fetch(`${base}/internal/status`);
+    expect([401, 503]).toContain(locked.status);
+    const previousSecret = process.env.CRON_SECRET;
+    process.env.CRON_SECRET = "status-test";
+    const status = await fetch(`${base}/internal/status`, { headers: { authorization: "Bearer status-test" } });
+    const statusBody = await status.json() as {
       globalEmails: {
         daySent: number | null;
         monthSent: number | null;
@@ -111,9 +155,8 @@ describe("streamable HTTP", () => {
         monthResetsAt: string;
       };
     };
-    expect(healthBody.service).toBe("fillip");
-    expect(healthBody.telegramConfigured).toBe(Boolean(process.env.TELEGRAM_BOT_TOKEN?.trim()));
-    expect(healthBody.globalEmails).toMatchObject({
+    expect(status.status).toBe(200);
+    expect(statusBody.globalEmails).toMatchObject({
       daySent: null,
       monthSent: null,
       dayLimit: 0,
@@ -122,8 +165,10 @@ describe("streamable HTTP", () => {
       close: true,
       reason: "month"
     });
-    expect(healthBody.globalEmails.dayResetsAt).toMatch(/T00:00:00.000Z$/);
-    expect(healthBody.globalEmails.monthResetsAt).toMatch(/T00:00:00.000Z$/);
+    expect(statusBody.globalEmails.dayResetsAt).toMatch(/T00:00:00.000Z$/);
+    expect(statusBody.globalEmails.monthResetsAt).toMatch(/T00:00:00.000Z$/);
+    if (previousSecret === undefined) delete process.env.CRON_SECRET;
+    else process.env.CRON_SECRET = previousSecret;
 
     const connect = await fetch(`${base}/connect`);
     const html = await connect.text();
@@ -138,6 +183,8 @@ describe("streamable HTTP", () => {
     expect(oauth.resource_name).toBe("Fillip by Ouroboros");
     expect(oauth.bearer_methods_supported).toEqual(["header"]);
     expect(oauth.authorization_servers[0]).toMatch(/\/auth\/v1$/);
+    expect(JSON.stringify(oauth)).not.toContain("code_challenge_methods_supported");
+    expect(JSON.stringify(oauth)).not.toContain("authorization_response_iss_parameter_supported");
 
     const home = await fetch(`${base}/`);
     const homeHtml = await home.text();

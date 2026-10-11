@@ -55,6 +55,11 @@ export class FileFillipStore extends MemoryFillipStore {
     return saved;
   }
 
+  override async deleteReminder(ownerId: string, id: string): Promise<void> {
+    await super.deleteReminder(ownerId, id);
+    this.persist();
+  }
+
   override async rememberOwner(contact: OwnerContact): Promise<void> {
     await super.rememberOwner(contact);
     this.persist();

@@ -243,4 +243,60 @@ describe("reminder CRUD", () => {
     const off = await saveDigestSettings(store, actor, { enabled: false }, now);
     expect(off.enabled).toBe(false);
   });
+
+  it("hides cancelled and completed reminders until include_done, and delete removes deliveries", async () => {
+    const store = storeWithActor();
+    const open = await setReminder(store, actor, { what: "Still open", when: "tomorrow 9am", timezone: "UTC" }, now);
+    const done = await setReminder(store, actor, { what: "Finished", when: "tomorrow 10am", timezone: "UTC" }, now);
+    const dropped = await setReminder(store, actor, { what: "Drop me", when: "tomorrow 11am", timezone: "UTC" }, now);
+    await completeOrCancel(store, actor.id, done.id, "complete", now);
+    await store.saveReminder({ ...(await store.getReminder(actor.id, dropped.id))!, status: "paused" });
+    store.deliveries.push({
+      id: "delivery-1",
+      ownerId: actor.id,
+      reminderId: dropped.id,
+      dedupeKey: "drop",
+      occurrenceAt: now.toISOString(),
+      status: "sent",
+      idempotencyKey: "drop-key",
+      channel: "email",
+      providerId: null,
+      startedAt: now.toISOString(),
+      sentAt: now.toISOString(),
+      error: null
+    });
+    const listed = await listReminders(store, actor.id, {}, now);
+    expect(listed.map((row) => row.what).sort()).toEqual(["Drop me", "Still open"]);
+    const withDone = await listReminders(store, actor.id, { includeDone: true }, now);
+    expect(withDone.map((row) => row.what)).toContain("Finished");
+    const removed = await completeOrCancel(store, actor.id, dropped.id, "delete", now);
+    expect(removed).toMatchObject({ status: "deleted", what: "Drop me" });
+    expect(await store.getReminder(actor.id, dropped.id)).toBeNull();
+    expect(store.deliveries.filter((row) => row.reminderId === dropped.id)).toHaveLength(0);
+    expect((await listReminders(store, actor.id, {}, now)).map((row) => row.id)).toEqual([open.id]);
+  });
+
+  it("changes or removes a repeat and an end date on an existing reminder", async () => {
+    const store = storeWithActor();
+    const created = await setReminder(store, actor, {
+      what: "Standup",
+      when: "every weekday 9am until March 31, 2027",
+      timezone: "America/New_York"
+    }, now);
+    expect(created.repeats).toMatch(/March 31, 2027/);
+    expect(created.repeats).not.toMatch(/April 1/);
+    const weekly = await snoozeOrReschedule(store, actor.id, created.id, undefined, "America/New_York", now, "reschedule", {
+      repeat: "every Monday 9am",
+      end: "Dec 15, 2026"
+    });
+    expect(weekly.repeats).toMatch(/Monday/);
+    expect(weekly.repeats).toMatch(/December 15, 2026/);
+    const cleared = await snoozeOrReschedule(store, actor.id, created.id, undefined, undefined, now, "reschedule", {
+      repeat: "once",
+      end: "none"
+    });
+    expect(cleared.repeats).toBe("once");
+    await expect(setReminder(store, actor, { what: "Bad", when: "tomorrow 9am", timezone: "UTC", until: "not a date" }, now))
+      .rejects.toThrow(/March 31, 2027/);
+  });
 });

@@ -13,21 +13,43 @@ export function protectedResourceMetadata(baseUrl: string, supabaseUrl: string) 
   };
 }
 
-export function installPluginAuth(app: Express, baseUrl: string, supabaseUrl: string, anonKey: string) {
-  const metadata = protectedResourceMetadata(baseUrl, supabaseUrl);
+export function otpFailure(message: string): string {
+  const text = message.toLowerCase();
+  if (text.includes("rate") || text.includes("too many") || text.includes("only request this after") || text.includes("over_request") || text.includes("security purposes")) {
+    return "Too many code emails were requested. Wait a minute, then send a new code.";
+  }
+  if (text.includes("expired")) {
+    return "That code has expired. Send a new one and use the code in the latest email.";
+  }
+  if (text.includes("invalid") || text.includes("otp") || text.includes("token")) {
+    return "That code is not right. Check the email and try the latest code.";
+  }
+  return "Fillip could not finish sign-in. Send a new code and try again.";
+}
+
+export function installPluginAuth(app: Express, fallbackBase: string, fallbackSupabase: string, fallbackAnon: string) {
   app.get(["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"], (_req, res) => {
-    res.set("Access-Control-Allow-Origin", "*").json(metadata);
+    const base = (process.env.APP_BASE_URL || fallbackBase).replace(/\/$/, "");
+    const supabaseUrl = (process.env.SUPABASE_URL || fallbackSupabase).trim().replace(/\/+$/, "");
+    res.set("Access-Control-Allow-Origin", "*").json(protectedResourceMetadata(base, supabaseUrl));
   });
   app.get(["/oauth/consent", "//oauth/consent", "/connections"], (_req, res) => {
-    const config = JSON.stringify({ supabaseUrl, anonKey }).replace(/</g, "\\u003c");
+    const supabaseUrl = (process.env.SUPABASE_URL || fallbackSupabase).trim().replace(/\/+$/, "");
+    const anonKey = (process.env.SUPABASE_ANON_KEY || fallbackAnon).trim();
+    const google = process.env.FILLIP_AUTH_GOOGLE_ENABLED === "true";
+    const config = JSON.stringify({ supabaseUrl, anonKey, google }).replace(/</g, "\\u003c");
+    const googleButton = google ? `<button id="signin" class="secondary" hidden>Continue with Google</button>` : "";
     res.set({ "Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY" });
     res.type("html").send(`<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Connect Fillip by Ouroboros</title>
 <style>body{margin:0;background:#f6f4ef;color:#1c1915;font:17px/1.6 system-ui}main{max-width:560px;margin:8vh auto;padding:28px}h1{line-height:1.2}a{color:#0c6b4d}button{font:inherit;padding:12px 20px;border-radius:10px;border:1px solid #0c6b4d;background:#0c6b4d;color:white;cursor:pointer;margin:8px 8px 8px 0}button:disabled{opacity:.5;cursor:wait}.secondary{background:transparent;color:#1c1915}.card{border:1px solid #ddd6c8;border-radius:16px;padding:24px;margin:20px 0;background:#fff}#error{color:#8d1d18;overflow-wrap:anywhere}label{display:block;margin:12px 0}input{box-sizing:border-box;width:100%;padding:10px;font:inherit;border:1px solid #c9c0b2;border-radius:8px;background:#fff;color:inherit}small{display:block;color:#5c564c}li{margin:8px 0}[hidden]{display:none!important}</style>
 </head><body><main><strong>Fillip by Ouroboros</strong><h1 id="heading">Connect Fillip</h1>
 <p id="status" role="status">Checking your sign-in…</p><p id="error" role="alert"></p>
-<button id="signout" class="secondary" hidden>Use a different account</button><button id="signin" hidden>Continue with Google</button>
-<details id="passwordLogin" hidden><summary>Sign in with email and password</summary><form id="passwordForm"><label>Email<input id="loginEmail" type="email" required autocomplete="username"></label><label>Password<input id="loginPassword" type="password" required autocomplete="current-password"></label><button>Sign in</button></form><small>For existing email and password accounts, including a review account. Google sign-in remains available above.</small></details>
+<form id="emailForm" hidden><label>Email<input id="loginEmail" type="email" required autocomplete="email"></label><button>Email me a code</button><small>We'll email a one-time code. A new account is created the first time you use it.</small></form>
+<form id="codeForm" hidden><label>Email code<input id="loginCode" inputmode="numeric" autocomplete="one-time-code" required></label><button>Sign in</button><button id="resend" class="secondary" type="button">Send a new code</button></form>
+<details id="passwordLogin" hidden><summary>Use a password instead</summary><form id="passwordForm"><label>Email<input id="passwordEmail" type="email" required autocomplete="username"></label><label>Password<input id="loginPassword" type="password" required autocomplete="current-password"></label><button>Sign in with password</button></form><small>For a review or test account that already has a password.</small></details>
+${googleButton}
+<button id="signout" class="secondary" hidden>Use a different account</button>
 <section id="consent" class="card" hidden><h2 id="client"></h2><p>This application will be able to:</p>
 <ul><li>Save reminders and follow-ups you ask for, and read the ones already on your account.</li><li>Email only the verified address on this account when a reminder is due.</li><li>Read your account email and subscription status.</li></ul>
 <p>Fillip does not take a recipient from the chat. Billing changes are not available through the reminder tools. A free plan does not expire. The trial is 14 days, then Pro. If you do not continue, you stay on the free plan. Checkout shows the plan terms.</p>
@@ -39,19 +61,37 @@ export function installPluginAuth(app: Express, baseUrl: string, supabaseUrl: st
 <script>
 (async function(){
 var cfg=${config}, id=new URLSearchParams(location.search).get('authorization_id');
+var explain=${otpFailure.toString()};
 var el=function(name){return document.getElementById(name)};
 function fail(error){el('status').textContent='';el('error').textContent=error.message||String(error)}
+function showSignIn(){
+  el('status').textContent='Enter your email and we will send a sign-in code.';
+  el('emailForm').hidden=false;
+  el('passwordLogin').hidden=false;
+  if(cfg.google&&el('signin'))el('signin').hidden=false;
+}
 try{
  if(!window.supabase)throw new Error('Sign-in could not load. Refresh to try again.');
  var client=window.supabase.createClient(cfg.supabaseUrl,cfg.anonKey);
  var result=await client.auth.getSession();if(result.error)throw result.error;
- el('passwordForm').onsubmit=async function(e){e.preventDefault();var button=this.querySelector('button');button.disabled=true;try{var r=await client.auth.signInWithPassword({email:el('loginEmail').value,password:el('loginPassword').value});el('loginPassword').value='';if(r.error)throw Error('Email or password sign-in failed. Check your credentials and try again.');location.reload()}catch(e){fail(e);button.disabled=false}};
- el('signin').onclick=async function(){
+ el('emailForm').onsubmit=async function(e){
+   e.preventDefault();var button=this.querySelector('button');button.disabled=true;
+   try{var r=await client.auth.signInWithOtp({email:el('loginEmail').value.trim(),options:{shouldCreateUser:true}});if(r.error)throw r.error;el('emailForm').hidden=true;el('codeForm').hidden=false;el('status').textContent='Enter the code from the latest email.';el('error').textContent=''}
+   catch(e){fail({message:explain(e.message||String(e))});button.disabled=false}
+ };
+ el('codeForm').onsubmit=async function(e){
+   e.preventDefault();var button=this.querySelector('button');button.disabled=true;
+   try{var r=await client.auth.verifyOtp({email:el('loginEmail').value.trim(),token:el('loginCode').value.trim(),type:'email'});if(r.error)throw r.error;location.reload()}
+   catch(e){fail({message:explain(e.message||String(e))});button.disabled=false}
+ };
+ el('resend').onclick=function(){el('codeForm').hidden=true;el('emailForm').hidden=false;el('emailForm').querySelector('button').disabled=false;el('status').textContent='We can send another code to the same email.';};
+ el('passwordForm').onsubmit=async function(e){e.preventDefault();var button=this.querySelector('button');button.disabled=true;try{var r=await client.auth.signInWithPassword({email:el('passwordEmail').value,password:el('loginPassword').value});el('loginPassword').value='';if(r.error)throw Error('Email or password sign-in failed. Check your credentials and try again.');location.reload()}catch(e){el('status').textContent='';el('error').textContent=e.message||String(e);button.disabled=false}};
+ if(el('signin'))el('signin').onclick=async function(){
    el('signin').disabled=true;
    try{sessionStorage.setItem('fillipPluginReturn',JSON.stringify({id:id,createdAt:Date.now()}));var r=await client.auth.signInWithOAuth({provider:'google',options:{redirectTo:location.origin+'/'}});if(r.error)throw r.error}
    catch(e){fail(e);el('signin').disabled=false}
  };
- if(!result.data.session){el('status').textContent='Sign in so Fillip knows which account to email.';el('signin').hidden=false;el('passwordLogin').hidden=false;return}
+ if(!result.data.session){showSignIn();return}
  el('status').textContent='Signed in as '+result.data.session.user.email;
  el('signout').hidden=false;el('signout').onclick=async function(){this.disabled=true;try{var r=await client.auth.signOut({scope:"local"});if(r.error)throw r.error;location.reload()}catch(e){fail(e);this.disabled=false}};
  if(location.pathname==='/connections'){

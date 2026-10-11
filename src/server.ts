@@ -61,6 +61,18 @@ function appBaseUrl() {
   return (envValue("APP_BASE_URL") || "http://localhost:3000").replace(/\/$/, "");
 }
 
+function mcpResourceUrls(): string[] {
+  const urls = new Set<string>();
+  const add = (value: string) => {
+    const trimmed = value.trim().replace(/\/+$/, "");
+    if (trimmed) urls.add(`${trimmed}/mcp`);
+  };
+  add(appBaseUrl());
+  add(envValue("FILLIP_PUBLIC_ORIGIN"));
+  add(envValue("FILLIP_LEGACY_ORIGIN"));
+  return [...urls];
+}
+
 function intEnv(name: string, fallback: number) {
   const value = Number(envValue(name) || fallback);
   return Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
@@ -302,7 +314,15 @@ app.get("/", (_req, res) => {
   }));
 });
 
-app.get("/health", async (_req, res) => {
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, service: "fillip", version: FILLIP_VERSION });
+});
+
+async function internalStatus(req: Request, res: Response) {
+  const secret = envValue("CRON_SECRET");
+  if (!secret) return res.status(503).json({ error: "Status is not configured." });
+  const header = bearer(req);
+  if (!header || !safeEqual(header, secret)) return res.status(401).json({ error: "Status authorization failed." });
   const now = new Date();
   const limits = globalEmailLimitsFromEnv();
   if (limits.perDay <= 0 || limits.perMonth <= 0) {
@@ -351,7 +371,9 @@ app.get("/health", async (_req, res) => {
       reason
     }
   });
-});
+}
+
+app.get("/internal/status", internalStatus);
 
 app.post("/billing/checkout", async (req, res) => {
   try {
@@ -532,11 +554,15 @@ app.post("/mcp", ensureStreamableHttpAccept, async (req, res) => {
   let server: McpServer | undefined;
   let actor: Actor = { id: "", email: null, emailVerified: false };
   let store: ReminderStore = new MemoryFillipStore();
-  const publicMethods = new Set(["initialize", "notifications/initialized", "tools/list", "ping"]);
+  // tools/list stays public so ChatGPT's app directory and Glama can read the
+  // catalog and securitySchemes before a user connects. initialize and every
+  // other method require a token, so Claude and Cursor start OAuth at connect
+  // time instead of on the first tools/call.
+  const publicMethods = new Set(["tools/list"]);
   if (!publicMethods.has(req.body?.method)) {
     try {
       const auth = await authenticatedUser(req);
-      validateMcpClaims(auth.token, auth.user.id, `${envValue("SUPABASE_URL").replace(/\/+$/, "")}/auth/v1`, `${appBaseUrl()}/mcp`);
+      validateMcpClaims(auth.token, auth.user.id, `${envValue("SUPABASE_URL").replace(/\/+$/, "")}/auth/v1`, mcpResourceUrls());
       actor = actorFromUser(auth.user);
       store = createUserStore(actor.id, auth.token);
     } catch {

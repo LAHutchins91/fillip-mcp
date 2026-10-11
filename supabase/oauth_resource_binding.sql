@@ -49,15 +49,20 @@ begin
   sid := (claims->>'session_id')::uuid;
   select r.resource into resource from fillip_private.oauth_resources r where r.session_id = sid;
 
-  if resource is null and event->>'authentication_method' = 'oauth_provider/authorization_code' then
-    select count(*) > 0 and bool_and(a.resource = expected)
-      into matching
-      from auth.oauth_authorizations a
-     where a.client_id = cid::uuid
-       and a.user_id = (claims->>'sub')::uuid
-       and a.status::text = 'approved'
-       and a.expires_at > now();
-    if matching then
+  -- Bind on the approved authorization for this resource, including a refresh
+  -- whose session row was never stored. Another client's authorization must
+  -- not make bool_and fail the match. Trailing slashes are ignored.
+  if resource is null then
+    select exists (
+      select 1
+        from auth.oauth_authorizations a
+       where a.client_id = cid::uuid
+         and a.user_id = (claims->>'sub')::uuid
+         and a.status::text = 'approved'
+         and a.expires_at > now()
+         and rtrim(a.resource, '/') = rtrim(expected, '/')
+    ) into matching;
+    if matching and sid is not null then
       resource := expected;
       insert into fillip_private.oauth_resources (session_id, resource)
       values (sid, resource)

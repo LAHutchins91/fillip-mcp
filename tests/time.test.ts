@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { advanceSeries, applyRepeat, nextFire, WhenError, resolveWhen } from "../src/lib/time.js";
+import { calendarFeed } from "../src/lib/ics.js";
+import { advanceSeries, applyRepeat, describeRecurrence, nextFire, WhenError, resolveWhen } from "../src/lib/time.js";
+import type { Reminder } from "../src/lib/types.js";
 import { zonedParts, zonedTimeToUtc } from "../src/lib/zone.js";
 
 const zone = "America/New_York";
@@ -193,5 +195,62 @@ describe("repeat merged with free text", () => {
       .toThrow(/every 2 weeks[\s\S]*until[\s\S]*conflicts with repeat "weekly"/);
     expect(() => applyRepeat(resolveWhen("every Monday 9am", zone, now), "once", zone))
       .toThrow(/conflicts with repeat "once"/);
+  });
+});
+
+describe("inclusive end dates and daylight-saving gaps", () => {
+  it("reports the named local end date across both 2027 DST boundaries", () => {
+    const spring = resolveWhen("every day at 9am until March 14, 2027", zone, now);
+    expect(spring.recurrence?.ends?.until).toBe("2027-03-15T04:00:00.000Z");
+    expect(describeRecurrence(spring.recurrence, zone)).toMatch(/March 14, 2027/);
+    expect(describeRecurrence(spring.recurrence, zone)).not.toMatch(/March 15/);
+    const lastSpring = nextFire(spring.recurrence!, zone, new Date("2027-03-14T12:00:00.000Z"));
+    expect(zonedParts(lastSpring!, zone).day).toBe(14);
+    expect(nextFire(spring.recurrence!, zone, new Date("2027-03-15T04:00:00.000Z"))).toBeNull();
+
+    const fall = resolveWhen("every day at 9am until November 7, 2027", zone, now);
+    expect(fall.recurrence?.ends?.until).toBe("2027-11-08T05:00:00.000Z");
+    expect(describeRecurrence(fall.recurrence, zone)).toMatch(/November 7, 2027/);
+    expect(describeRecurrence(fall.recurrence, zone)).not.toMatch(/November 8/);
+    expect(resolveWhen("every weekday 9am until tomorrow", zone, now).recurrence?.ends?.until).toBeTruthy();
+  });
+
+  it("warns instead of silently moving 2:30am on the spring-forward morning", () => {
+    const gap = resolveWhen("2027-03-14 2:30 AM", zone, now);
+    expect(gap.corrected).toBe(true);
+    expect(gap.note ?? "").toMatch(/does not exist/);
+    expect(gap.note ?? "").toMatch(/3:30/);
+    expectParts(gap.fireAt, { year: 2027, month: 3, day: 14, hour: 3, minute: 30 });
+    const words = resolveWhen("March 14, 2027 at 2:30am", zone, now);
+    expect(words.note ?? "").toMatch(/does not exist/);
+    expect(words.fireAt.toISOString()).toBe(gap.fireAt.toISOString());
+  });
+
+  it("names accepted formats when an end date cannot be read", () => {
+    expect(() => resolveWhen("every day at 9am until sometime", zone, now)).toThrow(/March 31, 2027/);
+    expect(() => resolveWhen("not a time at all", zone, now)).toThrow(/tomorrow at 9am/);
+  });
+
+  it("keeps the calendar UNTIL on the last second of the named local day", () => {
+    const resolved = resolveWhen("every day at 9am until March 31, 2027", zone, now);
+    expect(describeRecurrence(resolved.recurrence, zone)).toMatch(/March 31, 2027/);
+    expect(describeRecurrence(resolved.recurrence, zone)).not.toMatch(/April 1/);
+    const reminder: Reminder = {
+      id: "00000000-0000-4000-8000-000000000001",
+      ownerId: "00000000-0000-4000-8000-000000000002",
+      kind: "reminder",
+      what: "Through March",
+      context: null,
+      timezone: zone,
+      fireAt: resolved.fireAt.toISOString(),
+      recurrence: resolved.recurrence,
+      channel: "email",
+      status: "active",
+      holdUntil: null,
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+      completedAt: null
+    };
+    expect(calendarFeed([reminder], now)).toContain("UNTIL=20270401T035959Z");
   });
 });

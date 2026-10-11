@@ -72,23 +72,25 @@ export function parseClock(text: string): { hour: number; minute: number } | nul
 }
 
 const NTH_NAMES = ["", "first", "second", "third", "fourth", "fifth"];
+const MONTH_NAMES = ["", "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+export const END_DATE_EXAMPLES = "March 31, 2027, Dec 15, tomorrow, or 2027-03-31";
 
-function endPhrase(ends: RecurrenceEnd | undefined): string {
+function endPhrase(ends: RecurrenceEnd | undefined, timeZone: string): string {
   if (!ends) return "";
   const bits: string[] = [];
   if (ends.count) bits.push(`${ends.count} times`);
   if (ends.until) {
     const last = new Date(new Date(ends.until).getTime() - 1);
-    const parts = zonedParts(last, "UTC");
-    bits.push(`until ${parts.year}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`);
+    const parts = zonedParts(last, timeZone);
+    bits.push(`until ${MONTH_NAMES[parts.month]} ${parts.day}, ${parts.year}`);
   }
   return bits.length ? `, ${bits.join(", ")}` : "";
 }
 
-export function describeRecurrence(recurrence: Recurrence | null): string {
+export function describeRecurrence(recurrence: Recurrence | null, timeZone = "UTC"): string {
   if (!recurrence) return "once";
   const clock = formatClock(recurrence.hour, recurrence.minute);
-  const tail = endPhrase(recurrence.ends);
+  const tail = endPhrase(recurrence.ends, timeZone);
   if (recurrence.kind === "daily") return `every day at ${clock}${tail}`;
   if (recurrence.kind === "weekdays") return `every weekday at ${clock}${tail}`;
   if (recurrence.kind === "weekly") return `every ${WEEKDAY_NAMES[recurrence.weekday]} at ${clock}${tail}`;
@@ -255,7 +257,7 @@ function parseEvery(raw: string, timeZone: string, now: Date): ResolvedWhen | nu
   if (!parseClock(rest.trim() || "9am")) throw new WhenError("Add a time, such as 9am.");
   const fireAt = nextFire(recurrence, timeZone, now);
   if (!fireAt) throw new WhenError("That repeating reminder has already ended.");
-  return { fireAt, recurrence, corrected: false, note: null };
+  return finishSeries(fireAt, recurrence, timeZone);
 }
 
 const NTH_WORD = "first|second|third|fourth|fifth|last";
@@ -275,28 +277,78 @@ function monthEnd(year: number, month: number, timeZone: string): Date {
   return zonedTimeToUtc(year, month + 1, 1, 0, 0, timeZone);
 }
 
-function parseUntil(text: string, timeZone: string, now: Date): Date {
-  const iso = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (iso) {
-    const year = Number(iso[1]);
-    const month = Number(iso[2]);
-    const day = Number(iso[3]);
-    if (!isRealDate(year, month, day)) throw new WhenError("That date is not a real calendar day.");
-    const end = exclusiveEnd(year, month, day, timeZone);
-    if (end.getTime() <= now.getTime()) throw new WhenError("That date has already passed.");
-    return end;
-  }
-  const named = text.match(new RegExp(`^(${MONTH})(?:\\s+(\\d{1,2})(?:st|nd|rd|th)?)?$`, "i"));
-  if (!named) throw new WhenError("Fillip could not read that end date. Try \"until Dec\" or \"until 2026-12-15\".");
-  const month = monthIndex(named[1] ?? "");
-  const day = named[2] ? Number(named[2]) : null;
+function endDateError(): WhenError {
+  return new WhenError(`Fillip could not read that end date. Use ${END_DATE_EXAMPLES}.`);
+}
+
+function endFromYmd(year: number, month: number, day: number, timeZone: string, now: Date): Date {
+  if (!isRealDate(year, month, day)) throw new WhenError("That date is not a real calendar day.");
   const current = zonedParts(now, timeZone).year;
-  for (const year of [current, current + 1]) {
-    if (day && !isRealDate(year, month, day)) continue;
-    const end = day ? exclusiveEnd(year, month, day, timeZone) : monthEnd(year, month, timeZone);
+  if (year < current || year > current + 1) throw new WhenError("That year is too far out. End dates use this year or the next one.");
+  const end = exclusiveEnd(year, month, day, timeZone);
+  if (end.getTime() <= now.getTime()) throw new WhenError("That date has already passed.");
+  return end;
+}
+
+function endFromNamed(monthName: string, day: number | null, year: number | null, timeZone: string, now: Date): Date {
+  const month = monthIndex(monthName);
+  if (year !== null) {
+    if (day === null) {
+      const end = monthEnd(year, month, timeZone);
+      const current = zonedParts(now, timeZone).year;
+      if (year < current || year > current + 1) throw new WhenError("That year is too far out. End dates use this year or the next one.");
+      if (end.getTime() <= now.getTime()) throw new WhenError("That date has already passed.");
+      return end;
+    }
+    return endFromYmd(year, month, day, timeZone, now);
+  }
+  const current = zonedParts(now, timeZone).year;
+  for (const candidate of [current, current + 1]) {
+    if (day && !isRealDate(candidate, month, day)) continue;
+    const end = day ? exclusiveEnd(candidate, month, day, timeZone) : monthEnd(candidate, month, timeZone);
     if (end.getTime() > now.getTime()) return end;
   }
   throw new WhenError("That date has already passed.");
+}
+
+function parseUntil(text: string, timeZone: string, now: Date): Date {
+  const cleaned = text.trim().replace(/\./g, "").replace(/,/g, " ").replace(/\s+/g, " ");
+  if (/^(today|tomorrow)$/i.test(cleaned)) {
+    const parts = zonedParts(now, timeZone);
+    const day = /^tomorrow$/i.test(cleaned) ? addCalendarDays(parts.year, parts.month, parts.day, 1) : parts;
+    return endFromYmd(day.year, day.month, day.day, timeZone, now);
+  }
+  const iso = cleaned.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (iso) return endFromYmd(Number(iso[1]), Number(iso[2]), Number(iso[3]), timeZone, now);
+  const slash = cleaned.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (slash) return endFromYmd(Number(slash[3]), Number(slash[1]), Number(slash[2]), timeZone, now);
+  const ofForm = cleaned.match(new RegExp(`^(?:the\\s+)?(\\d{1,2})(?:st|nd|rd|th)?\\s+of\\s+(${MONTH})(?:\\s+(\\d{4}))?$`, "i"));
+  if (ofForm) return endFromNamed(ofForm[2] ?? "", Number(ofForm[1]), ofForm[3] ? Number(ofForm[3]) : null, timeZone, now);
+  const named = cleaned.match(new RegExp(`^(${MONTH})(?:\\s+(\\d{1,2})(?:st|nd|rd|th)?)?(?:\\s+(\\d{4}))?$`, "i"));
+  if (!named) throw endDateError();
+  return endFromNamed(named[1] ?? "", named[2] ? Number(named[2]) : null, named[3] ? Number(named[3]) : null, timeZone, now);
+}
+
+export function readEndDate(text: string, timeZone: string, now: Date): Date {
+  return parseUntil(text.trim().replace(/^until\s+/i, ""), timeZone, now);
+}
+
+export function attachEndDate(resolved: ResolvedWhen, endText: string, timeZone: string, now: Date): ResolvedWhen {
+  const word = endText.trim().toLowerCase();
+  if (word === "none" || word === "never" || word === "off") {
+    if (!resolved.recurrence?.ends) return resolved;
+    const next = { ...resolved.recurrence };
+    delete next.ends;
+    return { ...resolved, recurrence: next };
+  }
+  const end = readEndDate(endText, timeZone, now);
+  if (resolved.recurrence?.ends?.until) {
+    if (Math.abs(new Date(resolved.recurrence.ends.until).getTime() - end.getTime()) > 1000) {
+      throw new WhenError("The end date in the words and the separate end date do not match. Use one of them.");
+    }
+    return resolved;
+  }
+  return withEnds(resolved, end, resolved.recurrence?.ends?.count ?? null);
 }
 
 function peelEnds(raw: string): { body: string; untilText: string | null; count: number | null } {
@@ -343,7 +395,7 @@ function parseMonthly(raw: string, timeZone: string, now: Date): ResolvedWhen | 
       hour: clock.hour,
       minute: clock.minute
     };
-    return { fireAt: requireFire(recurrence, timeZone, now), recurrence, corrected: false, note: null };
+    return finishSeries(requireFire(recurrence, timeZone, now), recurrence, timeZone);
   }
   const dated = raw.match(/^(?:every\s+month\s+on\s+the\s+|monthly\s+on\s+the\s+|the\s+)(\d{1,2})(?:st|nd|rd|th)?(?:\s+of\s+every\s+month)?(?:\s+at)?\s*(.*)$/i);
   if (!dated) return null;
@@ -352,7 +404,7 @@ function parseMonthly(raw: string, timeZone: string, now: Date): ResolvedWhen | 
   if (day < 1 || day > 31) throw new WhenError("That date is not a real calendar day.");
   const clock = clockOr(dated[2] ?? "", { hour: 9, minute: 0 });
   const recurrence: Recurrence = { kind: "monthly_date", day, hour: clock.hour, minute: clock.minute };
-  return { fireAt: requireFire(recurrence, timeZone, now), recurrence, corrected: false, note: null };
+  return finishSeries(requireFire(recurrence, timeZone, now), recurrence, timeZone);
 }
 
 function parseInterval(raw: string, timeZone: string, now: Date): ResolvedWhen | null {
@@ -377,7 +429,7 @@ function parseInterval(raw: string, timeZone: string, now: Date): ResolvedWhen |
     };
     const fireAt = requireFire(recurrence, timeZone, now);
     recurrence.anchor = fireAt.toISOString();
-    return { fireAt, recurrence, corrected: false, note: null };
+    return finishSeries(fireAt, recurrence, timeZone);
   }
   const weeks = raw.match(new RegExp(`^every\\s+(\\d+)\\s+weeks?(?:\\s+on)?(?:\\s+(${WEEKDAY}))?(?:\\s+at)?\\s*(.*)$`, "i"));
   if (!weeks) return null;
@@ -406,11 +458,23 @@ function parseInterval(raw: string, timeZone: string, now: Date): ResolvedWhen |
   };
   const fireAt = requireFire(recurrence, timeZone, now);
   recurrence.anchor = fireAt.toISOString();
-  return { fireAt, recurrence, corrected: false, note: null };
+  return finishSeries(fireAt, recurrence, timeZone);
 }
 
 function gapNote(hour: number, minute: number, fireAt: Date, timeZone: string): string {
   return `${formatClock(hour, minute)} does not exist that day because of daylight saving. Fillip moved it to ${formatWhen(fireAt, timeZone)}.`;
+}
+
+function finishSeries(fireAt: Date, recurrence: Recurrence, timeZone: string): ResolvedWhen {
+  const local = zonedParts(fireAt, timeZone);
+  if (local.hour === recurrence.hour && local.minute === recurrence.minute) {
+    return { fireAt, recurrence, corrected: false, note: null };
+  }
+  const wall = interpretWall(local.year, local.month, local.day, recurrence.hour, recurrence.minute, timeZone);
+  if (wall.gap) {
+    return { fireAt, recurrence, corrected: true, note: gapNote(recurrence.hour, recurrence.minute, fireAt, timeZone) };
+  }
+  return { fireAt, recurrence, corrected: false, note: null };
 }
 
 function overlapNote(hour: number, minute: number, fireAt: Date, instants: Date[], timeZone: string): string {
@@ -477,15 +541,18 @@ function parseWeekday(raw: string, timeZone: string, now: Date): ResolvedWhen | 
   let delta = (target - parts.weekday + 7) % 7;
   if (qualifier === "next" && delta === 0) delta = 7;
   let date = addCalendarDays(parts.year, parts.month, parts.day, delta);
-  let instant = zonedTimeToUtc(date.year, date.month, date.day, clock.hour, clock.minute, timeZone);
-  let corrected = false;
-  if (instant.getTime() <= now.getTime()) {
+  try {
+    return fromWall(date.year, date.month, date.day, clock.hour, clock.minute, timeZone, now);
+  } catch (error) {
+    if (!(error instanceof WhenError)) throw error;
     date = addCalendarDays(date.year, date.month, date.day, 7);
-    instant = zonedTimeToUtc(date.year, date.month, date.day, clock.hour, clock.minute, timeZone);
-    corrected = true;
+    const next = fromWall(date.year, date.month, date.day, clock.hour, clock.minute, timeZone, now);
+    return {
+      ...next,
+      corrected: true,
+      note: next.note ?? `That time already passed, so Fillip moved it to ${formatWhen(next.fireAt, timeZone)}.`
+    };
   }
-  const note = corrected ? `That time already passed, so Fillip moved it to ${formatWhen(instant, timeZone)}.` : null;
-  return { fireAt: instant, recurrence: null, corrected, note };
 }
 
 function parseNextWeek(raw: string, timeZone: string, now: Date): ResolvedWhen | null {
@@ -494,8 +561,7 @@ function parseNextWeek(raw: string, timeZone: string, now: Date): ResolvedWhen |
   const clock = clockOr(match[1] ?? "", { hour: 9, minute: 0 });
   const parts = zonedParts(now, timeZone);
   const date = addCalendarDays(parts.year, parts.month, parts.day, 7);
-  const instant = zonedTimeToUtc(date.year, date.month, date.day, clock.hour, clock.minute, timeZone);
-  return { fireAt: instant, recurrence: null, corrected: false, note: null };
+  return fromWall(date.year, date.month, date.day, clock.hour, clock.minute, timeZone, now);
 }
 
 function fromWall(year: number, month: number, day: number, hour: number, minute: number, timeZone: string, now: Date): ResolvedWhen {
@@ -556,7 +622,18 @@ function parseSlash(raw: string, timeZone: string, now: Date): ResolvedWhen | nu
 }
 
 function parseIso(raw: string, timeZone: string, now: Date): ResolvedWhen | null {
-  const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})(?:[t\s](\d{2}):(\d{2})(?::\d{2})?(?:\.\d+)?)?(z|[+-]\d{2}:?\d{2})?$/i);
+  const normalized = raw.replace(
+    /^(\d{4}-\d{2}-\d{2}[t\s])(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)$/i,
+    (_all, date: string, hourText: string, minute: string, second: string | undefined, mer: string) => {
+      let hour = Number(hourText);
+      const pm = /^p/i.test(mer);
+      if (hour < 1 || hour > 12) return raw;
+      if (hour === 12) hour = pm ? 12 : 0;
+      else if (pm) hour += 12;
+      return `${date}${String(hour).padStart(2, "0")}:${minute}${second ? `:${second}` : ""}`;
+    }
+  );
+  const match = normalized.match(/^(\d{4})-(\d{2})-(\d{2})(?:[t\s](\d{2}):(\d{2})(?::\d{2})?(?:\.\d+)?)?(z|[+-]\d{2}:?\d{2})?$/i);
   if (!match) return null;
   const year = Number(match[1]);
   const month = Number(match[2]);
@@ -565,7 +642,7 @@ function parseIso(raw: string, timeZone: string, now: Date): ResolvedWhen | null
   const minute = match[5] === undefined ? 0 : Number(match[5]);
   if (hour > 23 || minute > 59) throw new WhenError("Add a time, such as 9am.");
   if (match[6]) {
-    const instant = new Date(raw);
+    const instant = new Date(normalized);
     if (Number.isNaN(instant.getTime())) throw new WhenError("Fillip could not read that time. Try \"next Tue 2pm\" or \"every weekday 9am\".");
     const parts = zonedParts(instant, timeZone);
     return finishExplicit(instant, year, timeZone, now, parts.month, parts.day, parts.hour, parts.minute);
@@ -610,7 +687,7 @@ export function resolveWhen(input: string, timeZone: string, now: Date): Resolve
     ?? parseSlash(peeled.body, zone, now)
     ?? parseIso(peeled.body, zone, now)
     ?? parseClockOnly(peeled.body, zone, now);
-  if (!parsed) throw new WhenError("Fillip could not read that time. Try \"next Tue 2pm\" or \"every weekday 9am\".");
+  if (!parsed) throw new WhenError("Fillip could not read that time. Try tomorrow at 9am, next Tue 2pm, March 31, 2027 at 9am, 2027-03-31 09:00, or every weekday 9am.");
   const until = peeled.untilText ? parseUntil(peeled.untilText, zone, now) : null;
   return withEnds(parsed, until, peeled.count);
 }
@@ -639,7 +716,7 @@ export function applyRepeat(resolved: ResolvedWhen, repeat: RepeatChoice | undef
     return { ...resolved, recurrence: { kind: "weekly", weekday: parts.weekday, hour: parts.hour, minute: parts.minute } };
   }
   if (repeatAgrees(existing, repeat, timeZone, resolved.fireAt)) return resolved;
-  throw new WhenError(`Those words already schedule this as ${describeRecurrence(existing)}, which conflicts with repeat "${repeat}". Leave repeat off when the words include the schedule.`);
+  throw new WhenError(`Those words already schedule this as ${describeRecurrence(existing, timeZone)}, which conflicts with repeat "${repeat}". Leave repeat off when the words include the schedule.`);
 }
 
 export function recurrenceFromCadence(cadence: string, timeZone: string, now: Date): Recurrence {

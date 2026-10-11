@@ -8,6 +8,7 @@ export interface ReminderStore {
   getReminder(ownerId: string, id: string): Promise<Reminder | null>;
   createReminder(reminder: Reminder): Promise<Reminder>;
   saveReminder(reminder: Reminder): Promise<Reminder>;
+  deleteReminder(ownerId: string, id: string): Promise<void>;
   countCreatedSince(ownerId: string, sinceIso: string): Promise<number>;
   countActive(ownerId: string): Promise<number>;
   rememberOwner(contact: OwnerIdentity): Promise<void>;
