@@ -557,16 +557,18 @@ describe("QA round 5 cap refusals and the post-insert pass", () => {
     expect(text).not.toMatch(/should not stick/);
   });
 
-  it("QA-PASS: an over-cap hosted read refuses and does not delete an older row", async () => {
+  it("QA-PASS: an over-cap hosted read deletes only this call's row and throws", async () => {
     const olderId = randomUUID();
     const hosted = hostedOverCap(actor.id, olderId);
     const store = new SupabaseFillipStore(null, hosted.db, "service");
-    await expect(setReminder(store, actor, { what: "should not stick", when: "tomorrow 9am", timezone: "UTC" }, now, caps)).rejects.toThrow(/The free plan allows 10 open reminders/);
-    expect(hosted.deleted, "no row is deleted").toEqual([]);
+    await expect(setReminder(store, actor, { what: "should not stick", when: "tomorrow 9am", timezone: "UTC" }, now, caps)).rejects.toThrow(/The free plan allows 10 open reminders\. Upgrade to Pro for a higher allowance\. The trial is 14 days, then Pro\./);
+    expect(hosted.deleted).toHaveLength(1);
+    const ownId = hosted.deleted[0];
+    expect(hosted.deleted).toEqual([ownId]);
     expect(hosted.deleted).not.toContain(olderId);
     expect(hosted.stored.has(olderId)).toBe(true);
-    const inserted = [...hosted.stored.keys()].filter((id) => id !== olderId);
-    expect(inserted, "the inserted row stays; the read does not delete it").toHaveLength(1);
+    expect(hosted.stored.has(ownId)).toBe(false);
+    expect(await store.getReminder(actor.id, ownId)).toBeNull();
     expect((await store.getReminder(actor.id, olderId))?.id).toBe(olderId);
   });
 });

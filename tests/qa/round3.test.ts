@@ -367,7 +367,8 @@ describe("QA round 3 reservations, claims, and caps", () => {
     const activeRows = books.get(db)?.reminders.filter((row) => row.status === "active") ?? [];
     const older = activeRows.filter((row) => String(row.what).startsWith("Open"));
     expect(older, "an older row is not deleted").toHaveLength(9);
-    expect(activeRows, "this double has no trigger, so both inserts remain").toHaveLength(11);
+    expect(activeRows.length, "each refusal deletes only the row that call inserted").toBeLessThanOrEqual(10);
+    expect(activeRows.length).toBeGreaterThanOrEqual(9);
     const stored = new Set(activeRows.map((row) => row.id));
     const rejected = raced.filter((item) => item.status === "rejected");
     expect(rejected.length, "a cap refusal is a tool error").toBeGreaterThanOrEqual(1);

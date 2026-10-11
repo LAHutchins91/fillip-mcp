@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { ClaimResult, Delivery, DeliveryChannel, DigestSettings, OwnerContact, OwnerIdentity, PlanName, Recurrence, Reminder, ReminderStatus } from "./types.js";
 import { openCapMessage } from "./errors.js";
 import { OpenCapError, type ListQuery, type OpenCap, type SendReserve, type SendReserveResult, type ServiceStore } from "./store.js";
-import { sentThisMonth, usagePeriodCurrent } from "./usage.js";
+import { sentThisMonth, UPGRADE_PROMPT, usagePeriodCurrent } from "./usage.js";
 import { zonedParts, zonedTimeToUtc } from "./zone.js";
 
 export type Db = (pathname: string, options?: RequestInit) => Promise<unknown>;
@@ -216,15 +216,23 @@ export class SupabaseFillipStore implements ServiceStore {
   }
 
   /**
-   * The BEFORE INSERT OR UPDATE trigger is what holds the cap. This read does
-   * not delete. When a lagging active list is already longer than the cap, the
-   * call throws so a row is never handed back as saved.
+   * The trigger holds a real insert. A lagging active list can still come back
+   * longer than the cap. Delete only the row this call inserted, then throw,
+   * so the caller is not told it failed while that row stays due.
    */
   private async refuseIfReadOverCap(saved: Reminder, open: OpenCap): Promise<void> {
     const listed = rows<{ id: string }>(await this.persist()(
       `/rest/v1/reminders?owner_id=eq.${encodeURIComponent(saved.ownerId)}&status=eq.active&select=id&limit=500`
     ));
-    if (listed.length > open.cap) throw new OpenCapError(open.message);
+    if (listed.length <= open.cap) return;
+    await this.persist()(`/rest/v1/reminders?id=eq.${encodeURIComponent(saved.id)}&owner_id=eq.${encodeURIComponent(saved.ownerId)}`, {
+      method: "DELETE",
+      headers: { Prefer: "return=minimal" }
+    });
+    const message = open.message.startsWith("The free plan") && !open.message.includes(UPGRADE_PROMPT)
+      ? `${open.message} ${UPGRADE_PROMPT}`
+      : open.message;
+    throw new OpenCapError(message);
   }
 
   async deleteReminder(ownerId: string, id: string): Promise<void> {
