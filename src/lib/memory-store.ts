@@ -1,5 +1,5 @@
 import type { ClaimResult, Delivery, DeliveryChannel, DigestSettings, OwnerContact, OwnerIdentity, Reminder, ReminderStatus } from "./types.js";
-import type { ListQuery, SendReserve, SendReserveResult, ServiceStore } from "./store.js";
+import { OpenCapError, type ListQuery, type OpenCap, type SendReserve, type SendReserveResult, type ServiceStore } from "./store.js";
 import { blankContact, sentThisMonth } from "./usage.js";
 import { randomUUID } from "node:crypto";
 
@@ -11,6 +11,13 @@ export class MemoryFillipStore implements ServiceStore {
   providerBackoffUntil: string | null = null;
   private holds: Array<{ id: string; ownerId: string; global: boolean }> = [];
   private inFlight = new Set<string>();
+  private writes: Promise<void> = Promise.resolve();
+
+  private enqueue<T>(run: () => T): Promise<T> {
+    const result = this.writes.then(() => run());
+    this.writes = result.then(() => undefined, () => undefined);
+    return result;
+  }
 
   async listReminders(ownerId: string, query: ListQuery): Promise<Reminder[]> {
     return this.reminders
@@ -22,9 +29,15 @@ export class MemoryFillipStore implements ServiceStore {
     return this.reminders.find((row) => row.ownerId === ownerId && row.id === id) ?? null;
   }
 
-  async createReminder(reminder: Reminder): Promise<Reminder> {
-    this.reminders.push(reminder);
-    return reminder;
+  async createReminder(reminder: Reminder, open?: OpenCap): Promise<Reminder> {
+    return this.enqueue(() => {
+      if (open && reminder.status === "active") {
+        const active = this.reminders.filter((row) => row.ownerId === reminder.ownerId && row.status === "active").length;
+        if (active >= open.cap) throw new OpenCapError(open.message);
+      }
+      this.reminders.push(reminder);
+      return reminder;
+    });
   }
 
   async saveReminder(reminder: Reminder): Promise<Reminder> {
@@ -134,6 +147,10 @@ export class MemoryFillipStore implements ServiceStore {
       .slice(0, limit);
   }
 
+  async listHeld(nowIso: string): Promise<Reminder[]> {
+    return this.reminders.filter((row) => row.status === "active" && row.holdUntil !== null && row.holdUntil > nowIso);
+  }
+
   async listEnabledDigests(): Promise<DigestSettings[]> {
     return [...this.digests.values()].filter((row) => row.enabled);
   }
@@ -167,7 +184,7 @@ export class MemoryFillipStore implements ServiceStore {
       this.deliveries.push(delivery);
       return { delivery, outcome: "send" };
     }
-    if (existing.status === "sent") return { delivery: existing, outcome: "already-sent" };
+    if (existing.status === "sent" || existing.providerId) return { delivery: existing, outcome: "already-sent" };
     if (existing.status === "sending" && existing.startedAt > input.staleBeforeIso) {
       return { delivery: existing, outcome: "in-progress" };
     }
@@ -236,7 +253,7 @@ export class MemoryFillipStore implements ServiceStore {
     return { ok: true, id };
   }
 
-  releaseSend(id: string): void {
+  releaseSend(id: string, _keep = false): void {
     this.holds = this.holds.filter((hold) => hold.id !== id);
   }
 

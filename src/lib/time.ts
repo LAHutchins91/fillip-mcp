@@ -147,13 +147,20 @@ function instantAfter(year: number, month: number, day: number, hour: number, mi
 export function nextFire(recurrence: Recurrence, timeZone: string, after: Date): Date | null {
   if (recurrence.kind === "every_n_days" || recurrence.kind === "every_n_weeks") {
     const step = recurrence.kind === "every_n_days" ? recurrence.interval : recurrence.interval * 7;
-    let cursor: { year: number; month: number; day: number } = zonedParts(new Date(recurrence.anchor), timeZone);
-    for (let i = 0; i < 400; i += 1) {
-      const instant = instantAfter(cursor.year, cursor.month, cursor.day, recurrence.hour, recurrence.minute, timeZone, after);
-      if (instant) return withinEnd(recurrence, instant);
-      cursor = addCalendarDays(cursor.year, cursor.month, cursor.day, step);
+    if (step < 1) throw new WhenError("Fillip could not read that time. Try \"next Tue 2pm\" or \"every weekday 9am\".");
+    const anchor = zonedParts(new Date(recurrence.anchor), timeZone);
+    const afterParts = zonedParts(after, timeZone);
+    const anchorDay = Date.UTC(anchor.year, anchor.month - 1, anchor.day);
+    const afterDay = Date.UTC(afterParts.year, afterParts.month - 1, afterParts.day);
+    const elapsed = Math.round((afterDay - anchorDay) / 86_400_000);
+    const k = elapsed <= 0 ? 0 : Math.floor(elapsed / step);
+    for (let bump = 0; bump < 8; bump += 1) {
+      const date = addCalendarDays(anchor.year, anchor.month, anchor.day, (k + bump) * step);
+      const instant = instantAfter(date.year, date.month, date.day, recurrence.hour, recurrence.minute, timeZone, after);
+      if (!instant) continue;
+      return withinEnd(recurrence, instant);
     }
-    throw new WhenError("Fillip could not read that time. Try \"next Tue 2pm\" or \"every weekday 9am\".");
+    return null;
   }
   if (recurrence.kind === "monthly_date" || recurrence.kind === "monthly_nth") {
     const start = zonedParts(after, timeZone);
@@ -672,7 +679,7 @@ export function resolveWhen(input: string, timeZone: string, now: Date): Resolve
   const zone = assertTimeZone(timeZone);
   const raw = input.trim().replace(/\s+/g, " ");
   if (!raw) throw new WhenError("Say when to ping you, such as next Tuesday at 2pm.");
-  if (/^(yesterday|last\b|\d+\s+\w+\s+ago\b)/i.test(raw)) {
+  if (/^(yesterday|last\b|\d+\s+\w+\s+ago\b)/i.test(raw) && !/^last\s+\w+\s+of\s+every\s+month\b/i.test(raw)) {
     throw new WhenError("That time is in the past. Give a future time, such as tomorrow at 9am.");
   }
   const peeled = peelEnds(raw);

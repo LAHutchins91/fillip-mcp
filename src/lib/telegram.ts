@@ -2,7 +2,12 @@ import crypto from "node:crypto";
 import type { ServiceStore } from "./store.js";
 
 export type TelegramSender = {
-  send(chatId: string, text: string): Promise<{ id: string }>;
+  /**
+   * `idempotencyKey` is Fillip's occurrence key (`fillip/<reminder>/<fireAt>/telegram`).
+   * Telegram's sendMessage API does not store or honor it. Callers write the attempt
+   * before this call and skip the call when that row already exists.
+   */
+  send(chatId: string, text: string, idempotencyKey?: string): Promise<{ id: string }>;
 };
 
 export function telegramConfigured(env: NodeJS.ProcessEnv = process.env): boolean {

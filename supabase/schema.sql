@@ -88,15 +88,22 @@ grant select on public.profiles to authenticated;
 grant select, insert, update, delete on public.reminders to authenticated;
 grant select, insert, update, delete on public.digest_settings to authenticated;
 
--- Deliveries are written by the service role. Without a delete policy, a
--- user-token DELETE matches no rows and still returns success, so delivery
--- history survives account deletion. Owners may delete only their own rows.
--- The app deletes with the service role, which does not depend on this policy.
+-- Deliveries are written by the service role. Owners may delete only their own
+-- rows. PostgreSQL requires SELECT as well as DELETE: without a SELECT grant
+-- the delete raises 42501, and without a SELECT policy the delete matches
+-- nothing because the rows are not visible. The app deletes with the service
+-- role, which does not depend on these policies.
+drop policy if exists deliveries_owner_select on public.deliveries;
+create policy deliveries_owner_select on public.deliveries
+  for select to authenticated
+  using (owner_id = auth.uid());
+
 drop policy if exists deliveries_owner_delete on public.deliveries;
 create policy deliveries_owner_delete on public.deliveries
   for delete to authenticated
   using (owner_id = auth.uid());
 
+grant select on public.deliveries to authenticated;
 grant delete on public.deliveries to authenticated;
 
 -- Opt-in flips only the mail flag. It cannot change plan or Stripe ids.
@@ -250,3 +257,45 @@ grant execute on function public.fillip_set_default_channel(text) to authenticat
 grant execute on function public.fillip_set_telegram_link(text, timestamptz) to authenticated;
 grant execute on function public.fillip_clear_telegram() to authenticated;
 grant execute on function public.fillip_set_calendar_token(text) to authenticated;
+
+-- Parallel creates must not pass the free open cap. The lock is per owner,
+-- so two transactions cannot both count 9 and insert.
+create or replace function public.fillip_enforce_open_cap()
+returns trigger
+language plpgsql
+as $$
+declare
+  open_count integer;
+  plan text;
+  sub_status text;
+  cap integer;
+begin
+  if new.status is distinct from 'active' then
+    return new;
+  end if;
+  perform pg_advisory_xact_lock(hashtext(new.owner_id::text));
+  select p.plan, p.subscription_status into plan, sub_status
+  from public.profiles p
+  where p.id = new.owner_id;
+  if sub_status = 'trialing' or (sub_status = 'active' and plan in ('pro', 'annual')) then
+    cap := 100;
+  else
+    cap := 10;
+  end if;
+  select count(*) into open_count
+  from public.reminders r
+  where r.owner_id = new.owner_id and r.status = 'active';
+  if open_count >= cap then
+    if cap = 10 then
+      raise exception 'The free plan allows 10 open reminders.';
+    end if;
+    raise exception 'Too many reminders are still open. Complete or cancel one first.';
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists reminders_open_cap on public.reminders;
+create trigger reminders_open_cap
+  before insert on public.reminders
+  for each row execute function public.fillip_enforce_open_cap();

@@ -121,7 +121,7 @@ function eventLines(reminder: Reminder, now: Date): string[] {
     `DTEND;TZID=${reminder.timezone}:${icsLocal(end, reminder.timezone)}`,
     `SUMMARY:${escapeText(reminder.what)}`
   ];
-  const description = [reminder.context, "Fillip, reminders that fire."].filter(Boolean).join("\\n");
+  const description = [reminder.context, "Fillip, reminders that fire."].filter(Boolean).join("\n");
   lines.push(`DESCRIPTION:${escapeText(description)}`);
   const rule = rruleFor(reminder.recurrence);
   if (rule) lines.push(`RRULE:${rule}`);

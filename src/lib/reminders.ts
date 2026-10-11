@@ -1,5 +1,5 @@
 import { calendarFeed } from "./ics.js";
-import { newId, type ReminderStore, type ServiceStore } from "./store.js";
+import { OpenCapError, newId, type OpenCap, type ReminderStore, type ServiceStore } from "./store.js";
 import { newSecretToken, telegramDeepLink, telegramUsername } from "./telegram.js";
 import { applyRepeat, attachEndDate, describeRecurrence, nextFire, parseClock, recurrenceFromCadence, resolveWhen, type RepeatChoice, type ResolvedWhen } from "./time.js";
 import { MAX_ACTIVE_REMINDERS, MAX_CREATES_PER_HOUR, type Actor, type DeliveryChannel, type DigestSettings, type Reminder, type ReminderStatus } from "./types.js";
@@ -139,9 +139,9 @@ export async function setReminder(store: ReminderStore, actor: Actor, input: {
   const channel = chosenChannel(input.channel, usage?.defaultChannel, telegramEnabled);
   let resolved = applyRepeat(resolveWhen(input.when, input.timezone, now), input.repeat, input.timezone);
   if (input.until?.trim()) resolved = attachEndDate(resolved, input.until, input.timezone, now);
-  const reminder = await store.createReminder(stamp(actor, input.what, input.context ?? null, input.timezone, resolved, "reminder", channel, now));
+  const draft = stamp(actor, input.what, input.context ?? null, input.timezone, resolved, "reminder", channel, now);
   const note = [resolved.note, channelNote(channel)].filter(Boolean).join(" ");
-  return view(reminder, now, { corrected: resolved.corrected, note });
+  return createOrRefuse(store, draft, openCapFor(usage, caps), now, { corrected: resolved.corrected, note });
 }
 
 function holdExplanation(reminder: Reminder, allowance: Allowance): string | null {
@@ -338,9 +338,36 @@ export async function followUp(store: ReminderStore, actor: Actor, input: {
     };
   }
   if (input.until?.trim()) first = attachEndDate(first, input.until, input.timezone, now);
-  const reminder = await store.createReminder(stamp(actor, input.topic, input.context ?? null, input.timezone, first, "follow_up", channel, now));
-  const note = [first.note, followNote(channel, reminder.recurrence, input.timezone)].filter(Boolean).join(" ");
-  return view(reminder, now, { corrected: first.corrected, note });
+  const draft = stamp(actor, input.topic, input.context ?? null, input.timezone, first, "follow_up", channel, now);
+  const note = [first.note, followNote(channel, draft.recurrence, input.timezone)].filter(Boolean).join(" ");
+  return createOrRefuse(store, draft, openCapFor(usage, caps), now, { corrected: first.corrected, note });
+}
+
+function openCapFor(usage: { plan?: string | null; subscriptionStatus?: string | null } | null, caps: TierCaps): OpenCap {
+  const tier = tierFor(usage?.plan, usage?.subscriptionStatus);
+  const cap = tier === "free" ? freeOpenReminders(caps) : MAX_ACTIVE_REMINDERS;
+  return {
+    cap,
+    message: tier === "free" ? freeOpenMessage(cap) : "Too many reminders are still open. Complete or cancel one first."
+  };
+}
+
+async function createOrRefuse(
+  store: ReminderStore,
+  reminder: Reminder,
+  open: OpenCap,
+  now: Date,
+  extra: { corrected?: boolean; note?: string | null }
+): Promise<ReminderView> {
+  try {
+    const saved = await store.createReminder(reminder, open);
+    return view(saved, now, extra);
+  } catch (error) {
+    if (error instanceof OpenCapError && (await store.countActive(reminder.ownerId)) >= open.cap) {
+      return view(reminder, now, { corrected: extra.corrected ?? false, note: error.message });
+    }
+    throw error;
+  }
 }
 
 export async function saveDigestSettings(store: ReminderStore, actor: Actor, input: {

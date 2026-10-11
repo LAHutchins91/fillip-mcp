@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { MemoryFillipStore } from "./memory-store.js";
+import type { OpenCap } from "./store.js";
 import type { Delivery, DigestSettings, OwnerContact, Reminder } from "./types.js";
 
 type Snapshot = {
@@ -43,8 +44,8 @@ export class FileFillipStore extends MemoryFillipStore {
     writeFileSync(this.filePath, JSON.stringify(snapshot));
   }
 
-  override async createReminder(reminder: Reminder): Promise<Reminder> {
-    const saved = await super.createReminder(reminder);
+  override async createReminder(reminder: Reminder, open?: OpenCap): Promise<Reminder> {
+    const saved = await super.createReminder(reminder, open);
     this.persist();
     return saved;
   }

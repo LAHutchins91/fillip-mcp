@@ -21,7 +21,7 @@ import { FileFillipStore } from "./lib/file-store.js";
 import { MemoryFillipStore } from "./lib/memory-store.js";
 import { verifyStopToken } from "./lib/stop-token.js";
 import type { ReminderStore, ServiceStore } from "./lib/store.js";
-import { SupabaseFillipStore, type Db } from "./lib/supabase-store.js";
+import { FILLIP_EMPTY_REPRESENTATION, SupabaseFillipStore, type Db } from "./lib/supabase-store.js";
 import type { Actor } from "./lib/types.js";
 import { validateMcpClaims } from "./mcp-claims.js";
 import { MCP_CORS_HEADERS, ensureStreamableHttpAccept, mcpBrowserOriginAllowed } from "./mcp-clients.js";
@@ -136,7 +136,12 @@ async function supabaseRequest<T>(pathname: string, options: RequestInit = {}, a
   const response = await fetch(`${base}${pathname}`, { ...options, headers, signal: options.signal ?? AbortSignal.timeout(20000) });
   const text = await response.text();
   if (!response.ok) throw new Error(`Supabase ${response.status}: ${text || response.statusText}`);
-  return (text ? JSON.parse(text) : null) as T;
+  if (!text) {
+    const prefer = new Headers(options.headers).get("prefer") ?? "";
+    if (prefer.includes("return=representation")) return FILLIP_EMPTY_REPRESENTATION as T;
+    return null as T;
+  }
+  return JSON.parse(text) as T;
 }
 
 function bearer(req: Request) {

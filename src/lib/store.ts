@@ -3,10 +3,20 @@ import type { ClaimResult, Delivery, DeliveryChannel, DigestSettings, OwnerConta
 
 export type ListQuery = { status?: ReminderStatus | "all" };
 
+/** Checked and inserted together so two parallel creates cannot both pass the open cap. */
+export type OpenCap = { cap: number; message: string };
+
+export class OpenCapError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "OpenCapError";
+  }
+}
+
 export interface ReminderStore {
   listReminders(ownerId: string, query: ListQuery): Promise<Reminder[]>;
   getReminder(ownerId: string, id: string): Promise<Reminder | null>;
-  createReminder(reminder: Reminder): Promise<Reminder>;
+  createReminder(reminder: Reminder, open?: OpenCap): Promise<Reminder>;
   saveReminder(reminder: Reminder): Promise<Reminder>;
   deleteReminder(ownerId: string, id: string): Promise<void>;
   countCreatedSince(ownerId: string, sinceIso: string): Promise<number>;
@@ -44,6 +54,8 @@ export type SendReserveResult =
 export interface ServiceStore extends ReminderStore {
   getContact(ownerId: string): Promise<OwnerContact | null>;
   listDue(nowIso: string, limit: number): Promise<Reminder[]>;
+  /** Active reminders whose hold is still in the future. */
+  listHeld(nowIso: string): Promise<Reminder[]>;
   listEnabledDigests(): Promise<DigestSettings[]>;
   claimDelivery(input: {
     ownerId: string;
@@ -63,9 +75,13 @@ export interface ServiceStore extends ReminderStore {
   getProviderBackoffUntil(): Promise<string | null>;
   setProviderBackoffUntil(untilIso: string): Promise<void>;
   saveUsage(ownerId: string, usage: { emailsSentInPeriod: number; emailPeriodStart: string }): Promise<void>;
-  /** Synchronous cap hold. Two callers in one process cannot both pass the same remaining slot. */
-  reserveSend(input: SendReserve): SendReserveResult;
-  releaseSend(id: string): void;
+  /**
+   * Hold one ping before the provider call.
+   * Hosted stores do this with a conditional update so two workers cannot both take the last ping.
+   */
+  reserveSend(input: SendReserve): SendReserveResult | Promise<SendReserveResult>;
+  /** Drop the hold. `keep` means the send was accepted and a hosted counter increment must stay. */
+  releaseSend(id: string, keep?: boolean): void | Promise<void>;
   /** One in-flight provider call per idempotency key. False when another caller already holds it or it was sent. */
   beginSend(idempotencyKey: string): boolean;
   finishSend(idempotencyKey: string): void;

@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { ClaimResult, Delivery, DeliveryChannel, DigestSettings, OwnerContact, OwnerIdentity, PlanName, Recurrence, Reminder, ReminderStatus } from "./types.js";
 import type { ListQuery, SendReserve, SendReserveResult, ServiceStore } from "./store.js";
+import { sentThisMonth, usagePeriodCurrent } from "./usage.js";
+import { zonedParts, zonedTimeToUtc } from "./zone.js";
 
 export type Db = (pathname: string, options?: RequestInit) => Promise<unknown>;
 
@@ -10,9 +12,37 @@ function rows<T>(value: unknown): T[] {
   return Array.isArray(value) ? value as T[] : [];
 }
 
+/**
+ * An empty HTTP body on `Prefer: return=representation` is not a lost compare-and-swap.
+ * PostgREST returns `[]` when the filter matched nothing. A client that accepts the
+ * write and sends no body (the HTTP stand-in) is reported with this marker instead.
+ */
+export const FILLIP_EMPTY_REPRESENTATION = Object.freeze({ fillipEmptyRepresentation: true });
+
+export function isAcknowledgedWrite(value: unknown): boolean {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    (value as { fillipEmptyRepresentation?: boolean }).fillipEmptyRepresentation === true
+  );
+}
+
 function isDuplicate(error: unknown): boolean {
   const message = error instanceof Error ? error.message : "";
   return message.includes("23505") || message.toLowerCase().includes("duplicate");
+}
+
+/** A claim lock older than this is abandoned and can be taken again. Matches the job's stale window. */
+const CLAIM_LEASE_MS = 2 * 60 * 1000;
+
+function leaseCutoff(nowIso: string): string {
+  return new Date(new Date(nowIso).getTime() - CLAIM_LEASE_MS).toISOString();
+}
+
+function localMonthStartIso(now: Date, timeZone: string): string {
+  const parts = zonedParts(now, timeZone);
+  return zonedTimeToUtc(parts.year, parts.month, 1, 0, 0, timeZone).toISOString();
 }
 
 type ReminderRow = {
@@ -130,6 +160,8 @@ export function dueRemindersPath(nowIso: string, limit: number): string {
 export class SupabaseFillipStore implements ServiceStore {
   private sendHolds = new Set<string>();
   private inFlight = new Set<string>();
+  /** Reservation id to owner, present only while a hosted counter increment should be undone on failure. */
+  private reservations = new Map<string, string>();
   constructor(private ownerId: string | null, private db: Db, private mode: Mode) {}
 
   private owned(ownerId: string) {
@@ -332,6 +364,12 @@ export class SupabaseFillipStore implements ServiceStore {
     return rows<ReminderRow>(value).map(fromReminder);
   }
 
+  async listHeld(nowIso: string): Promise<Reminder[]> {
+    if (this.mode !== "service") throw new Error("Reminder not found");
+    const value = await this.db(`/rest/v1/reminders?status=eq.active&hold_until=gt.${encodeURIComponent(nowIso)}&select=*&limit=500`);
+    return rows<ReminderRow>(value).map(fromReminder);
+  }
+
   async listEnabledDigests(): Promise<DigestSettings[]> {
     if (this.mode !== "service") throw new Error("Reminder not found");
     const value = await this.db("/rest/v1/digest_settings?enabled=eq.true&select=*");
@@ -377,7 +415,7 @@ export class SupabaseFillipStore implements ServiceStore {
     }
     const existing = rows<DeliveryRow>(await this.db(`/rest/v1/deliveries?dedupe_key=eq.${encodeURIComponent(input.dedupeKey)}&select=*`))[0];
     if (!existing) throw new Error("Fillip could not complete this request. Your reminder may not have been saved.");
-    if (existing.status === "sent") return { delivery: fromDelivery(existing), outcome: "already-sent" };
+    if (existing.status === "sent" || existing.provider_id) return { delivery: fromDelivery(existing), outcome: "already-sent" };
     if (existing.status === "sending" && existing.started_at > input.staleBeforeIso) {
       return { delivery: fromDelivery(existing), outcome: "in-progress" };
     }
@@ -395,8 +433,16 @@ export class SupabaseFillipStore implements ServiceStore {
         })
       });
     } catch (error) {
-      if (isDuplicate(error)) return { delivery: fromDelivery(existing), outcome: "in-progress" };
-      throw error;
+      if (!isDuplicate(error)) throw error;
+      const ticket = rows<DeliveryRow>(await this.db(`/rest/v1/deliveries?dedupe_key=eq.${encodeURIComponent(ticketKey)}&select=*`))[0];
+      if (ticket?.started_at && ticket.started_at > leaseCutoff(input.nowIso)) {
+        return { delivery: fromDelivery(existing), outcome: "in-progress" };
+      }
+      await this.db(`/rest/v1/deliveries?dedupe_key=eq.${encodeURIComponent(ticketKey)}`, {
+        method: "PATCH",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({ status: "sending", started_at: input.nowIso })
+      });
     }
     const taken = rows<DeliveryRow>(await this.db(`/rest/v1/deliveries?dedupe_key=eq.${encodeURIComponent(input.dedupeKey)}&status=neq.sent`, {
       method: "PATCH",
@@ -511,14 +557,64 @@ export class SupabaseFillipStore implements ServiceStore {
     });
   }
 
-  reserveSend(_input: SendReserve): SendReserveResult {
-    const id = randomUUID();
-    this.sendHolds.add(id);
-    return { ok: true, id };
+  async reserveSend(input: SendReserve): Promise<SendReserveResult> {
+    if (this.mode !== "service") throw new Error("Reminder not found");
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const usage = await this.readUsage(input.ownerId);
+      const used = sentThisMonth(
+        { emailsSentInPeriod: usage.emailsSentInPeriod, emailPeriodStart: usage.emailPeriodStart, subscriptionStatus: usage.subscriptionStatus },
+        input.now,
+        input.timeZone
+      );
+      if (used >= input.monthlyLimit) return { ok: false, reason: "month" };
+      if ((await this.countSentSince(input.ownerId, input.sinceIso)) >= input.dailyLimit) return { ok: false, reason: "day" };
+      if (input.countGlobal) {
+        if ((await this.countAllSentSince(input.globalDayStartIso)) >= input.globalDayLimit) return { ok: false, reason: "global-day" };
+        if ((await this.countAllSentSince(input.globalMonthStartIso)) >= input.globalMonthLimit) return { ok: false, reason: "global-month" };
+      }
+      const periodCurrent = Boolean(usage.emailPeriodStart) && usagePeriodCurrent(usage.emailPeriodStart ?? "", input.now, input.timeZone, usage.subscriptionStatus);
+      const stored = usage.emailsSentInPeriod;
+      const next = used + 1;
+      const periodStart = periodCurrent && usage.emailPeriodStart ? usage.emailPeriodStart : localMonthStartIso(input.now, input.timeZone);
+      const updated = await this.db(
+        `/rest/v1/profiles?id=eq.${encodeURIComponent(input.ownerId)}&emails_sent_in_period=eq.${stored}`,
+        {
+          method: "PATCH",
+          headers: { Prefer: "return=representation" },
+          body: JSON.stringify({
+            emails_sent_in_period: next,
+            email_period_start: periodStart,
+            updated_at: new Date().toISOString()
+          })
+        }
+      );
+      // A row means this worker won the compare-and-swap. An empty array or null
+      // means another worker already took the count. An acknowledged write with
+      // no body still holds the slot: the caller accepted the PATCH.
+      if (!isAcknowledgedWrite(updated) && !rows(updated)[0]) continue;
+      const id = randomUUID();
+      this.sendHolds.add(id);
+      this.reservations.set(id, input.ownerId);
+      return { ok: true, id };
+    }
+    return { ok: false, reason: "month" };
   }
 
-  releaseSend(id: string): void {
+  async releaseSend(id: string, keep = false): Promise<void> {
+    const ownerId = this.reservations.get(id);
+    this.reservations.delete(id);
     this.sendHolds.delete(id);
+    if (!ownerId || keep || this.mode !== "service") return;
+    const usage = await this.readUsage(ownerId);
+    const next = Math.max(0, usage.emailsSentInPeriod - 1);
+    await this.db(
+      `/rest/v1/profiles?id=eq.${encodeURIComponent(ownerId)}&emails_sent_in_period=eq.${usage.emailsSentInPeriod}`,
+      {
+        method: "PATCH",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({ emails_sent_in_period: next, updated_at: new Date().toISOString() })
+      }
+    );
   }
 
   beginSend(idempotencyKey: string): boolean {
