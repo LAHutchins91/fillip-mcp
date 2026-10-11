@@ -40,7 +40,7 @@ export type Reminder = {
   resumeStatus?: "active" | "paused" | "fired" | "completed" | "cancelled" | null;
 };
 
-export type DeliveryStatus = "sending" | "sent" | "failed" | "skipped";
+export type DeliveryStatus = "sending" | "sent" | "failed" | "skipped" | "cancelled";
 
 export type Delivery = {
   id: string;

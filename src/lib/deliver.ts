@@ -531,13 +531,17 @@ export async function runDueJob(options: {
               if (claim.delivery.providerId === ATTEMPT_MARK && !missedAttempt(claim.delivery, staleBefore)) retryingAttempt = true;
               const marked = await markAttempt(options.store, claim.delivery);
               try {
-                const result = await options.telegram.sender.send(contact.telegramChatId, telegramText(reminder, options.now), idempotencyKey);
-                keep = true;
-                await options.store.saveDelivery({ ...marked, status: "sent", providerId: result.id, sentAt: nowIso, error: null });
-                await noteSent(options.store, contact, options.now, reminder.timezone);
-                telegramDone = true;
-                delivered = true;
-                report.sent += 1;
+                if (!(await options.store.confirmActiveSend(marked))) {
+                  report.skipped += 1;
+                } else {
+                  const result = await options.telegram.sender.send(contact.telegramChatId, telegramText(reminder, options.now), idempotencyKey);
+                  keep = true;
+                  await options.store.saveDelivery({ ...marked, status: "sent", providerId: result.id, sentAt: nowIso, error: null });
+                  await noteSent(options.store, contact, options.now, reminder.timezone);
+                  telegramDone = true;
+                  delivered = true;
+                  report.sent += 1;
+                }
               } catch (error) {
                 await options.store.saveDelivery({
                   ...marked,
@@ -675,26 +679,30 @@ export async function runDueJob(options: {
               const fresh = await options.store.getReminder(reminder.ownerId, reminder.id) ?? reminder;
               const message = messageForReminder(fresh, options.from, to, stopUrl, options.now);
               await takeSlot();
-              const result = await options.sender.send(message);
-              accepted = true;
-              await options.store.saveDelivery({
-                ...marked,
-                status: "sent",
-                providerId: result.id,
-                sentAt: nowIso,
-                error: outsideAttempt ? DELAYED_RETRY_NOTE : null
-              });
-              try {
-                await noteSent(options.store, contact, options.now, reminder.timezone);
-              } catch {
-                warn("Fillip recorded the provider accept but could not update the allowance. The occurrence will not be sent again.");
+              if (!(await options.store.confirmActiveSend(marked))) {
+                report.skipped += 1;
+              } else {
+                const result = await options.sender.send(message);
+                accepted = true;
+                await options.store.saveDelivery({
+                  ...marked,
+                  status: "sent",
+                  providerId: result.id,
+                  sentAt: nowIso,
+                  error: outsideAttempt ? DELAYED_RETRY_NOTE : null
+                });
+                try {
+                  await noteSent(options.store, contact, options.now, reminder.timezone);
+                } catch {
+                  warn("Fillip recorded the provider accept but could not update the allowance. The occurrence will not be sent again.");
+                }
+                global.daySent += 1;
+                global.monthSent += 1;
+                refreshStop();
+                emailDone = true;
+                delivered = true;
+                report.sent += 1;
               }
-              global.daySent += 1;
-              global.monthSent += 1;
-              refreshStop();
-              emailDone = true;
-              delivered = true;
-              report.sent += 1;
             } catch (error) {
               if (accepted) {
                 emailDone = true;

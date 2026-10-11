@@ -49,7 +49,7 @@ create table if not exists public.deliveries (
   reminder_id uuid references public.reminders (id) on delete cascade,
   dedupe_key text not null unique,
   occurrence_at timestamptz not null,
-  status text not null check (status in ('sending', 'sent', 'failed', 'skipped')),
+  status text not null check (status in ('sending', 'sent', 'failed', 'skipped', 'cancelled')),
   idempotency_key text not null,
   provider_id text,
   started_at timestamptz not null default now(),
@@ -82,6 +82,9 @@ alter table public.reminders add constraint reminders_status_check
 alter table public.reminders drop constraint if exists reminders_resume_status_check;
 alter table public.reminders add constraint reminders_resume_status_check
   check (resume_status is null or resume_status in ('active', 'paused', 'fired', 'completed', 'cancelled'));
+alter table public.deliveries drop constraint if exists deliveries_status_check;
+alter table public.deliveries add constraint deliveries_status_check
+  check (status in ('sending', 'sent', 'failed', 'skipped', 'cancelled'));
 
 create index if not exists reminders_due on public.reminders (fire_at) where status = 'active';
 create index if not exists reminders_removed_purge on public.reminders (removed_at) where status = 'removed';
@@ -206,6 +209,8 @@ create table if not exists public.fillip_runtime (
 );
 
 insert into public.fillip_runtime (id) values (1) on conflict (id) do nothing;
+alter table public.fillip_runtime add column if not exists last_purge_count integer;
+alter table public.fillip_runtime add column if not exists last_purge_at timestamptz;
 
 alter table public.fillip_runtime enable row level security;
 revoke all on table public.fillip_runtime from public, anon, authenticated;
@@ -570,6 +575,97 @@ begin
   end if;
 end
 $$;
+
+-- Last look before the provider call. The share lock ends when this function
+-- returns, so the send itself is not held. A miss marks a still-sending row
+-- skipped and does not count as a send. Remove, pause, and cancel already
+-- set that row to cancelled in the same transaction as the status change.
+create or replace function public.fillip_confirm_send(delivery_id uuid)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  delivery_status text;
+  reminder_status text;
+  reminder uuid;
+begin
+  select d.status, d.reminder_id
+    into delivery_status, reminder
+  from public.deliveries d
+  where d.id = delivery_id
+  for update;
+
+  if delivery_status is distinct from 'sending' then
+    return false;
+  end if;
+
+  if reminder is null then
+    return true;
+  end if;
+
+  select r.status into reminder_status
+  from public.reminders r
+  where r.id = reminder
+  for share;
+
+  if reminder_status = 'active' then
+    return true;
+  end if;
+
+  update public.deliveries
+  set status = 'skipped',
+      provider_id = null
+  where id = delivery_id
+    and status = 'sending';
+  return false;
+end;
+$$;
+
+revoke all on function public.fillip_confirm_send(uuid) from public, anon, authenticated;
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    grant execute on function public.fillip_confirm_send(uuid) to service_role;
+  end if;
+end
+$$;
+
+-- Runs in the reminder update, so a worker that already claimed send sees the
+-- delivery cancelled before it calls the provider.
+create or replace function public.fillip_cancel_inflight_claims()
+returns trigger
+language plpgsql
+set search_path = public
+as $$
+begin
+  if tg_op = 'UPDATE'
+     and old.status is distinct from new.status
+     and new.status in ('removed', 'paused', 'cancelled') then
+    update public.deliveries
+    set status = 'cancelled'
+    where reminder_id = new.id
+      and owner_id = new.owner_id
+      and status = 'sending';
+  end if;
+  return new;
+end;
+$$;
+
+revoke all on function public.fillip_cancel_inflight_claims() from public, anon, authenticated;
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    grant execute on function public.fillip_cancel_inflight_claims() to service_role;
+  end if;
+end
+$$;
+
+drop trigger if exists reminders_cancel_inflight on public.reminders;
+create trigger reminders_cancel_inflight
+  after update of status on public.reminders
+  for each row execute function public.fillip_cancel_inflight_claims();
 
 -- Parallel creates and resumes must not pass the free open cap. The advisory
 -- lock and the profile row lock are per owner. An update counts only when the

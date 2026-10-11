@@ -355,7 +355,7 @@ async function internalStatus(req: Request, res: Response) {
     : limits.perDay <= 0 || limits.perMonth <= 0 || countsMissing;
   const reason = globalEmails?.reason
     ?? (countsMissing ? null : limits.perMonth <= 0 ? "month" : limits.perDay <= 0 ? "day" : null);
-  const purged = await purgeRemovedNow();
+  const lastPurge = await recordedPurge();
   res.json({
     ok: true,
     service: "fillip",
@@ -370,7 +370,8 @@ async function internalStatus(req: Request, res: Response) {
     resendConfigured: Boolean(envValue("RESEND_API_KEY")),
     senderConfigured: Boolean(envValue("FILLIP_FROM_EMAIL")),
     telegramConfigured: telegramConfigured(),
-    purged,
+    purged: lastPurge?.count ?? null,
+    purgedAt: lastPurge?.at ?? null,
     globalEmails: {
       daySent,
       dayLimit: limits.perDay,
@@ -481,6 +482,8 @@ async function stopMail(req: Request, res: Response) {
 app.get("/stop", stopMail);
 app.post("/stop", stopMail);
 
+let lastPurge: { count: number; at: string } | null = null;
+
 async function purgeRemovedNow(): Promise<number | null> {
   if (!envValue("SUPABASE_URL") || !envValue("SUPABASE_SERVICE_ROLE_KEY")) return null;
   try {
@@ -493,6 +496,49 @@ async function purgeRemovedNow(): Promise<number | null> {
   }
 }
 
+async function rememberPurge(count: number): Promise<void> {
+  const recorded = { count, at: new Date().toISOString() };
+  lastPurge = recorded;
+  if (!envValue("SUPABASE_URL") || !envValue("SUPABASE_SERVICE_ROLE_KEY")) return;
+  try {
+    await supabaseRequest("/rest/v1/fillip_runtime?on_conflict=id", {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify({
+        id: 1,
+        last_purge_count: recorded.count,
+        last_purge_at: recorded.at,
+        updated_at: recorded.at
+      })
+    }, undefined, true);
+  } catch (error) {
+    console.warn("Fillip could not record the last purge");
+    console.warn(error instanceof Error ? error.message : "purge record failed");
+  }
+}
+
+async function recordedPurge(): Promise<{ count: number; at: string } | null> {
+  if (envValue("SUPABASE_URL") && envValue("SUPABASE_SERVICE_ROLE_KEY")) {
+    try {
+      const rows = await supabaseRequest<Array<{ last_purge_count?: number | null; last_purge_at?: string | null }>>(
+        "/rest/v1/fillip_runtime?id=eq.1&select=last_purge_count,last_purge_at",
+        { method: "GET" },
+        undefined,
+        true
+      );
+      const row = rows?.[0];
+      if (typeof row?.last_purge_count === "number" && typeof row.last_purge_at === "string") {
+        lastPurge = { count: row.last_purge_count, at: row.last_purge_at };
+        return lastPurge;
+      }
+    } catch (error) {
+      console.warn("Fillip could not read the last purge");
+      console.warn(error instanceof Error ? error.message : "purge read failed");
+    }
+  }
+  return lastPurge;
+}
+
 async function deliver(req: Request, res: Response) {
   const secret = envValue("CRON_SECRET");
   if (!secret) return res.status(503).json({ error: "Delivery is not configured." });
@@ -500,7 +546,12 @@ async function deliver(req: Request, res: Response) {
   const header = bearer(req);
   if (!header || !safeEqual(header, secret)) return res.status(401).json({ error: "Delivery authorization failed." });
   const purged = await purgeRemovedNow();
-  if (!envValue("RESEND_API_KEY")) return res.status(503).json({ error: "Email provider is not configured." });
+  if (typeof purged === "number") await rememberPurge(purged);
+  if (!envValue("RESEND_API_KEY")) {
+    return res.status(503).json(typeof purged === "number"
+      ? { error: "Email provider is not configured.", purged }
+      : { error: "Email provider is not configured." });
+  }
   try {
     const report = await runDueJob({
       store: createServiceStore(),
@@ -516,7 +567,9 @@ async function deliver(req: Request, res: Response) {
       global: globalEmailLimitsFromEnv(),
       telegram: envValue("TELEGRAM_BOT_TOKEN") ? { sender: createTelegramSender(envValue("TELEGRAM_BOT_TOKEN")) } : null
     });
-    res.json({ ...report, purged: typeof purged === "number" ? purged + report.purged : report.purged });
+    const total = typeof purged === "number" ? purged + report.purged : report.purged;
+    await rememberPurge(total);
+    res.json({ ...report, purged: total });
   } catch (error) {
     console.error("Delivery job failed");
     const message = error instanceof Error ? error.message : "";

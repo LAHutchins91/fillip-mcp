@@ -373,12 +373,15 @@ describe("streamable HTTP", () => {
     try {
       const denied = await ask("/internal/deliver");
       expect(denied.status).toBe(503);
-      expect(JSON.parse(denied.text)).toEqual({ error: "Email provider is not configured." });
-      expect(calls.some((call) => call.includes("/rest/v1/rpc/fillip_purge_removed"))).toBe(true);
+      expect(JSON.parse(denied.text)).toEqual({ error: "Email provider is not configured.", purged: 4 });
+      expect(calls.filter((call) => call.includes("/rest/v1/rpc/fillip_purge_removed"))).toHaveLength(1);
       expect(calls.some((call) => call.includes("api.resend.com"))).toBe(false);
       const status = await ask("/internal/status");
       expect(status.status).toBe(200);
-      expect((JSON.parse(status.text) as { purged: number }).purged).toBe(4);
+      const statusBody = JSON.parse(status.text) as { purged: number; purgedAt: string };
+      expect(statusBody.purged).toBe(4);
+      expect(statusBody.purgedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+      expect(calls.filter((call) => call.includes("/rest/v1/rpc/fillip_purge_removed"))).toHaveLength(1);
     } finally {
       globalThis.fetch = original;
       for (const [key, value] of Object.entries(previous)) {

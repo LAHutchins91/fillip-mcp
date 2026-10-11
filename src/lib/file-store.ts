@@ -93,6 +93,12 @@ export class FileFillipStore extends MemoryFillipStore {
     return result;
   }
 
+  override async confirmActiveSend(delivery: Delivery): Promise<boolean> {
+    const ok = await super.confirmActiveSend(delivery);
+    if (!ok) this.persist();
+    return ok;
+  }
+
   override async saveDelivery(delivery: Delivery): Promise<void> {
     await super.saveDelivery(delivery);
     this.persist();

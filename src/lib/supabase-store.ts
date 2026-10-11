@@ -670,6 +670,34 @@ export class SupabaseFillipStore implements ServiceStore {
     return { delivery: fromDelivery({ ...row, status: "sending", started_at: input.nowIso, idempotency_key: input.idempotencyKey }), outcome: "send" };
   }
 
+  async confirmActiveSend(delivery: Delivery): Promise<boolean> {
+    if (this.mode !== "service") throw new Error("Reminder not found");
+    if (!delivery.reminderId) return true;
+    try {
+      const value = await this.db("/rest/v1/rpc/fillip_confirm_send", {
+        method: "POST",
+        body: JSON.stringify({ delivery_id: delivery.id })
+      });
+      if (typeof value === "boolean") return value;
+    } catch {
+      // The status read below is the same predicate when the function is not installed.
+    }
+    const found = rows<{ status?: string }>(await this.db(
+      `/rest/v1/reminders?id=eq.${encodeURIComponent(delivery.reminderId)}&owner_id=eq.${encodeURIComponent(delivery.ownerId)}&select=status&limit=1`
+    ));
+    const status = found[0]?.status;
+    if (!status || status === "active") return true;
+    await this.db(
+      `/rest/v1/deliveries?id=eq.${encodeURIComponent(delivery.id)}&owner_id=eq.${encodeURIComponent(delivery.ownerId)}&status=eq.sending`,
+      {
+        method: "PATCH",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({ status: "skipped", provider_id: null })
+      }
+    );
+    return false;
+  }
+
   async saveDelivery(delivery: Delivery): Promise<void> {
     if (this.mode !== "service") throw new Error("Reminder not found");
     await this.db(`/rest/v1/deliveries?dedupe_key=eq.${encodeURIComponent(delivery.dedupeKey)}`, {

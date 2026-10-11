@@ -46,8 +46,25 @@ export class MemoryFillipStore implements ServiceStore {
     if (expectedUpdatedAt !== undefined && this.reminders[index]?.updatedAt !== expectedUpdatedAt) {
       throw new ReminderConflictError();
     }
+    const previous = this.reminders[index];
     this.reminders[index] = reminder;
+    if (
+      previous
+      && previous.status !== reminder.status
+      && (reminder.status === "removed" || reminder.status === "paused" || reminder.status === "cancelled")
+    ) {
+      this.cancelInFlight(reminder.ownerId, reminder.id);
+    }
     return reminder;
+  }
+
+  /** Same moment as the status write: an in-progress claim cannot still look sendable. */
+  private cancelInFlight(ownerId: string, reminderId: string): void {
+    for (const delivery of this.deliveries) {
+      if (delivery.ownerId === ownerId && delivery.reminderId === reminderId && delivery.status === "sending") {
+        delivery.status = "cancelled";
+      }
+    }
   }
 
   async reminderSendInFlight(ownerId: string, reminderId: string, now: Date): Promise<boolean> {
@@ -268,6 +285,20 @@ export class MemoryFillipStore implements ServiceStore {
     existing.idempotencyKey = input.idempotencyKey;
     if (!this.reminderIsActive(input.ownerId, input.reminderId)) return this.withheldClaim(input);
     return { delivery: existing, outcome: "send" };
+  }
+
+  async confirmActiveSend(delivery: Delivery): Promise<boolean> {
+    if (!delivery.reminderId) return true;
+    const row = this.deliveries.find((item) => item.ownerId === delivery.ownerId && item.dedupeKey === delivery.dedupeKey);
+    if (row && row.status !== "sending") return false;
+    if (!this.reminderIsActive(delivery.ownerId, delivery.reminderId)) {
+      if (row?.status === "sending") {
+        row.status = "skipped";
+        row.providerId = null;
+      }
+      return false;
+    }
+    return true;
   }
 
   async saveDelivery(delivery: Delivery): Promise<void> {

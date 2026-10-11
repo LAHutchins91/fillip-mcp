@@ -131,7 +131,9 @@ describe("schema re-run", () => {
         order by p.proname
       `);
       expect(functions.rows.map((row) => row.proname)).toEqual(expect.arrayContaining([
+        "fillip_cancel_inflight_claims",
         "fillip_claim_sendable",
+        "fillip_confirm_send",
         "fillip_enforce_open_cap",
         "fillip_purge_removed",
         "fillip_reserve_ping",
@@ -157,6 +159,12 @@ describe("schema re-run", () => {
       `);
       expect(resumeCheck.rows[0]?.def ?? "").toContain("cancelled");
       expect(resumeCheck.rows[0]?.def ?? "").toContain("completed");
+      const deliveryCheck = await db.query<{ def: string }>(`
+        select pg_get_constraintdef(oid) as def
+        from pg_constraint
+        where conname = 'deliveries_status_check'
+      `);
+      expect(deliveryCheck.rows[0]?.def ?? "").toContain("cancelled");
       const purgeIndex = await db.query<{ indexname: string }>(
         "select indexname from pg_indexes where schemaname = 'public' and indexname = 'reminders_removed_purge'"
       );
@@ -167,13 +175,48 @@ describe("schema re-run", () => {
       const triggers = await db.query<{ tgname: string }>(`
         select tgname from pg_trigger
         where not tgisinternal
-          and tgname in ('on_auth_user_created_fillip', 'reminders_open_cap')
+          and tgname in ('on_auth_user_created_fillip', 'reminders_cancel_inflight', 'reminders_open_cap')
         order by tgname
       `);
       expect(triggers.rows.map((row) => row.tgname)).toEqual([
         "on_auth_user_created_fillip",
+        "reminders_cancel_inflight",
         "reminders_open_cap"
       ]);
+      const owner = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      const removedId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      const removedDelivery = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+      await db.query("insert into auth.users (id) values ($1)", [owner]);
+      await db.query(
+        `insert into public.reminders (id, owner_id, kind, what, timezone, fire_at, status)
+         values ($1, $2, 'reminder', 'inflight', 'UTC', now(), 'active')`,
+        [removedId, owner]
+      );
+      await db.query(
+        `insert into public.deliveries (id, owner_id, reminder_id, dedupe_key, occurrence_at, status, idempotency_key)
+         values ($1, $2, $3, 'inflight-key', now(), 'sending', 'inflight-idem')`,
+        [removedDelivery, owner, removedId]
+      );
+      await db.query("update public.reminders set status = 'removed' where id = $1", [removedId]);
+      const cancelled = await db.query<{ status: string }>("select status from public.deliveries where id = $1", [removedDelivery]);
+      expect(cancelled.rows[0]?.status).toBe("cancelled");
+      const completedId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+      const completedDelivery = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+      await db.query(
+        `insert into public.reminders (id, owner_id, kind, what, timezone, fire_at, status)
+         values ($1, $2, 'reminder', 'done', 'UTC', now(), 'active')`,
+        [completedId, owner]
+      );
+      await db.query(
+        `insert into public.deliveries (id, owner_id, reminder_id, dedupe_key, occurrence_at, status, idempotency_key)
+         values ($1, $2, $3, 'done-key', now(), 'sending', 'done-idem')`,
+        [completedDelivery, owner, completedId]
+      );
+      await db.query("update public.reminders set status = 'completed' where id = $1", [completedId]);
+      const confirmed = await db.query<{ ok: boolean }>("select public.fillip_confirm_send($1::uuid) as ok", [completedDelivery]);
+      expect(confirmed.rows[0]?.ok).toBe(false);
+      const skipped = await db.query<{ status: string }>("select status from public.deliveries where id = $1", [completedDelivery]);
+      expect(skipped.rows[0]?.status).toBe("skipped");
     } finally {
       await db.end();
     }

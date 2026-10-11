@@ -104,6 +104,13 @@ export interface ServiceStore extends ReminderStore {
     nowIso: string;
     staleBeforeIso: string;
   }): Promise<ClaimResult>;
+  /**
+   * Last check before the provider call. True only when this delivery is still
+   * sending and its reminder is still active. A digest has no reminder and stays
+   * sendable. When the reminder is not active, a sending row is marked skipped.
+   * A row already cancelled by remove, pause, or cancel stays cancelled.
+   */
+  confirmActiveSend(delivery: Delivery): Promise<boolean>;
   ownerIdForCalendarToken(token: string): Promise<string | null>;
   claimTelegramLink(token: string, chatId: string, nowIso: string): Promise<string | null>;
   saveDelivery(delivery: Delivery): Promise<void>;

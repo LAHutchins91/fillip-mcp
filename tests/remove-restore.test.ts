@@ -64,6 +64,7 @@ describe("remove and restore", () => {
     };
     expect((await store.claimDelivery(claim)).outcome).toBe("send");
     await removeReminder(store, actor.id, row.id, now);
+    expect(store.deliveries.find((item) => item.reminderId === row.id)?.status).toBe("cancelled");
     expect((await store.claimDelivery(claim)).outcome).toBe("withheld");
     expect(store.reserveSend({
       ownerId: actor.id,
@@ -88,6 +89,31 @@ describe("remove and restore", () => {
     await store.setCalendarToken(actor.id, "calendar-token-value-123456");
     const feed = await renderCalendarFeed(store, "calendar-token-value-123456", now);
     expect(feed ?? "").not.toContain("Ship the note");
+  });
+
+  it("cancels an in-progress delivery when the reminder is paused or cancelled", async () => {
+    for (const action of ["pause", "cancel"] as const) {
+      const store = new MemoryFillipStore();
+      const created = await setReminder(store, actor, { what: action, when: "tomorrow at 9am", timezone: "UTC" }, earlier);
+      const row = await store.getReminder(actor.id, created.id);
+      if (!row) throw new Error("missing reminder");
+      expect((await store.claimDelivery({
+        ownerId: actor.id,
+        reminderId: row.id,
+        dedupeKey: `reminder:${row.id}:${row.fireAt}:email`,
+        occurrenceAt: row.fireAt,
+        idempotencyKey: `fillip/${row.id}/${row.fireAt}`,
+        channel: "email",
+        nowIso: now.toISOString(),
+        staleBeforeIso: new Date(now.getTime() - 120_000).toISOString()
+      })).outcome).toBe("send");
+      if (action === "pause") await snoozeOrReschedule(store, actor.id, row.id, undefined, "UTC", now, "pause");
+      else await completeOrCancel(store, actor.id, row.id, "cancel", now);
+      expect(store.deliveries.find((item) => item.reminderId === row.id)?.status).toBe("cancelled");
+      const sender = new RecordingSender();
+      expect((await job(store, sender, now)).sent).toBe(0);
+      expect(sender.sent).toHaveLength(0);
+    }
   });
 
   it("restores the same id and the next time, and stays paused when it was paused", async () => {
