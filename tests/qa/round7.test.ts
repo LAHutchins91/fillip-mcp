@@ -350,6 +350,42 @@ describe("QA round 7 token hook and the open cap on Postgres", () => {
       await Promise.all(clients.map((client) => client.end()));
     }
   });
+
+  it("counts 15 simultaneous wrong tries once each and lets through at most five", async () => {
+    const emailHash = "a".repeat(64);
+    const ipHash = "b".repeat(64);
+    const clients = await Promise.all(Array.from({ length: 15 }, async () => {
+      const client = pgClient();
+      await client.connect();
+      return client;
+    }));
+    try {
+      const emailCounts = await Promise.all(clients.map((client) => client.query<{ n: number }>(
+        "select public.fillip_bump_code_counter('email', $1, 'wrong') as n",
+        [emailHash]
+      ).then((result) => result.rows[0]?.n)));
+      expect([...emailCounts].sort((left, right) => left - right)).toEqual(Array.from({ length: 15 }, (_, index) => index + 1));
+      expect(emailCounts.filter((count) => count <= 5)).toHaveLength(5);
+      const storedEmail = await db.query<{ wrong_count: number }>(
+        "select wrong_count from public.fillip_code_attempts where subject_kind = 'email' and subject_hash = $1",
+        [emailHash]
+      );
+      expect(storedEmail.rows[0]?.wrong_count).toBe(15);
+
+      const ipCounts = await Promise.all(clients.map((client) => client.query<{ n: number }>(
+        "select public.fillip_bump_code_counter('ip', $1, 'verify') as n",
+        [ipHash]
+      ).then((result) => result.rows[0]?.n)));
+      expect([...ipCounts].sort((left, right) => left - right)).toEqual(Array.from({ length: 15 }, (_, index) => index + 1));
+      const storedIp = await db.query<{ verify_count: number }>(
+        "select verify_count from public.fillip_code_attempts where subject_kind = 'ip' and subject_hash = $1",
+        [ipHash]
+      );
+      expect(storedIp.rows[0]?.verify_count).toBe(15);
+    } finally {
+      await Promise.all(clients.map((client) => client.end()));
+    }
+  });
 });
 
 describe("QA round 7 over-cap read-back", () => {
@@ -499,18 +535,24 @@ describe("QA round 7 HTTP catalog, lockout, and sign-out", () => {
         if (bearer === "Bearer token-b") return send(200, { id: "user-b", email: "b@example.com" });
         return send(401, { message: "bad" });
       }
-      if (url.startsWith("/rest/v1/fillip_code_attempts")) {
-        const query = new URL(url, "http://stub.local");
-        if (req.method === "GET") {
-          const kind = (query.searchParams.get("subject_kind") ?? "").replace(/^eq\./, "");
-          const hash = decodeURIComponent((query.searchParams.get("subject_hash") ?? "").replace(/^eq\./, ""));
-          return send(200, attempts.filter((row) => row.subject_kind === kind && row.subject_hash === hash));
+      if (url.startsWith("/rest/v1/rpc/fillip_bump_code_counter")) {
+        const parsed = JSON.parse(body) as { p_kind: string; p_hash: string; p_field: "wrong" | "send" | "verify" };
+        let row = attempts.find((item) => item.subject_kind === parsed.p_kind && item.subject_hash === parsed.p_hash);
+        if (!row) {
+          row = { subject_kind: parsed.p_kind, subject_hash: parsed.p_hash, wrong_count: 0, send_count: 0, verify_count: 0 };
+          attempts.push(row);
         }
-        const row = JSON.parse(body) as Record<string, string | number>;
-        const index = attempts.findIndex((item) => item.subject_kind === row.subject_kind && item.subject_hash === row.subject_hash);
-        if (index >= 0) attempts[index] = row;
-        else attempts.push(row);
-        res.writeHead(201);
+        const field = parsed.p_field === "wrong" ? "wrong_count" : parsed.p_field === "send" ? "send_count" : "verify_count";
+        row[field] = Number(row[field] ?? 0) + 1;
+        return send(200, row[field]);
+      }
+      if (url.startsWith("/rest/v1/rpc/fillip_clear_email_wrong") || url.startsWith("/rest/v1/rpc/fillip_reset_ip_verify")) {
+        const parsed = JSON.parse(body) as { p_hash: string };
+        const kind = url.includes("fillip_clear_email_wrong") ? "email" : "ip";
+        const row = attempts.find((item) => item.subject_kind === kind && item.subject_hash === parsed.p_hash);
+        if (row && kind === "email") row.wrong_count = 0;
+        if (row && kind === "ip") row.verify_count = 0;
+        res.writeHead(204);
         res.end();
         return;
       }
@@ -623,8 +665,8 @@ describe("QA round 7 HTTP catalog, lockout, and sign-out", () => {
     expect(readme).toContain("refresh_token_already_used");
     expect(readme).toContain("Sign out everywhere");
     expect(readme).toContain("code_challenge_method");
-    expect(oauth).toContain("A new send resets the count.");
-    expect(oauth).toContain("Two issued codes that share a scope are ambiguous and neither is bound.");
+    expect(oauth).toContain("A new send does not clear that lock.");
+    expect(oauth).toContain("however many rows there are");
     expect(oauth).toContain("an issued grant with no resource does not receive the audience");
     expect(oauth).toContain("POST /auth/v1/logout?scope=global");
     const roots = ["README.md", "src", "public", "glama.json", "server.json", "supabase/README-oauth.md"];

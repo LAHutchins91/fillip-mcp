@@ -144,9 +144,11 @@ describe("OAuth resource audience", () => {
     );
     expect(granted.rows.map((row) => row.column_name)).toEqual([
       "authorization_code",
+      "authorization_id",
       "client_id",
       "code_challenge_method",
       "expires_at",
+      "id",
       "resource",
       "scope",
       "status",
@@ -267,5 +269,47 @@ describe("OAuth resource audience", () => {
       [clientA, user, expected]
     );
     expect(await audience(clash, clientA)).toBe("authenticated");
+  });
+
+  it("matches the authorization id in the claims and withholds a different id", async () => {
+    const goodSession = "88888888-8888-4888-8888-888888888881";
+    const badSession = "88888888-8888-4888-8888-888888888882";
+    await db.query("delete from auth.oauth_authorizations where client_id = $1", [clientA]);
+    await db.query("delete from fillip_private.oauth_resources where session_id in ($1, $2)", [goodSession, badSession]);
+    await db.query(
+      `insert into auth.oauth_authorizations
+         (id, authorization_id, client_id, user_id, scope, status, expires_at, resource, code_challenge_method, authorization_code, created_at, approved_at)
+       values
+         ('99999999-9999-4999-8999-999999999991', 'named-evil', $1, $2, 'email', 'approved', now() + interval '1 hour', 'https://evil.example/mcp', 's256', 'code-named-evil', now() - interval '1 minute', now() - interval '1 minute'),
+         ('99999999-9999-4999-8999-999999999992', 'named-real', $1, $2, 'email', 'approved', now() + interval '1 hour', $3, 's256', 'code-named-real', now(), now())`,
+      [clientA, user, expected]
+    );
+    const base = event(goodSession, clientA);
+    await db.query(
+      `insert into auth.sessions (id, user_id, oauth_client_id, scopes)
+       values ($1, $2, $3, 'email')
+       on conflict (id) do update set oauth_client_id = excluded.oauth_client_id`,
+      [goodSession, user, clientA]
+    );
+    const good = await db.query<{ event: { claims?: { aud?: unknown } } }>(
+      "select public.fillip_access_token_hook($1::jsonb) as event",
+      [JSON.stringify({ ...base, claims: { ...base.claims, authorization_id: "named-real" } })]
+    );
+    expect(good.rows[0]?.event.claims?.aud).toEqual(["authenticated", expected]);
+
+    await db.query(
+      `insert into auth.sessions (id, user_id, oauth_client_id, scopes)
+       values ($1, $2, $3, 'email')
+       on conflict (id) do update set oauth_client_id = excluded.oauth_client_id`,
+      [badSession, user, clientA]
+    );
+    const bad = await db.query<{ event: { claims?: { aud?: unknown } } }>(
+      "select public.fillip_access_token_hook($1::jsonb) as event",
+      [JSON.stringify({
+        ...event(badSession, clientA),
+        claims: { ...event(badSession, clientA).claims, authorization_id: "does-not-exist" }
+      })]
+    );
+    expect(bad.rows[0]?.event.claims?.aud).toBe("authenticated");
   });
 });

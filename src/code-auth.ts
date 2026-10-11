@@ -1,10 +1,10 @@
 import { createHmac } from "node:crypto";
 import type { Express, Request, Response } from "express";
 import { z } from "zod";
-import { otpFailure } from "./plugin-auth.js";
 
 export const CODE_SENT = "If that email can sign in, a code is on its way.";
 export const CODE_LOCKED = "Too many wrong codes. Request a new one.";
+export const CODE_WRONG = "That code is wrong or expired.";
 export const SIGNED_OUT_EVERYWHERE = "Signed out of every app and device.";
 
 const SEND_WAIT = "Too many code emails were requested. Wait a minute, then send a new code.";
@@ -14,12 +14,14 @@ const PAD_MS = 500;
 const EMAIL_WRONG_LIMIT = 5;
 const IP_SEND_LIMIT = 5;
 const IP_VERIFY_LIMIT = 10;
-const WINDOW_MS = 5 * 60 * 1000;
+const EMAIL_WINDOW_MS = 15 * 60 * 1000;
+const IP_WINDOW_MS = 5 * 60 * 1000;
 
 const emailBody = z.object({ email: z.string().trim().email().max(254) });
 const verifyBody = emailBody.extend({ code: z.string().trim().regex(/^\d{6,10}$/) });
 
 type AttemptKind = "email" | "ip";
+type CounterField = "wrong" | "send" | "verify";
 
 type AttemptRow = {
   subject_kind: AttemptKind;
@@ -30,14 +32,12 @@ type AttemptRow = {
   window_started_at: string;
 };
 
-type AttemptStore = {
-  read(kind: AttemptKind, hash: string): Promise<AttemptRow | null>;
-  write(row: AttemptRow): Promise<void>;
-};
-
 const memoryRows = new Map<string, AttemptRow>();
+let memoryChain: Promise<unknown> = Promise.resolve();
 
 function pepper(): string {
+  const dedicated = (process.env.FILLIP_LOCKOUT_SECRET || "").trim();
+  if (dedicated) return dedicated;
   return process.env.FILLIP_UNSUBSCRIBE_SECRET || process.env.CRON_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || "fillip-pkce";
 }
 
@@ -68,24 +68,35 @@ function blankRow(kind: AttemptKind, hash: string, now: number): AttemptRow {
   };
 }
 
-function openWindow(row: AttemptRow | null, kind: AttemptKind, hash: string, now: number): AttemptRow {
-  if (!row) return blankRow(kind, hash, now);
-  const started = Date.parse(row.window_started_at);
-  if (!Number.isFinite(started) || now - started >= WINDOW_MS) {
-    return { ...row, send_count: 0, verify_count: 0, window_started_at: new Date(now).toISOString() };
-  }
-  return row;
+function memoryExclusive<T>(work: () => T): Promise<T> {
+  const run = memoryChain.then(work, work);
+  memoryChain = run.then(() => undefined, () => undefined);
+  return run;
 }
 
-function memoryStore(): AttemptStore {
-  return {
-    async read(kind, hash) {
-      return memoryRows.get(`${kind}:${hash}`) ?? null;
-    },
-    async write(row) {
-      memoryRows.set(`${row.subject_kind}:${row.subject_hash}`, { ...row });
+function memoryBump(kind: AttemptKind, hash: string, field: CounterField): Promise<number> {
+  return memoryExclusive(() => {
+    const now = Date.now();
+    const key = `${kind}:${hash}`;
+    const span = kind === "email" ? EMAIL_WINDOW_MS : IP_WINDOW_MS;
+    let row = memoryRows.get(key);
+    if (!row) row = blankRow(kind, hash, now);
+    else {
+      const started = Date.parse(row.window_started_at);
+      if (!Number.isFinite(started) || now - started >= span) {
+        row = { ...blankRow(kind, hash, now) };
+      } else {
+        row = { ...row };
+      }
     }
-  };
+    if (field === "wrong") row.wrong_count += 1;
+    else if (field === "send") row.send_count += 1;
+    else row.verify_count += 1;
+    memoryRows.set(key, row);
+    if (field === "wrong") return row.wrong_count;
+    if (field === "send") return row.send_count;
+    return row.verify_count;
+  });
 }
 
 async function serviceRest<T>(pathname: string, options: RequestInit = {}): Promise<T> {
@@ -103,31 +114,88 @@ async function serviceRest<T>(pathname: string, options: RequestInit = {}): Prom
   return JSON.parse(text) as T;
 }
 
-function supabaseStore(): AttemptStore {
-  return {
-    async read(kind, hash) {
-      const rows = await serviceRest<AttemptRow[]>(
-        `/rest/v1/fillip_code_attempts?subject_kind=eq.${encodeURIComponent(kind)}&subject_hash=eq.${encodeURIComponent(hash)}&select=subject_kind,subject_hash,wrong_count,send_count,verify_count,window_started_at&limit=1`
-      );
-      return rows?.[0] ?? null;
-    },
-    async write(row) {
-      await serviceRest(`/rest/v1/fillip_code_attempts?on_conflict=subject_kind,subject_hash`, {
-        method: "POST",
-        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-        body: JSON.stringify({ ...row, updated_at: new Date().toISOString() })
-      });
-    }
-  };
+function asCount(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && /^\d+$/.test(value)) return Number(value);
+  throw new Error("counter");
 }
 
-function attemptStore(): AttemptStore {
-  if (supabaseBase() && serviceKey()) return supabaseStore();
-  return memoryStore();
+async function bumpCounter(kind: AttemptKind, hash: string, field: CounterField): Promise<number> {
+  if (supabaseBase() && serviceKey()) {
+    const value = await serviceRest<unknown>("/rest/v1/rpc/fillip_bump_code_counter", {
+      method: "POST",
+      body: JSON.stringify({ p_kind: kind, p_hash: hash, p_field: field })
+    });
+    return asCount(value);
+  }
+  return memoryBump(kind, hash, field);
+}
+
+async function clearEmailWrong(hash: string): Promise<void> {
+  if (supabaseBase() && serviceKey()) {
+    await serviceRest("/rest/v1/rpc/fillip_clear_email_wrong", {
+      method: "POST",
+      body: JSON.stringify({ p_hash: hash })
+    });
+    return;
+  }
+  await memoryExclusive(() => {
+    const row = memoryRows.get(`email:${hash}`);
+    if (row) memoryRows.set(`email:${hash}`, { ...row, wrong_count: 0 });
+  });
+}
+
+async function resetIpVerify(hash: string): Promise<void> {
+  if (supabaseBase() && serviceKey()) {
+    await serviceRest("/rest/v1/rpc/fillip_reset_ip_verify", {
+      method: "POST",
+      body: JSON.stringify({ p_hash: hash })
+    });
+    return;
+  }
+  await memoryExclusive(() => {
+    const row = memoryRows.get(`ip:${hash}`);
+    if (row) memoryRows.set(`ip:${hash}`, { ...row, verify_count: 0 });
+  });
+}
+
+function firstHop(value: string | undefined): string {
+  if (!value) return "";
+  return value.split(",")[0]?.trim() ?? "";
+}
+
+function ipv6Slash64(address: string): string {
+  const bare = (address.toLowerCase().split("%")[0] ?? "").trim();
+  const halves = bare.split("::");
+  if (halves.length > 2) return bare;
+  const expand = (side: string) => (side ? side.split(":").filter((part) => part.length > 0) : []);
+  const left = expand(halves[0] ?? "");
+  const right = halves.length === 2 ? expand(halves[1] ?? "") : [];
+  if (halves.length === 1) {
+    if (left.length !== 8) return bare;
+    return left.slice(0, 4).map((part) => part.padStart(4, "0")).join(":");
+  }
+  const missing = 8 - left.length - right.length;
+  if (missing < 0) return bare;
+  const hextets = [...left, ...Array.from({ length: missing }, () => "0"), ...right];
+  if (hextets.length < 4) return bare;
+  return hextets.slice(0, 4).map((part) => part.padStart(4, "0")).join(":");
+}
+
+/** Vercel sets x-vercel-forwarded-for. A client-supplied X-Forwarded-For chain is not the key. */
+export function lockoutAddressKey(header: (name: string) => string | undefined, remoteAddress?: string | null): string {
+  const vercel = firstHop(header("x-vercel-forwarded-for"));
+  const real = firstHop(header("x-real-ip"));
+  let value = vercel || real || (remoteAddress ?? "").trim() || "unknown";
+  if (value.toLowerCase().startsWith("::ffff:")) value = value.slice(7);
+  const v4port = value.match(/^(\d{1,3}(?:\.\d{1,3}){3}):\d+$/);
+  if (v4port?.[1]) return v4port[1];
+  if (value.includes(":")) return ipv6Slash64(value);
+  return value;
 }
 
 function requestIp(req: Request): string {
-  return req.ip || req.socket.remoteAddress || "unknown";
+  return lockoutAddressKey((name) => req.get(name), req.socket.remoteAddress);
 }
 
 function wantsJson(req: Request): boolean {
@@ -210,21 +278,16 @@ async function sendCode(req: Request, res: Response): Promise<void> {
   }
   const started = Date.now();
   const email = parsed.data.email.toLowerCase();
-  const store = attemptStore();
   const ipHash = codeSubjectHash("ip", requestIp(req));
-  const emailHash = codeSubjectHash("email", email);
-  let throttled = false;
+  let sendCount = 0;
+  let counted = false;
   try {
-    const ip = openWindow(await store.read("ip", ipHash), "ip", ipHash, started);
-    if (ip.send_count >= IP_SEND_LIMIT) throttled = true;
-    else {
-      ip.send_count += 1;
-      await store.write(ip);
-    }
+    sendCount = await bumpCounter("ip", ipHash, "send");
+    counted = true;
   } catch {
-    throttled = false;
+    counted = false;
   }
-  if (throttled) {
+  if (counted && sendCount > IP_SEND_LIMIT) {
     await pad(started);
     res.set("Cache-Control", "no-store").status(429).json({ ok: false, message: SEND_WAIT });
     return;
@@ -237,13 +300,11 @@ async function sendCode(req: Request, res: Response): Promise<void> {
     res.set("Cache-Control", "no-store").status(429).json({ ok: false, message: SEND_WAIT });
     return;
   }
-  if (sent.status >= 200 && sent.status < 300) {
+  if (counted && sendCount <= IP_SEND_LIMIT) {
     try {
-      const row = (await store.read("email", emailHash)) ?? blankRow("email", emailHash, started);
-      row.wrong_count = 0;
-      await store.write(row);
+      await resetIpVerify(ipHash);
     } catch {
-      // A failed counter reset still answers like every other send.
+      // A failed verify-window reset still answers like every other send.
     }
   }
   await pad(started);
@@ -261,41 +322,36 @@ async function verifyCode(req: Request, res: Response): Promise<void> {
     return;
   }
   const email = emailParsed.data.email.toLowerCase();
-  const store = attemptStore();
-  const now = Date.now();
   const ipHash = codeSubjectHash("ip", requestIp(req));
   const emailHash = codeSubjectHash("email", email);
-  let emailRow: AttemptRow;
+  let ipCount = 0;
   try {
-    const ip = openWindow(await store.read("ip", ipHash), "ip", ipHash, now);
-    if (ip.verify_count >= IP_VERIFY_LIMIT) {
-      res.set("Cache-Control", "no-store").status(429).json({ ok: false, message: CODE_LOCKED });
-      return;
-    }
-    ip.verify_count += 1;
-    await store.write(ip);
-    emailRow = (await store.read("email", emailHash)) ?? blankRow("email", emailHash, now);
+    ipCount = await bumpCounter("ip", ipHash, "verify");
   } catch {
     res.status(503).json({ ok: false, message: SIGN_IN_FAILED });
     return;
   }
-  if (emailRow.wrong_count >= EMAIL_WRONG_LIMIT) {
+  if (ipCount > IP_VERIFY_LIMIT) {
+    res.set("Cache-Control", "no-store").status(429).json({ ok: false, message: CODE_LOCKED });
+    return;
+  }
+  let wrongCount = 0;
+  try {
+    wrongCount = await bumpCounter("email", emailHash, "wrong");
+  } catch {
+    res.status(503).json({ ok: false, message: SIGN_IN_FAILED });
+    return;
+  }
+  if (wrongCount > EMAIL_WRONG_LIMIT) {
     res.set("Cache-Control", "no-store").status(429).json({ ok: false, message: CODE_LOCKED });
     return;
   }
   const parsed = verifyBody.safeParse(req.body);
   if (!parsed.success) {
-    emailRow.wrong_count += 1;
-    try {
-      await store.write(emailRow);
-    } catch {
-      res.status(503).json({ ok: false, message: SIGN_IN_FAILED });
-      return;
-    }
-    const locked = emailRow.wrong_count >= EMAIL_WRONG_LIMIT;
+    const locked = wrongCount >= EMAIL_WRONG_LIMIT;
     res.set("Cache-Control", "no-store").status(locked ? 429 : 400).json({
       ok: false,
-      message: locked ? CODE_LOCKED : otpFailure("invalid")
+      message: locked ? CODE_LOCKED : CODE_WRONG
     });
     return;
   }
@@ -308,26 +364,18 @@ async function verifyCode(req: Request, res: Response): Promise<void> {
       res.status(502).json({ ok: false, message: SIGN_IN_FAILED });
       return;
     }
-    emailRow.wrong_count = 0;
     try {
-      await store.write(emailRow);
+      await clearEmailWrong(emailHash);
     } catch {
       // The code is already consumed. Still hand the session to this browser.
     }
     res.set("Cache-Control", "no-store").status(200).json({ ok: true, access_token: access, refresh_token: refresh });
     return;
   }
-  emailRow.wrong_count += 1;
-  try {
-    await store.write(emailRow);
-  } catch {
-    res.status(503).json({ ok: false, message: SIGN_IN_FAILED });
-    return;
-  }
-  const locked = emailRow.wrong_count >= EMAIL_WRONG_LIMIT;
+  const locked = wrongCount >= EMAIL_WRONG_LIMIT;
   res.set("Cache-Control", "no-store").status(locked ? 429 : 400).json({
     ok: false,
-    message: locked ? CODE_LOCKED : otpFailure(gotrueMessage(checked.json) || "invalid")
+    message: locked ? CODE_LOCKED : CODE_WRONG
   });
 }
 

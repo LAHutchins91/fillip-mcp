@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ClaimResult, Delivery, DeliveryChannel, DigestSettings, OwnerContact, OwnerIdentity, PlanName, Recurrence, Reminder, ReminderStatus } from "./types.js";
-import { openCapMessage } from "./errors.js";
+import { openCapMessage, UNCONFIRMED_SAVE } from "./errors.js";
 import { OpenCapError, OpenCapKeptError, ReminderConflictError, type ListQuery, type OpenCap, type SendReserve, type SendReserveResult, type ServiceStore } from "./store.js";
 import { sentThisMonth, UPGRADE_PROMPT, usagePeriodCurrent } from "./usage.js";
 import { zonedParts, zonedTimeToUtc } from "./zone.js";
@@ -232,13 +232,23 @@ export class SupabaseFillipStore implements ServiceStore {
     const opened = await this.deleteOwnReturning(first, saved);
     if (opened.removed) throw this.capError(open);
     if (opened.error) failure = opened.error;
-    if (!(await this.rowStillStored(saved))) throw this.capError(open);
+    const seen = await this.rowStillStored(saved);
+    if (seen === "absent") throw this.capError(open);
+    if (seen === "unknown") {
+      this.logCapDeleteFailed(failure);
+      throw new Error(UNCONFIRMED_SAVE);
+    }
 
     if (this.writer && this.writer !== first) {
       const retried = await this.deleteOwnReturning(this.writer, saved);
       if (retried.removed) throw this.capError(open);
       if (retried.error) failure = retried.error;
-      if (!(await this.rowStillStored(saved))) throw this.capError(open);
+      const again = await this.rowStillStored(saved);
+      if (again === "absent") throw this.capError(open);
+      if (again === "unknown") {
+        this.logCapDeleteFailed(failure);
+        throw new Error(UNCONFIRMED_SAVE);
+      }
     }
 
     this.logCapDeleteFailed(failure);
@@ -260,14 +270,20 @@ export class SupabaseFillipStore implements ServiceStore {
     }
   }
 
-  private async rowStillStored(saved: Reminder): Promise<boolean> {
-    try {
-      const value = await this.persist()(this.ownReminderPath(saved, "*"));
-      if (isAcknowledgedWrite(value)) return true;
-      return rows<ReminderRow>(value).length > 0;
-    } catch {
-      return true;
-    }
+  /** A thrown read is unknown. One retry, then the caller must not claim the row was saved or removed. */
+  private async rowStillStored(saved: Reminder): Promise<"present" | "absent" | "unknown"> {
+    const once = async (): Promise<"present" | "absent" | "unknown"> => {
+      try {
+        const value = await this.persist()(this.ownReminderPath(saved, "*"));
+        if (isAcknowledgedWrite(value)) return "unknown";
+        return rows<ReminderRow>(value).length > 0 ? "present" : "absent";
+      } catch {
+        return "unknown";
+      }
+    };
+    const first = await once();
+    if (first !== "unknown") return first;
+    return once();
   }
 
   private ownReminderPath(saved: Reminder, select: string): string {

@@ -221,6 +221,106 @@ begin
 end
 $$;
 
+-- One statement increments a counter and returns the new value. Email wrongs
+-- use a 15-minute window. IP sends and verifies use a 5-minute window.
+-- A send does not change wrong_count.
+create or replace function public.fillip_bump_code_counter(p_kind text, p_hash text, p_field text)
+returns integer
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  n integer;
+  span interval := case when p_kind = 'email' then interval '15 minutes' else interval '5 minutes' end;
+begin
+  if p_kind not in ('email', 'ip') or p_field not in ('wrong', 'send', 'verify') then
+    raise exception 'invalid counter';
+  end if;
+  insert into public.fillip_code_attempts as existing (
+    subject_kind, subject_hash, wrong_count, send_count, verify_count, window_started_at, updated_at
+  ) values (
+    p_kind,
+    p_hash,
+    case when p_field = 'wrong' then 1 else 0 end,
+    case when p_field = 'send' then 1 else 0 end,
+    case when p_field = 'verify' then 1 else 0 end,
+    now(),
+    now()
+  )
+  on conflict (subject_kind, subject_hash) do update
+  set
+    wrong_count = case
+      when p_field = 'wrong' and existing.window_started_at <= now() - span then 1
+      when p_field = 'wrong' then existing.wrong_count + 1
+      when existing.window_started_at <= now() - span then 0
+      else existing.wrong_count
+    end,
+    send_count = case
+      when p_field = 'send' and existing.window_started_at <= now() - span then 1
+      when p_field = 'send' then existing.send_count + 1
+      when existing.window_started_at <= now() - span then 0
+      else existing.send_count
+    end,
+    verify_count = case
+      when p_field = 'verify' and existing.window_started_at <= now() - span then 1
+      when p_field = 'verify' then existing.verify_count + 1
+      when existing.window_started_at <= now() - span then 0
+      else existing.verify_count
+    end,
+    window_started_at = case
+      when existing.window_started_at <= now() - span then now()
+      else existing.window_started_at
+    end,
+    updated_at = now()
+  returning case p_field
+    when 'wrong' then wrong_count
+    when 'send' then send_count
+    else verify_count
+  end into n;
+  return n;
+end;
+$$;
+
+create or replace function public.fillip_clear_email_wrong(p_hash text)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  update public.fillip_code_attempts
+  set wrong_count = 0, updated_at = now()
+  where subject_kind = 'email' and subject_hash = p_hash;
+end;
+$$;
+
+create or replace function public.fillip_reset_ip_verify(p_hash text)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  update public.fillip_code_attempts
+  set verify_count = 0, updated_at = now()
+  where subject_kind = 'ip' and subject_hash = p_hash;
+end;
+$$;
+
+revoke all on function public.fillip_bump_code_counter(text, text, text) from public, anon, authenticated;
+revoke all on function public.fillip_clear_email_wrong(text) from public, anon, authenticated;
+revoke all on function public.fillip_reset_ip_verify(text) from public, anon, authenticated;
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    grant execute on function public.fillip_bump_code_counter(text, text, text) to service_role;
+    grant execute on function public.fillip_clear_email_wrong(text) to service_role;
+    grant execute on function public.fillip_reset_ip_verify(text) to service_role;
+  end if;
+end
+$$;
+
 alter table public.profiles add column if not exists default_channel text not null default 'email';
 alter table public.profiles add column if not exists telegram_chat_id text;
 alter table public.profiles add column if not exists telegram_link_token text;

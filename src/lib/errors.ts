@@ -1,5 +1,7 @@
 import { UPGRADE_PROMPT } from "./usage.js";
 
+export const UNCONFIRMED_SAVE = "Fillip couldn't confirm whether this reminder was saved. Please list your reminders.";
+
 const KNOWN = [
   "Say when to ping you",
   "That time is in the past",
@@ -15,6 +17,7 @@ const KNOWN = [
   "Too many reminders",
   "The free plan",
   "You're over the free plan",
+  "Fillip couldn't confirm whether this reminder was saved",
   "This plan's reminder pings",
   "Telegram is not offered",
   "Telegram is not linked",

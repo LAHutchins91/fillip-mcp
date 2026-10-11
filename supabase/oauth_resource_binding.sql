@@ -4,8 +4,11 @@
 -- Then set the resource to the public APP_BASE_URL || '/mcp' and reconnect clients.
 --
 -- The custom access token hook payload (Supabase Auth v0hooks.CustomAccessTokenInput) carries
--- user_id, authentication_method, and claims. It does not carry code_challenge_method or
--- authorization_id. Claims that identify the grant are session_id, client_id, sub, and scope.
+-- user_id, authentication_method, and claims. The current payload does not carry
+-- code_challenge_method or authorization_id. If claims include authorization_id or
+-- authorizationId, that row is the only match. Otherwise the grant is every unexpired
+-- approved issued row for that user, client, and scope. Claims that identify the set are
+-- session_id, client_id, sub, and scope.
 -- On an authorization_code exchange, IssueRefreshToken writes auth.sessions.oauth_client_id and
 -- auth.sessions.scopes from that authorization before this hook runs. The authorization row is
 -- still present: FindOAuthServerAuthorizationByCode requires status = approved, and Approve sets
@@ -46,6 +49,7 @@ declare
   resource text;
   expected text;
   grant_scope text;
+  auth_id text;
   matched integer := 0;
   agreed boolean := false;
   s256 boolean := false;
@@ -72,13 +76,13 @@ begin
   -- Refresh uses only the stored session row, and only when it still equals
   -- mcp_resource. That row is written only for an S256 grant, so a later
   -- approval cannot add the audience and a plain grant cannot gain it on refresh.
-  -- A new authorization code is bound from the single issued grant: the approved
-  -- auth.oauth_authorizations row whose client_id, user_id, and scope match the
-  -- session this hook was given, and whose authorization_code is set. A pending
-  -- row for the same user and client is not that grant. Trailing slashes are
-  -- not trimmed. Another client does not count. The audience is added only when
-  -- that grant's resource string-equals mcp_resource and its code_challenge_method
-  -- is s256. Two issued codes that share a scope are ambiguous, so neither is bound.
+  -- A new authorization code is bound from every unexpired, approved, issued
+  -- grant for this user, client, and scope. Each of those rows must string-equal
+  -- mcp_resource and use code_challenge_method s256. Any number of such rows
+  -- still receives the audience. One different or null resource, or one method
+  -- other than s256, withholds it. A pending row is not an issued grant.
+  -- Trailing slashes are not trimmed. Another client does not count. When the
+  -- claims carry an authorization id, that row is the only one matched.
   if resource is not null then
     if resource <> expected then
       resource := null;
@@ -93,6 +97,8 @@ begin
          and (s.oauth_client_id is null or s.oauth_client_id::text = cid);
     end if;
 
+    auth_id := nullif(btrim(coalesce(claims->>'authorization_id', claims->>'authorizationId', '')), '');
+
     if grant_scope is not null then
       select count(*)::integer,
              bool_and(a.resource is not null and a.resource = expected),
@@ -105,10 +111,15 @@ begin
          and a.status::text = 'approved'
          and a.authorization_code is not null
          and a.expires_at > now()
-         and a.scope = grant_scope;
+         and a.scope = grant_scope
+         and (
+           auth_id is null
+           or a.authorization_id = auth_id
+           or a.id::text = auth_id
+         );
     end if;
 
-    if matched = 1 and agreed and s256 and resource = expected then
+    if matched >= 1 and agreed and s256 and resource = expected then
       insert into fillip_private.oauth_resources (session_id, resource)
       values (sid, resource)
       on conflict do nothing;
@@ -147,8 +158,16 @@ begin
         where table_schema = 'auth'
           and table_name = 'oauth_authorizations'
           and column_name = 'code_challenge_method'
+     )
+     and exists (
+       select 1 from information_schema.columns
+        where table_schema = 'auth'
+          and table_name = 'oauth_authorizations'
+          and column_name = 'authorization_id'
      ) then
     grant select (
+      id,
+      authorization_id,
       client_id,
       user_id,
       scope,

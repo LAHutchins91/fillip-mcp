@@ -1,6 +1,6 @@
 import http, { type IncomingMessage, type Server } from "node:http";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { CODE_LOCKED, CODE_SENT, SIGNED_OUT_EVERYWHERE } from "../src/code-auth.js";
+import { CODE_LOCKED, CODE_SENT, CODE_WRONG, SIGNED_OUT_EVERYWHERE, lockoutAddressKey } from "../src/code-auth.js";
 import { app } from "../src/server.js";
 
 const saved = {
@@ -55,6 +55,29 @@ function request(base: string, method: string, pathname: string, body: string, h
     req.end(body);
   });
 }
+
+describe("emailed-code lockout address", () => {
+  it("ignores a spoofed X-Forwarded-For and keys IPv6 on its /64", () => {
+    const header = (map: Record<string, string>) => (name: string) => map[name.toLowerCase()];
+    const left = lockoutAddressKey(header({ "x-forwarded-for": "203.0.113.10" }), "127.0.0.1");
+    const right = lockoutAddressKey(header({ "x-forwarded-for": "203.0.113.99" }), "127.0.0.1");
+    expect(left).toBe(right);
+    expect(left).toBe("127.0.0.1");
+    expect(lockoutAddressKey(header({
+      "x-vercel-forwarded-for": "198.51.100.8, 10.0.0.1",
+      "x-forwarded-for": "203.0.113.10",
+      "x-real-ip": "198.51.100.9"
+    }), "127.0.0.1")).toBe("198.51.100.8");
+    expect(lockoutAddressKey(header({
+      "x-real-ip": "198.51.100.9",
+      "x-forwarded-for": "203.0.113.10"
+    }), "127.0.0.1")).toBe("198.51.100.9");
+    const same = lockoutAddressKey(() => undefined, "2001:db8:1:2::abcd");
+    expect(lockoutAddressKey(() => undefined, "2001:db8:1:2:ffff::1")).toBe(same);
+    expect(lockoutAddressKey(() => undefined, "2001:db8:1:3::1")).not.toBe(same);
+    expect(lockoutAddressKey(() => undefined, "::ffff:203.0.113.10")).toBe("203.0.113.10");
+  });
+});
 
 describe("server-side emailed codes and sign-out everywhere", () => {
   let stub: Server;
@@ -111,19 +134,33 @@ describe("server-side emailed codes and sign-out everywhere", () => {
         if (header !== `Bearer ${accessToken}`) return send(401, { message: "bad" });
         return send(200, { id: "user-1", email: "owner@example.com" });
       }
-      if (url.startsWith("/rest/v1/fillip_code_attempts")) {
-        const query = new URL(url, "http://stub.local");
-        if (req.method === "GET") {
-          const kind = (query.searchParams.get("subject_kind") ?? "").replace(/^eq\./, "");
-          const hash = decodeURIComponent((query.searchParams.get("subject_hash") ?? "").replace(/^eq\./, ""));
-          return send(200, attempts.filter((row) => row.subject_kind === kind && row.subject_hash === hash));
-        }
+      if (url.startsWith("/rest/v1/rpc/fillip_bump_code_counter")) {
         attemptBodies.push(body);
-        const row = JSON.parse(body) as AttemptRow;
-        const index = attempts.findIndex((item) => item.subject_kind === row.subject_kind && item.subject_hash === row.subject_hash);
-        if (index >= 0) attempts[index] = row;
-        else attempts.push(row);
-        res.writeHead(201);
+        const parsed = JSON.parse(body) as { p_kind: string; p_hash: string; p_field: "wrong" | "send" | "verify" };
+        let row = attempts.find((item) => item.subject_kind === parsed.p_kind && item.subject_hash === parsed.p_hash);
+        if (!row) {
+          row = {
+            subject_kind: parsed.p_kind,
+            subject_hash: parsed.p_hash,
+            wrong_count: 0,
+            send_count: 0,
+            verify_count: 0,
+            window_started_at: new Date().toISOString()
+          };
+          attempts.push(row);
+        }
+        const field = parsed.p_field === "wrong" ? "wrong_count" : parsed.p_field === "send" ? "send_count" : "verify_count";
+        row[field] += 1;
+        return send(200, row[field]);
+      }
+      if (url.startsWith("/rest/v1/rpc/fillip_clear_email_wrong") || url.startsWith("/rest/v1/rpc/fillip_reset_ip_verify")) {
+        attemptBodies.push(body);
+        const parsed = JSON.parse(body) as { p_hash: string };
+        const kind = url.includes("fillip_clear_email_wrong") ? "email" : "ip";
+        const row = attempts.find((item) => item.subject_kind === kind && item.subject_hash === parsed.p_hash);
+        if (row && kind === "email") row.wrong_count = 0;
+        if (row && kind === "ip") row.verify_count = 0;
+        res.writeHead(204);
         res.end();
         return;
       }
@@ -199,12 +236,12 @@ describe("server-side emailed codes and sign-out everywhere", () => {
     }
   });
 
-  it("locks an email after five wrong codes, resets on a new send, and keeps another email open", async () => {
+  it("locks an email after five wrong codes, stays locked after a new send, and keeps another email open", async () => {
     await post("/auth/code/send", { email: "owner@example.com" });
     for (let index = 0; index < 4; index += 1) {
       const wrong = await post("/auth/code/verify", { email: "owner@example.com", code: "000000" });
       expect(wrong.status).toBe(400);
-      expect(wrong.text).toMatch(/expired/);
+      expect(JSON.parse(wrong.text).message).toBe(CODE_WRONG);
       expect(wrong.text).not.toContain(CODE_LOCKED);
     }
     const fifth = await post("/auth/code/verify", { email: "owner@example.com", code: "000000" });
@@ -216,12 +253,6 @@ describe("server-side emailed codes and sign-out everywhere", () => {
     expect(JSON.parse(blocked.text).message).toBe(CODE_LOCKED);
     expect(blocked.text).not.toContain(sessionToken);
     expect(verifyCalls).toHaveLength(5);
-    const other = await post("/auth/code/verify", { email: "other@example.com", code: "123456" });
-    expect(other.status).toBe(200);
-    expect(JSON.parse(other.text)).toEqual({ ok: true, access_token: sessionToken, refresh_token: refreshToken });
-    expect(verifyCalls).toHaveLength(6);
-    const again = await post("/auth/code/send", { email: "owner@example.com" });
-    expect(JSON.parse(again.text).message).toBe(CODE_SENT);
     const logs: string[] = [];
     const methods = ["log", "info", "warn", "error", "debug"] as const;
     const originals = methods.map((method) => console[method]);
@@ -230,20 +261,28 @@ describe("server-side emailed codes and sign-out everywhere", () => {
         logs.push(args.map((item) => String(item)).join(" "));
       };
     }
+    let other: { status: number; text: string; cache: string | null };
     try {
-      const unlocked = await post("/auth/code/verify", { email: "owner@example.com", code: "123456" });
-      expect(unlocked.status).toBe(200);
-      expect(unlocked.cache).toContain("no-store");
-      expect(JSON.parse(unlocked.text)).toEqual({ ok: true, access_token: sessionToken, refresh_token: refreshToken });
-      expect(unlocked.text).not.toContain("owner@example.com");
+      other = await post("/auth/code/verify", { email: "other@example.com", code: "123456" });
     } finally {
       methods.forEach((method, index) => {
         console[method] = originals[index];
       });
     }
+    expect(other.status).toBe(200);
+    expect(other.cache).toContain("no-store");
+    expect(JSON.parse(other.text)).toEqual({ ok: true, access_token: sessionToken, refresh_token: refreshToken });
+    expect(other.text).not.toContain("other@example.com");
     expect(logs.join("\n")).not.toContain(sessionToken);
     expect(logs.join("\n")).not.toContain(refreshToken);
-    expect(verifyCalls.at(-1)).toEqual({ email: "owner@example.com", token: "123456", type: "email" });
+    expect(verifyCalls).toHaveLength(6);
+    const again = await post("/auth/code/send", { email: "owner@example.com" });
+    expect(JSON.parse(again.text).message).toBe(CODE_SENT);
+    const still = await post("/auth/code/verify", { email: "owner@example.com", code: "123456" });
+    expect(still.status).toBe(429);
+    expect(JSON.parse(still.text).message).toBe(CODE_LOCKED);
+    expect(still.text).not.toContain(sessionToken);
+    expect(verifyCalls).toHaveLength(6);
     for (const stored of attemptBodies) {
       expect(stored).not.toContain("owner@example.com");
       expect(stored).not.toContain("000000");
