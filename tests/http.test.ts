@@ -154,8 +154,13 @@ describe("streamable HTTP", () => {
     const hiddenHtml = await hidden.text();
     expect(hidden.status).toBe(200);
     expect(hiddenHtml).toContain("Email me a code");
+    expect(hiddenHtml).toContain('id="loginCode"');
+    expect(hiddenHtml).toContain('autocomplete="one-time-code"');
     expect(hiddenHtml).toContain("signInWithOtp");
+    expect(hiddenHtml).toContain("options:{shouldCreateUser:true}");
+    expect(hiddenHtml).not.toContain("emailRedirectTo");
     expect(hiddenHtml).toContain("verifyOtp");
+    expect(hiddenHtml).toContain("type:'email'");
     expect(hiddenHtml).toContain("Use a password instead");
     expect(hiddenHtml).not.toContain("Continue with Google");
     expect(hiddenHtml).toContain("That code has expired");

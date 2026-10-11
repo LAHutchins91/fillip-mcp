@@ -1,4 +1,5 @@
 import http, { type Server } from "node:http";
+import vm from "node:vm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { otpFailure } from "../src/plugin-auth.js";
 import { app } from "../src/server.js";
@@ -175,5 +176,109 @@ describe("emailed code through to the first tool call", () => {
     expect(again.status).toBe(200);
     expect(again.text).toContain("Ship the notes");
     expect(again.text).not.toMatch(/Reconnect|Sign in to Fillip/);
+  });
+
+  it("sends a code with signInWithOtp and verifies it with type email", async () => {
+    const consent = await request(fillipBase, "GET", "/oauth/consent", "");
+    expect(consent.status).toBe(200);
+    expect(consent.text).toContain('id="loginCode"');
+    expect(consent.text).not.toContain("emailRedirectTo");
+    const started = consent.text.lastIndexOf("<script>");
+    const ended = consent.text.lastIndexOf("</script>");
+    const source = consent.text.slice(started + "<script>".length, ended);
+    const otpCalls: unknown[] = [];
+    const verifyCalls: unknown[] = [];
+    const elements = new Map<string, {
+      hidden: boolean;
+      textContent: string;
+      value: string;
+      disabled: boolean;
+      onsubmit: ((event: { preventDefault: () => void }) => Promise<void>) | null;
+      onclick: (() => void) | null;
+      querySelector: () => { disabled: boolean };
+    }>();
+    const element = (id: string) => {
+      let node = elements.get(id);
+      if (!node) {
+        node = {
+          hidden: true,
+          textContent: "",
+          value: "",
+          disabled: false,
+          onsubmit: null,
+          onclick: null,
+          querySelector: () => ({ disabled: false })
+        };
+        elements.set(id, node);
+      }
+      return node;
+    };
+    const sandbox = {
+      Error,
+      Promise,
+      JSON,
+      window: {
+        supabase: {
+          createClient() {
+            return {
+              auth: {
+                async getSession() {
+                  return { data: { session: null }, error: null };
+                },
+                async signInWithOtp(args: unknown) {
+                  otpCalls.push(args);
+                  return { error: null };
+                },
+                async verifyOtp(args: unknown) {
+                  verifyCalls.push(args);
+                  return { error: null };
+                },
+                async signInWithPassword() {
+                  return { error: null };
+                }
+              }
+            };
+          }
+        }
+      },
+      document: {
+        getElementById: (id: string) => id === "signin" ? null : element(id),
+        createElement: () => element("created")
+      },
+      location: {
+        search: "",
+        pathname: "/oauth/consent",
+        origin: "https://fillip.example",
+        assign() {
+          return undefined;
+        },
+        reload() {
+          return undefined;
+        }
+      },
+      URLSearchParams,
+      fetch: async () => ({ json: async () => ({}) }),
+      sessionStorage: {
+        setItem() {
+          return undefined;
+        },
+        getItem() {
+          return null;
+        }
+      }
+    };
+    await vm.runInContext(source, vm.createContext(sandbox));
+    const email = element("loginEmail");
+    const code = element("loginCode");
+    email.value = "owner@example.com";
+    const emailForm = element("emailForm");
+    expect(emailForm.hidden).toBe(false);
+    await emailForm.onsubmit?.({ preventDefault() { return undefined; } });
+    expect(otpCalls).toEqual([{ email: "owner@example.com", options: { shouldCreateUser: true } }]);
+    expect(JSON.stringify(otpCalls[0])).not.toContain("emailRedirectTo");
+    expect(element("codeForm").hidden).toBe(false);
+    code.value = "123456";
+    await element("codeForm").onsubmit?.({ preventDefault() { return undefined; } });
+    expect(verifyCalls).toEqual([{ email: "owner@example.com", token: "123456", type: "email" }]);
   });
 });
