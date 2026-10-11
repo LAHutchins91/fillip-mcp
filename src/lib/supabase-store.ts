@@ -225,10 +225,17 @@ export class SupabaseFillipStore implements ServiceStore {
       `/rest/v1/reminders?owner_id=eq.${encodeURIComponent(saved.ownerId)}&status=eq.active&select=id&limit=500`
     ));
     if (listed.length <= open.cap) return;
-    await this.persist()(`/rest/v1/reminders?id=eq.${encodeURIComponent(saved.id)}&owner_id=eq.${encodeURIComponent(saved.ownerId)}`, {
-      method: "DELETE",
-      headers: { Prefer: "return=minimal" }
-    });
+    try {
+      await this.persist()(`/rest/v1/reminders?id=eq.${encodeURIComponent(saved.id)}&owner_id=eq.${encodeURIComponent(saved.ownerId)}`, {
+        method: "DELETE",
+        headers: { Prefer: "return=minimal" }
+      });
+    } catch (error) {
+      console.error(JSON.stringify({
+        event: "open_cap_delete_failed",
+        name: error instanceof Error ? error.name : "Error"
+      }));
+    }
     const message = open.message.startsWith("The free plan") && !open.message.includes(UPGRADE_PROMPT)
       ? `${open.message} ${UPGRADE_PROMPT}`
       : open.message;

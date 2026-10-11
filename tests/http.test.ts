@@ -131,6 +131,18 @@ describe("streamable HTTP", () => {
     expect(lines.join("\n")).not.toContain("not-a-jwt");
   });
 
+  it("returns 401 invalid_token for tools/list when a bearer is present but invalid", async () => {
+    const response = await fetch(`${base}/mcp`, {
+      method: "POST",
+      headers: { ...headers, authorization: "Bearer not-a-jwt" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 5, method: "tools/list", params: {} })
+    });
+    expect(response.status).toBe(401);
+    expect(response.headers.get("www-authenticate")).toContain('error="invalid_token"');
+    const body = await response.json() as { error?: string };
+    expect(body.error).toBe("Authentication required.");
+  });
+
   it("asks for sign-in on initialize and keeps tools/list public", async () => {
     const initialize = await fetch(`${base}/mcp`, {
       method: "POST",

@@ -593,27 +593,33 @@ app.post("/mcp", ensureStreamableHttpAccept, async (req, res) => {
   let server: McpServer | undefined;
   let actor: Actor = { id: "", email: null, emailVerified: false };
   let store: ReminderStore = new MemoryFillipStore();
-  // tools/list stays public so ChatGPT's app directory and Glama can read the
-  // catalog and securitySchemes before a user connects. initialize and every
-  // other method require a token, so Claude and Cursor start OAuth at connect
-  // time instead of on the first tools/call.
-  const publicMethods = new Set(["tools/list"]);
-  if (!publicMethods.has(req.body?.method)) {
+  // tools/list stays public when no bearer is sent, so ChatGPT's app directory
+  // and Glama can read the catalog and securitySchemes before a user connects.
+  // A bearer that is present but invalid is rejected on tools/list too.
+  // initialize and every other method require a token, so Claude and Cursor
+  // start OAuth at connect time instead of on the first tools/call.
+  const method = typeof req.body?.method === "string" ? req.body.method : "";
+  const catalogWithoutBearer = method === "tools/list" && !presented;
+  if (!catalogWithoutBearer) {
     try {
       const auth = await authenticatedUser(req);
       validateMcpClaims(auth.token, auth.user.id, `${envValue("SUPABASE_URL").replace(/\/+$/, "")}/auth/v1`, mcpResourceUrls());
-      actor = actorFromUser(auth.user);
-      store = createUserStore(actor.id, auth.token);
+      if (method !== "tools/list") {
+        actor = actorFromUser(auth.user);
+        store = createUserStore(actor.id, auth.token);
+      }
     } catch {
       const metadata = `Bearer resource_metadata="${appBaseUrl()}/.well-known/oauth-protected-resource/mcp"`;
       res.set("WWW-Authenticate", presented ? `${metadata}, error="invalid_token"` : metadata);
       return res.status(401).json({ error: "Authentication required." });
     }
-    try {
-      const state = await subscriptionState(actor.id, bearer(req));
-      if (state === "error") return res.status(503).json({ error: "Could not verify your account. Please retry." });
-    } catch {
-      return res.status(503).json({ error: "Could not verify your subscription. Please retry." });
+    if (method !== "tools/list") {
+      try {
+        const state = await subscriptionState(actor.id, bearer(req));
+        if (state === "error") return res.status(503).json({ error: "Could not verify your account. Please retry." });
+      } catch {
+        return res.status(503).json({ error: "Could not verify your subscription. Please retry." });
+      }
     }
   }
   try {

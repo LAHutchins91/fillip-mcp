@@ -546,6 +546,35 @@ describe("QA round 5 cap refusals and the post-insert pass", () => {
     expect(store.reminders.filter((row) => row.status === "active")).toHaveLength(10);
   });
 
+  it("QA-PASS: a failed over-cap delete still throws the cap message and does not surface the delete error", async () => {
+    const olderId = randomUUID();
+    const hosted = hostedOverCap(actor.id, olderId);
+    const lines: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => {
+      lines.push(args.map(String).join(" "));
+    };
+    const db: Db = async (pathname, options) => {
+      if ((options?.method ?? "GET") === "DELETE" && pathname.includes("/rest/v1/reminders")) {
+        throw new Error("delete failed for reminder what=secret-note owner@example.com token=secret");
+      }
+      return hosted.db(pathname, options);
+    };
+    try {
+      const store = new SupabaseFillipStore(null, db, "service");
+      const result = await callTool(store, "set_reminder", { what: "should not stick", when: "tomorrow 9am", timezone: "UTC" });
+      const text = JSON.stringify(result);
+      expect(result.isError, text).toBe(true);
+      expect(text).toMatch(/The free plan allows 10 open reminders/);
+      expect(text).toMatch(/Upgrade to Pro for a higher allowance/);
+      expect(text).not.toMatch(/secret-note|owner@example.com|delete failed|token=secret/);
+      expect(lines.join("\n")).toContain("open_cap_delete_failed");
+      expect(lines.join("\n")).not.toMatch(/secret-note|owner@example.com|token=secret|delete failed/);
+    } finally {
+      console.error = original;
+    }
+  });
+
   it("QA-FAIL: a hosted read over the cap deletes the inserted row and still returns it as saved", async () => {
     const olderId = randomUUID();
     const hosted = hostedOverCap(actor.id, olderId);

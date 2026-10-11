@@ -175,8 +175,12 @@ try{
  var result=await client.auth.getSession();if(result.error)throw result.error;
  el('emailForm').onsubmit=async function(e){
    e.preventDefault();var button=this.querySelector('button');button.disabled=true;
-   try{var r=await client.auth.signInWithOtp({email:el('loginEmail').value.trim(),options:{shouldCreateUser:true}});if(r.error)throw r.error;el('emailForm').hidden=true;el('codeForm').hidden=false;el('status').textContent='Enter the code from the latest email.';el('error').textContent=''}
-   catch(e){fail({message:explain(e.message||String(e))});button.disabled=false}
+   var started=Date.now();var neutral=true;
+   try{var r=await client.auth.signInWithOtp({email:el('loginEmail').value.trim(),options:{shouldCreateUser:true}});if(r.error)throw r.error}
+   catch(err){var raw=String((err&&err.message)||err).toLowerCase();neutral=raw.indexOf('rate')<0&&raw.indexOf('too many')<0&&raw.indexOf('only request this after')<0&&raw.indexOf('over_request')<0&&raw.indexOf('security purposes')<0}
+   var wait=500-(Date.now()-started);if(wait>0)await new Promise(function(done){setTimeout(done,wait)});
+   if(!neutral){fail({message:explain('over_request_rate_limit')});button.disabled=false;return}
+   el('emailForm').hidden=true;el('codeForm').hidden=false;el('status').textContent='If that email can sign in, a code is on its way.';el('error').textContent='';button.disabled=false
  };
  el('codeForm').onsubmit=async function(e){
    e.preventDefault();var button=this.querySelector('button');button.disabled=true;
