@@ -147,6 +147,8 @@ export function installPluginAuth(app: Express, fallbackBase: string, fallbackSu
 <details id="passwordLogin" hidden><summary>Use a password instead</summary><form id="passwordForm"><label>Email<input id="passwordEmail" type="email" required autocomplete="username"></label><label>Password<input id="loginPassword" type="password" required autocomplete="current-password"></label><button>Sign in with password</button></form><small>For a review or test account that already has a password.</small></details>
 ${googleButton}
 <button id="signout" class="secondary" hidden>Use a different account</button>
+<button id="signoutEverywhere" class="secondary" hidden>Sign out everywhere</button>
+<p id="everywhere" role="status"></p>
 <section id="consent" class="card" hidden><h2 id="client"></h2><p>This application will be able to:</p>
 <ul><li>Save reminders and follow-ups you ask for, and read the ones already on your account.</li><li>Email only the verified address on this account when a reminder is due.</li><li>Read your account email and subscription status.</li></ul>
 <p>Fillip does not take a recipient from the chat. Billing changes are not available through the reminder tools. A free plan does not expire. The trial is 14 days, then Pro. If you do not continue, you stay on the free plan. Checkout shows the plan terms.</p>
@@ -175,17 +177,23 @@ try{
  var result=await client.auth.getSession();if(result.error)throw result.error;
  el('emailForm').onsubmit=async function(e){
    e.preventDefault();var button=this.querySelector('button');button.disabled=true;
-   var started=Date.now();var neutral=true;
-   try{var r=await client.auth.signInWithOtp({email:el('loginEmail').value.trim(),options:{shouldCreateUser:true}});if(r.error)throw r.error}
-   catch(err){var raw=String((err&&err.message)||err).toLowerCase();neutral=raw.indexOf('rate')<0&&raw.indexOf('too many')<0&&raw.indexOf('only request this after')<0&&raw.indexOf('over_request')<0&&raw.indexOf('security purposes')<0}
-   var wait=500-(Date.now()-started);if(wait>0)await new Promise(function(done){setTimeout(done,wait)});
-   if(!neutral){fail({message:explain('over_request_rate_limit')});button.disabled=false;return}
-   el('emailForm').hidden=true;el('codeForm').hidden=false;el('status').textContent='If that email can sign in, a code is on its way.';el('error').textContent='';button.disabled=false
+   try{
+     var response=await fetch('/auth/code/send',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-Fillip-Request':'1'},body:JSON.stringify({email:el('loginEmail').value.trim()})});
+     var data=await response.json();
+     if(!response.ok){fail({message:data.message||explain('over_request_rate_limit')});button.disabled=false;return}
+     el('emailForm').hidden=true;el('codeForm').hidden=false;el('status').textContent=data.message||'If that email can sign in, a code is on its way.';el('error').textContent='';button.disabled=false
+   }catch(err){fail({message:explain('invalid')});button.disabled=false}
  };
  el('codeForm').onsubmit=async function(e){
    e.preventDefault();var button=this.querySelector('button');button.disabled=true;
-   try{var r=await client.auth.verifyOtp({email:el('loginEmail').value.trim(),token:el('loginCode').value.trim(),type:'email'});if(r.error)throw r.error;location.reload()}
-   catch(e){fail({message:explain(e.message||String(e))});button.disabled=false}
+   try{
+     var response=await fetch('/auth/code/verify',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-Fillip-Request':'1'},body:JSON.stringify({email:el('loginEmail').value.trim(),code:el('loginCode').value.trim()})});
+     var data=await response.json();
+     if(!response.ok)throw Error(data.message||explain('invalid'));
+     var session=await client.auth.setSession({access_token:data.access_token,refresh_token:data.refresh_token});
+     if(session.error)throw session.error;
+     location.reload()
+   }catch(e){fail({message:e.message||String(e)});button.disabled=false}
  };
  el('resend').onclick=function(){el('codeForm').hidden=true;el('emailForm').hidden=false;el('emailForm').querySelector('button').disabled=false;el('status').textContent='We can send another code to the same email.';};
  el('passwordForm').onsubmit=async function(e){e.preventDefault();var button=this.querySelector('button');button.disabled=true;try{var r=await client.auth.signInWithPassword({email:el('passwordEmail').value,password:el('loginPassword').value});el('loginPassword').value='';if(r.error)throw Error('Email or password sign-in failed. Check your credentials and try again.');location.reload()}catch(e){el('status').textContent='';el('error').textContent=e.message||String(e);button.disabled=false}};
@@ -197,6 +205,7 @@ try{
  if(!result.data.session){showSignIn();return}
  el('status').textContent='Signed in as '+result.data.session.user.email;
  el('signout').hidden=false;el('signout').onclick=async function(){this.disabled=true;try{var r=await client.auth.signOut({scope:"local"});if(r.error)throw r.error;location.reload()}catch(e){fail(e);this.disabled=false}};
+ el('signoutEverywhere').hidden=false;el('signoutEverywhere').onclick=async function(){this.disabled=true;try{var token=result.data.session.access_token;var response=await fetch('/auth/sign-out-everywhere',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token,'X-Fillip-Request':'1'},body:'{}'});var data=await response.json();if(!response.ok)throw Error(data.message||'Sign-out failed.');el('everywhere').textContent=data.message;var out=await client.auth.signOut({scope:"local"});if(out.error)throw out.error}catch(e){fail(e);this.disabled=false}};
  if(location.pathname==='/connections'){
    el('heading').textContent='Connected applications';el('connections').hidden=false;
    var grants=await client.auth.oauth.listGrants();if(grants.error)throw grants.error;

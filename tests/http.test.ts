@@ -174,11 +174,13 @@ describe("streamable HTTP", () => {
     expect(hiddenHtml).toContain("Email me a code");
     expect(hiddenHtml).toContain('id="loginCode"');
     expect(hiddenHtml).toContain('autocomplete="one-time-code"');
-    expect(hiddenHtml).toContain("signInWithOtp");
-    expect(hiddenHtml).toContain("options:{shouldCreateUser:true}");
+    expect(hiddenHtml).toContain("/auth/code/send");
+    expect(hiddenHtml).toContain("/auth/code/verify");
+    expect(hiddenHtml).toContain("setSession");
+    expect(hiddenHtml).not.toContain("signInWithOtp");
+    expect(hiddenHtml).not.toContain("verifyOtp");
     expect(hiddenHtml).not.toContain("emailRedirectTo");
-    expect(hiddenHtml).toContain("verifyOtp");
-    expect(hiddenHtml).toContain("type:'email'");
+    expect(hiddenHtml).toContain("Sign out everywhere");
     expect(hiddenHtml).toContain("Use a password instead");
     expect(hiddenHtml).not.toContain("Continue with Google");
     expect(hiddenHtml).toContain("That code has expired");

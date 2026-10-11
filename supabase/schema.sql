@@ -198,6 +198,29 @@ insert into public.fillip_runtime (id) values (1) on conflict (id) do nothing;
 alter table public.fillip_runtime enable row level security;
 revoke all on table public.fillip_runtime from public, anon, authenticated;
 
+-- Wrong emailed-code tries. Service role only. The hash is an HMAC of the
+-- email or the IP. This table has no raw email, no raw IP, and no raw code.
+create table if not exists public.fillip_code_attempts (
+  subject_kind text not null check (subject_kind in ('email', 'ip')),
+  subject_hash text not null,
+  wrong_count integer not null default 0,
+  send_count integer not null default 0,
+  verify_count integer not null default 0,
+  window_started_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  primary key (subject_kind, subject_hash)
+);
+
+alter table public.fillip_code_attempts enable row level security;
+revoke all on table public.fillip_code_attempts from public, anon, authenticated;
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    grant select, insert, update, delete on table public.fillip_code_attempts to service_role;
+  end if;
+end
+$$;
+
 alter table public.profiles add column if not exists default_channel text not null default 'email';
 alter table public.profiles add column if not exists telegram_chat_id text;
 alter table public.profiles add column if not exists telegram_link_token text;

@@ -178,16 +178,21 @@ describe("emailed code through to the first tool call", () => {
     expect(again.text).not.toMatch(/Reconnect|Sign in to Fillip/);
   });
 
-  it("sends a code with signInWithOtp and verifies it with type email", async () => {
+  it("asks Fillip for a code and sets the returned session", async () => {
     const consent = await request(fillipBase, "GET", "/oauth/consent", "");
     expect(consent.status).toBe(200);
     expect(consent.text).toContain('id="loginCode"');
+    expect(consent.text).toContain("/auth/code/send");
+    expect(consent.text).toContain("/auth/code/verify");
     expect(consent.text).not.toContain("emailRedirectTo");
+    expect(consent.text).not.toContain("signInWithOtp");
+    expect(consent.text).not.toContain("verifyOtp");
     const started = consent.text.lastIndexOf("<script>");
     const ended = consent.text.lastIndexOf("</script>");
     const source = consent.text.slice(started + "<script>".length, ended);
-    const otpCalls: unknown[] = [];
-    const verifyCalls: unknown[] = [];
+    const fetches: Array<{ url: string; body: string }> = [];
+    const sessions: unknown[] = [];
+    let reloaded = false;
     const elements = new Map<string, {
       hidden: boolean;
       textContent: string;
@@ -225,12 +230,8 @@ describe("emailed code through to the first tool call", () => {
                 async getSession() {
                   return { data: { session: null }, error: null };
                 },
-                async signInWithOtp(args: unknown) {
-                  otpCalls.push(args);
-                  return { error: null };
-                },
-                async verifyOtp(args: unknown) {
-                  verifyCalls.push(args);
+                async setSession(args: unknown) {
+                  sessions.push(args);
                   return { error: null };
                 },
                 async signInWithPassword() {
@@ -253,13 +254,20 @@ describe("emailed code through to the first tool call", () => {
           return undefined;
         },
         reload() {
-          return undefined;
+          reloaded = true;
         }
       },
       URLSearchParams,
       Date,
       setTimeout,
-      fetch: async () => ({ json: async () => ({}) }),
+      fetch: async (url: string, init?: { body?: string }) => {
+        const body = init?.body ?? "";
+        fetches.push({ url: String(url), body });
+        if (String(url).includes("/auth/code/verify")) {
+          return { ok: true, json: async () => ({ ok: true, access_token: "access-token", refresh_token: "refresh-token" }) };
+        }
+        return { ok: true, json: async () => ({ ok: true, message: "If that email can sign in, a code is on its way." }) };
+      },
       sessionStorage: {
         setItem() {
           return undefined;
@@ -276,79 +284,17 @@ describe("emailed code through to the first tool call", () => {
     const emailForm = element("emailForm");
     expect(emailForm.hidden).toBe(false);
     await emailForm.onsubmit?.({ preventDefault() { return undefined; } });
-    expect(otpCalls).toEqual([{ email: "owner@example.com", options: { shouldCreateUser: true } }]);
-    expect(JSON.stringify(otpCalls[0])).not.toContain("emailRedirectTo");
+    expect(fetches[0]?.url).toBe("/auth/code/send");
+    expect(JSON.parse(fetches[0]?.body ?? "{}")).toEqual({ email: "owner@example.com" });
     expect(element("codeForm").hidden).toBe(false);
     expect(element("status").textContent).toBe("If that email can sign in, a code is on its way.");
     expect(element("error").textContent).toBe("");
     code.value = "123456";
     await element("codeForm").onsubmit?.({ preventDefault() { return undefined; } });
-    expect(verifyCalls).toEqual([{ email: "owner@example.com", token: "123456", type: "email" }]);
-  });
-
-  it("uses the same code-sent reply when the account is new and when Supabase reports otp_disabled", async () => {
-    const consent = await request(fillipBase, "GET", "/oauth/consent", "");
-    const started = consent.text.lastIndexOf("<script>");
-    const ended = consent.text.lastIndexOf("</script>");
-    const source = consent.text.slice(started + "<script>".length, ended);
-    const replies: string[] = [];
-    const elapsed: number[] = [];
-    for (const outcome of ["ok", "otp_disabled"] as const) {
-      const elements = new Map<string, { hidden: boolean; textContent: string; value: string; disabled: boolean; onsubmit: ((event: { preventDefault: () => void }) => Promise<void>) | null; querySelector: () => { disabled: boolean } }>();
-      const element = (id: string) => {
-        let node = elements.get(id);
-        if (!node) {
-          node = { hidden: true, textContent: "", value: "", disabled: false, onsubmit: null, querySelector: () => ({ disabled: false }) };
-          elements.set(id, node);
-        }
-        return node;
-      };
-      const sandbox = {
-        Error,
-        Promise,
-        JSON,
-        Date,
-        setTimeout,
-        window: {
-          supabase: {
-            createClient() {
-              return {
-                auth: {
-                  async getSession() {
-                    return { data: { session: null }, error: null };
-                  },
-                  async signInWithOtp() {
-                    if (outcome === "otp_disabled") return { error: { message: "otp_disabled" } };
-                    return { error: null };
-                  },
-                  async verifyOtp() {
-                    return { error: null };
-                  },
-                  async signInWithPassword() {
-                    return { error: null };
-                  }
-                }
-              };
-            }
-          }
-        },
-        document: { getElementById: (id: string) => element(id), createElement: () => element("created") },
-        location: { search: "", pathname: "/oauth/consent", origin: "https://fillip.example", assign() { return undefined; }, reload() { return undefined; } },
-        URLSearchParams,
-        fetch: async () => ({ json: async () => ({}) }),
-        sessionStorage: { setItem() { return undefined; }, getItem() { return null; } }
-      };
-      await vm.runInContext(source, vm.createContext(sandbox));
-      element("loginEmail").value = outcome === "ok" ? "new@example.com" : "owner@example.com";
-      const before = Date.now();
-      await element("emailForm").onsubmit?.({ preventDefault() { return undefined; } });
-      elapsed.push(Date.now() - before);
-      replies.push(`${element("status").textContent}|${element("error").textContent}|${element("codeForm").hidden}`);
-    }
-    expect(replies[0]).toBe("If that email can sign in, a code is on its way.||false");
-    expect(replies[1]).toBe(replies[0]);
-    expect(elapsed[0]).toBeGreaterThanOrEqual(450);
-    expect(elapsed[1]).toBeGreaterThanOrEqual(450);
-    expect(Math.abs(elapsed[0] - elapsed[1])).toBeLessThan(400);
+    expect(fetches[1]?.url).toBe("/auth/code/verify");
+    expect(JSON.parse(fetches[1]?.body ?? "{}")).toEqual({ email: "owner@example.com", code: "123456" });
+    expect(sessions).toEqual([{ access_token: "access-token", refresh_token: "refresh-token" }]);
+    expect(element("status").textContent).not.toContain("access-token");
+    expect(reloaded).toBe(true);
   });
 });

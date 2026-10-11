@@ -551,6 +551,7 @@ describe("QA round 4 real Postgres concurrency", () => {
       expect(matrix.profiles["authenticated:SELECT"]).toBe(true);
       expect(matrix.profiles["authenticated:DELETE"]).toBe(false);
       expect(matrix.fillip_runtime["authenticated:SELECT"]).toBe(false);
+      expect(matrix.fillip_code_attempts["authenticated:SELECT"]).toBe(false);
       expect(matrix.fillip_support_requests["authenticated:SELECT"]).toBe(false);
       const execute = await db.query<{ ok: boolean }>(
         "select has_function_privilege('service_role', 'public.fillip_reserve_ping(uuid, integer, timestamptz, integer, timestamptz)', 'EXECUTE') as ok"

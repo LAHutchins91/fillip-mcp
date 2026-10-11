@@ -104,6 +104,25 @@ describe("schema re-run", () => {
         expect(row.qual ?? "", row.polname).toMatch(/select auth\.uid\(\)/i);
         if (row.chk) expect(row.chk, row.polname).toMatch(/select auth\.uid\(\)/i);
       }
+      const attempts = await db.query<{ rls: boolean }>(`
+        select c.relrowsecurity as rls
+        from pg_class c
+        join pg_namespace n on n.oid = c.relnamespace
+        where n.nspname = 'public' and c.relname = 'fillip_code_attempts'
+      `);
+      expect(attempts.rows[0]?.rls).toBe(true);
+      const attemptRead = await db.query<{ ok: boolean }>(
+        "select has_table_privilege('authenticated', 'public.fillip_code_attempts', 'SELECT') as ok"
+      );
+      expect(attemptRead.rows[0]?.ok).toBe(false);
+      const attemptColumns = await db.query<{ column_name: string }>(`
+        select column_name from information_schema.columns
+        where table_schema = 'public' and table_name = 'fillip_code_attempts'
+      `);
+      const attemptNames = attemptColumns.rows.map((row) => row.column_name);
+      expect(attemptNames).toContain("subject_hash");
+      expect(attemptNames).not.toContain("email");
+      expect(attemptNames).not.toContain("code");
       const functions = await db.query<{ proname: string; proconfig: string[] | null }>(`
         select p.proname, p.proconfig
         from pg_proc p

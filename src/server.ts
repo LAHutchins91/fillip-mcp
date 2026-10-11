@@ -25,6 +25,7 @@ import { FILLIP_EMPTY_REPRESENTATION, SupabaseFillipStore, type Db } from "./lib
 import type { Actor } from "./lib/types.js";
 import { validateMcpClaims } from "./mcp-claims.js";
 import { MCP_CORS_HEADERS, ensureStreamableHttpAccept, mcpBrowserOriginAllowed } from "./mcp-clients.js";
+import { installCodeAuth } from "./code-auth.js";
 import { installPluginAuth } from "./plugin-auth.js";
 import { installPublicPages } from "./public-pages.js";
 import { useStdioTransport } from "./transport.js";
@@ -311,6 +312,7 @@ app.post("/api/support", async (req, res) => {
   }
 });
 
+installCodeAuth(app);
 installPluginAuth(app, loadedBase, loadedSupabaseUrl, loadedAnon);
 
 app.get("/", (_req, res) => {

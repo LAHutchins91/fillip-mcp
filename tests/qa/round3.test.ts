@@ -996,9 +996,15 @@ describe("QA round 3 auth, health, and copy", () => {
       expect(text).not.toMatch(/not found|already registered|signups not allowed|no user|does not exist|no account/i);
     }
     const page = readFileSync("src/plugin-auth.ts", "utf8");
-    expect(page).toMatch(/shouldCreateUser:\s*true/);
-    expect(page).toMatch(/verifyOtp/);
+    const routes = readFileSync("src/code-auth.ts", "utf8");
+    expect(page).toMatch(/\/auth\/code\/send/);
+    expect(page).toMatch(/\/auth\/code\/verify/);
+    expect(page).toMatch(/setSession/);
+    expect(page).not.toMatch(/signInWithOtp/);
+    expect(page).not.toMatch(/verifyOtp/);
     expect(page).not.toMatch(/attempts|lockout|usedCodes/i);
+    expect(routes).toMatch(/create_user:\s*true/);
+    expect(routes).toMatch(/type:\s*"email"/);
   });
 
   it("QA-PASS: Google is hidden unless the flag is exactly true, initialize is 401, and health is locked", async () => {
