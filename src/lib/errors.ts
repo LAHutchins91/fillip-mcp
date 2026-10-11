@@ -14,6 +14,7 @@ const KNOWN = [
   "That reminder is already",
   "Too many reminders",
   "The free plan",
+  "You're over the free plan",
   "This plan's reminder pings",
   "Telegram is not offered",
   "Telegram is not linked",

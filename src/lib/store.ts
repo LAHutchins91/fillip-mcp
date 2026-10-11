@@ -20,6 +20,19 @@ export class OpenCapError extends Error {
   }
 }
 
+/**
+ * The over-cap delete did not remove this row. Callers return it as saved.
+ * Throwing a generic failure here would tell the user it was not saved while it can still fire.
+ */
+export class OpenCapKeptError extends Error {
+  readonly reminder: Reminder;
+  constructor(reminder: Reminder, message: string) {
+    super(message);
+    this.name = "OpenCapKeptError";
+    this.reminder = reminder;
+  }
+}
+
 /** The reminder's updated_at changed between read and write, so this save lost to another writer. */
 export class ReminderConflictError extends Error {
   constructor() {

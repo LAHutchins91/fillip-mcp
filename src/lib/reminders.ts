@@ -1,5 +1,5 @@
 import { calendarFeed } from "./ics.js";
-import { newId, type DeliveryMark, type OpenCap, type ReminderStore, type ServiceStore } from "./store.js";
+import { newId, OpenCapKeptError, type DeliveryMark, type OpenCap, type ReminderStore, type ServiceStore } from "./store.js";
 import { newSecretToken, telegramDeepLink, telegramUsername } from "./telegram.js";
 import { applyRepeat, attachEndDate, describeRecurrence, nextFire, parseClock, recurrenceFromCadence, resolveWhen, WhenError, type RepeatChoice, type ResolvedWhen } from "./time.js";
 import { MAX_ACTIVE_REMINDERS, MAX_CREATES_PER_HOUR, type Actor, type DeliveryChannel, type DigestSettings, type Reminder, type ReminderStatus } from "./types.js";
@@ -454,6 +454,10 @@ async function createOrRefuse(
   try {
     saved = await store.createReminder(reminder, open);
   } catch (error) {
+    if (error instanceof OpenCapKeptError) {
+      const note = [extra.note, error.message].filter(Boolean).join(" ");
+      return view(error.reminder, now, { corrected: extra.corrected, note });
+    }
     await dropCancelledLeftover(store, reminder.ownerId, reminder.id);
     throw error;
   }

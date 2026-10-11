@@ -546,7 +546,7 @@ describe("QA round 5 cap refusals and the post-insert pass", () => {
     expect(store.reminders.filter((row) => row.status === "active")).toHaveLength(10);
   });
 
-  it("QA-PASS: a failed over-cap delete still throws the cap message and does not surface the delete error", async () => {
+  it("QA-PASS: a failed over-cap delete keeps the row and does not say it was not saved", async () => {
     const olderId = randomUUID();
     const hosted = hostedOverCap(actor.id, olderId);
     const lines: string[] = [];
@@ -564,12 +564,92 @@ describe("QA round 5 cap refusals and the post-insert pass", () => {
       const store = new SupabaseFillipStore(null, db, "service");
       const result = await callTool(store, "set_reminder", { what: "should not stick", when: "tomorrow 9am", timezone: "UTC" });
       const text = JSON.stringify(result);
-      expect(result.isError, text).toBe(true);
-      expect(text).toMatch(/The free plan allows 10 open reminders/);
-      expect(text).toMatch(/Upgrade to Pro for a higher allowance/);
-      expect(text).not.toMatch(/secret-note|owner@example.com|delete failed|token=secret/);
+      expect(result.isError, text).toBeFalsy();
+      expect(text).toMatch(/You're over the free plan's 10 open reminders\./);
+      expect(text).toMatch(/Upgrade to Pro for a higher allowance\. The trial is 14 days, then Pro\./);
+      expect(text).toMatch(/"status":"active"/);
+      expect(text).not.toMatch(/may not have been saved|secret-note|owner@example.com|delete failed|token=secret/);
       expect(lines.join("\n")).toContain("open_cap_delete_failed");
-      expect(lines.join("\n")).not.toMatch(/secret-note|owner@example.com|token=secret|delete failed/);
+      expect(lines.join("\n")).not.toMatch(/secret-note|owner@example.com|token=secret|delete failed|should not stick/);
+      const savedId = text.match(/"id":"([0-9a-f-]{36})"/)?.[1] ?? "";
+      expect((await store.getReminder(actor.id, savedId))?.status).toBe("active");
+      expect((await store.getReminder(actor.id, olderId))?.status).toBe("active");
+    } finally {
+      console.error = original;
+    }
+  });
+
+  it("QA-PASS: an over-cap delete that returns its id throws and does not delete again", async () => {
+    const olderId = randomUUID();
+    const hosted = hostedOverCap(actor.id, olderId);
+    let deletes = 0;
+    const db: Db = async (pathname, options) => {
+      if ((options?.method ?? "GET") === "DELETE" && pathname.includes("/rest/v1/reminders")) {
+        deletes += 1;
+        const id = new URLSearchParams(pathname.split("?")[1] ?? "").get("id")?.replace(/^eq\./, "") ?? "";
+        expect(String(options?.headers && new Headers(options.headers as HeadersInit).get("prefer"))).toContain("return=representation");
+        hosted.stored.delete(id);
+        return [{ id }];
+      }
+      return hosted.db(pathname, options);
+    };
+    const store = new SupabaseFillipStore(null, db, "service");
+    await expect(setReminder(store, actor, { what: "returned id", when: "tomorrow 9am", timezone: "UTC" }, now, caps)).rejects.toThrow(/The free plan allows 10 open reminders/);
+    expect(deletes).toBe(1);
+    expect(hosted.stored.has(olderId)).toBe(true);
+  });
+
+  it("QA-PASS: a user delete that leaves the row is retried once with the service role", async () => {
+    const olderId = randomUUID();
+    const hosted = hostedOverCap(actor.id, olderId);
+    let userDeletes = 0;
+    const userDb: Db = async (pathname, options) => {
+      if ((options?.method ?? "GET") === "DELETE" && pathname.includes("/rest/v1/reminders")) {
+        userDeletes += 1;
+        return [];
+      }
+      return hosted.db(pathname, options);
+    };
+    const store = new SupabaseFillipStore(actor.id, userDb, "user", hosted.db);
+    await expect(setReminder(store, actor, { what: "service removes it", when: "tomorrow 9am", timezone: "UTC" }, now, caps)).rejects.toThrow(/The free plan allows 10 open reminders/);
+    expect(userDeletes).toBe(1);
+    expect(hosted.deleted).toHaveLength(1);
+    const ownId = hosted.deleted[0] ?? "";
+    expect(hosted.deleted).not.toContain(olderId);
+    expect(hosted.stored.has(ownId)).toBe(false);
+    expect(hosted.stored.has(olderId)).toBe(true);
+  });
+
+  it("QA-PASS: a service-role retry that leaves the row returns it with the over-cap note", async () => {
+    const olderId = randomUUID();
+    const hosted = hostedOverCap(actor.id, olderId);
+    let serviceDeletes = 0;
+    const userDb: Db = async (pathname, options) => {
+      if ((options?.method ?? "GET") === "DELETE" && pathname.includes("/rest/v1/reminders")) return [];
+      return hosted.db(pathname, options);
+    };
+    const serviceDb: Db = async (pathname, options) => {
+      if ((options?.method ?? "GET") === "DELETE" && pathname.includes("/rest/v1/reminders")) {
+        serviceDeletes += 1;
+        return [];
+      }
+      return hosted.db(pathname, options);
+    };
+    const lines: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => {
+      lines.push(args.map(String).join(" "));
+    };
+    try {
+      const store = new SupabaseFillipStore(actor.id, userDb, "user", serviceDb);
+      const view = await setReminder(store, actor, { what: "still due", when: "tomorrow 9am", timezone: "UTC" }, now, caps);
+      expect(serviceDeletes).toBe(1);
+      expect(view.status).toBe("active");
+      expect(view.note).toMatch(/You're over the free plan's 10 open reminders\. Upgrade to Pro for a higher allowance\. The trial is 14 days, then Pro\./);
+      expect(view.note).not.toMatch(/may not have been saved/);
+      expect((await store.getReminder(actor.id, view.id))?.status).toBe("active");
+      expect(lines.join("\n")).toContain("open_cap_delete_failed");
+      expect(lines.join("\n")).not.toMatch(/still due|owner@example.com/);
     } finally {
       console.error = original;
     }

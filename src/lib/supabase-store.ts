@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ClaimResult, Delivery, DeliveryChannel, DigestSettings, OwnerContact, OwnerIdentity, PlanName, Recurrence, Reminder, ReminderStatus } from "./types.js";
 import { openCapMessage } from "./errors.js";
-import { OpenCapError, ReminderConflictError, type ListQuery, type OpenCap, type SendReserve, type SendReserveResult, type ServiceStore } from "./store.js";
+import { OpenCapError, OpenCapKeptError, ReminderConflictError, type ListQuery, type OpenCap, type SendReserve, type SendReserveResult, type ServiceStore } from "./store.js";
 import { sentThisMonth, UPGRADE_PROMPT, usagePeriodCurrent } from "./usage.js";
 import { zonedParts, zonedTimeToUtc } from "./zone.js";
 
@@ -217,29 +217,75 @@ export class SupabaseFillipStore implements ServiceStore {
 
   /**
    * The trigger holds a real insert. A lagging active list can still come back
-   * longer than the cap. Delete only the row this call inserted, then throw,
-   * so the caller is not told it failed while that row stays due.
+   * longer than the cap. Delete only the row this call inserted, with RETURNING id.
+   * A returned id, or a re-read that finds the row gone, is the cap error.
+   * A row that is still there after one service-role retry is returned as saved.
    */
   private async refuseIfReadOverCap(saved: Reminder, open: OpenCap): Promise<void> {
     const listed = rows<{ id: string }>(await this.persist()(
       `/rest/v1/reminders?owner_id=eq.${encodeURIComponent(saved.ownerId)}&status=eq.active&select=id&limit=500`
     ));
     if (listed.length <= open.cap) return;
-    try {
-      await this.persist()(`/rest/v1/reminders?id=eq.${encodeURIComponent(saved.id)}&owner_id=eq.${encodeURIComponent(saved.ownerId)}`, {
-        method: "DELETE",
-        headers: { Prefer: "return=minimal" }
-      });
-    } catch (error) {
-      console.error(JSON.stringify({
-        event: "open_cap_delete_failed",
-        name: error instanceof Error ? error.name : "Error"
-      }));
+
+    const first = this.mode === "user" ? this.db : this.persist();
+    let failure: unknown = null;
+    const opened = await this.deleteOwnReturning(first, saved);
+    if (opened.removed) throw this.capError(open);
+    if (opened.error) failure = opened.error;
+    if (!(await this.rowStillStored(saved))) throw this.capError(open);
+
+    if (this.writer && this.writer !== first) {
+      const retried = await this.deleteOwnReturning(this.writer, saved);
+      if (retried.removed) throw this.capError(open);
+      if (retried.error) failure = retried.error;
+      if (!(await this.rowStillStored(saved))) throw this.capError(open);
     }
+
+    this.logCapDeleteFailed(failure);
+    const limit = open.cap;
+    throw new OpenCapKeptError(saved, `You're over the free plan's ${limit} open reminders. ${UPGRADE_PROMPT}`);
+  }
+
+  /** DELETE ... WHERE id = this row RETURNING id. An empty body is not proof the row is gone. */
+  private async deleteOwnReturning(db: Db, saved: Reminder): Promise<{ removed: boolean; error: unknown }> {
+    try {
+      const value = await db(this.ownReminderPath(saved, "id"), {
+        method: "DELETE",
+        headers: { Prefer: "return=representation" }
+      });
+      if (isAcknowledgedWrite(value)) return { removed: false, error: null };
+      return { removed: rows<{ id?: string }>(value).length > 0, error: null };
+    } catch (error) {
+      return { removed: false, error };
+    }
+  }
+
+  private async rowStillStored(saved: Reminder): Promise<boolean> {
+    try {
+      const value = await this.persist()(this.ownReminderPath(saved, "*"));
+      if (isAcknowledgedWrite(value)) return true;
+      return rows<ReminderRow>(value).length > 0;
+    } catch {
+      return true;
+    }
+  }
+
+  private ownReminderPath(saved: Reminder, select: string): string {
+    return `/rest/v1/reminders?id=eq.${encodeURIComponent(saved.id)}&owner_id=eq.${encodeURIComponent(saved.ownerId)}&select=${select}`;
+  }
+
+  private capError(open: OpenCap): OpenCapError {
     const message = open.message.startsWith("The free plan") && !open.message.includes(UPGRADE_PROMPT)
       ? `${open.message} ${UPGRADE_PROMPT}`
       : open.message;
-    throw new OpenCapError(message);
+    return new OpenCapError(message);
+  }
+
+  private logCapDeleteFailed(error: unknown): void {
+    console.error(JSON.stringify({
+      event: "open_cap_delete_failed",
+      name: error instanceof Error ? error.name : "Error"
+    }));
   }
 
   async deleteReminder(ownerId: string, id: string): Promise<void> {
