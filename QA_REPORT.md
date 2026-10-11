@@ -1,139 +1,91 @@
-# Fillip QA round 4
+# Fillip QA round 5
 
-Head: `01eec0e` (`01eec0e6ed1ad92e7f7e99a4d0a2a16ed5f09c7b`) on PR #1.
+Head: `8231447` (`82314471e278453607b9755ba6c7c4e4796f6252`) on PR #1.
 Product code was not changed. New tests and this report are the only additions.
 
-The author said 209 tests pass, with rounds 3 and 4 merged. On a database that still had the previous grants, the suite at this head was **208 passed, 1 failed (209)**. The failure was the old deliveries delete test: that database had `DELETE` without `SELECT`. Applying `supabase/schema.sql` from this commit grants both, and that test passes. The suite at this head, before the new file, is **209 passed, 0 failed**. With `tests/qa/round4.test.ts` the suite is **225 passed, 6 failed (231)**.
+The author said 234 tests pass, the six round-4 failures pass unweakened, and the build is clean. Before `tests/qa/round5.test.ts`, this head is **234 passed, 0 failed**. `npx tsc -p tsconfig.json --noEmit` exits 0. With the new file the suite is **247 passed, 2 failed (249)**.
 
-Severity: **0 blockers, 4 majors, 1 minor**.
+Severity: **0 blockers, 2 majors, 0 minors**.
 
-Concurrency cases in the new file use Postgres 16 at `127.0.0.1` with role `fillip_qa` and a database loaded from `supabase/schema.sql`. They are not the in-memory `hostedDb` double. Each race uses 12 workers.
+Cap races and the daily counter use Postgres 16 at `127.0.0.1`, role `fillip_qa`, database `fillip_round5`, loaded from `supabase/schema.sql`. Each race uses its own sessions (12, or 16 for the empty-account mix). Delivery races use one shared delivery row and a separate store per worker. Each save waits on a real Postgres round trip before the write is visible. That is the same window hosted workers have between the claim read and the later update. `beginSend` stays in memory on each store, which is how separate Node processes behave.
 
 ## Assertion diff
 
-Compared test files from `c228d6b` (`qa/bellion-fillip-3`) to `01eec0e`.
+Compared test files from `0cb8712` (`qa/bellion-fillip-4`) to `8231447`.
 
-- `tests/qa/round2.test.ts` and `tests/qa/round3.test.ts` are unchanged. `QA-FAIL` names that now pass were not edited. The product now meets those assertions.
+- `tests/qa/round3.test.ts` and `tests/qa/round4.test.ts` have an empty diff. The six round-4 `QA-FAIL` tests were not edited, and all six pass on this head.
 - No `it.skip`, `describe.skip`, `test.skip`, `xit`, or `xdescribe` under `tests/`.
-- `tests/crud.test.ts` adds the paused next-send note and the spring-gap `accept_shifted_time` case.
-- `tests/delete-owner.test.ts` tightens the policy matcher to `(select auth.uid())`, which matches the schema.
-- `tests/http.test.ts` adds `delete_reminder` to the catalog, requires the 401 body `Authentication required.`, and adds PKCE and consent checks. `invalid_token` is required only when a token was presented.
-- `tests/oauth-resource-hook.test.ts` and `tests/schema-reapply.test.ts` are new. They do not replace an earlier expect.
+- `tests/qa/round2.test.ts` adds `expect(rejected).toHaveLength(1)` on the two-way create race. That is stricter. The kill-after-accept test used to expect 0 later sends. It now expects 1 send with the same idempotency key. That replaces the old "do not call the sender" check with the 24-hour retry. It is not a loosened bound: the new expect is length 1 and the keys must match. The test name still says the occurrence is not submitted again.
+- `tests/oauth-resource-hook.test.ts` changes the fixture method string to `oauth_provider/authorization_code`, stores `approved_at`, and adds a case: an unexpired authorization for a different resource leaves the audience as `authenticated`; an expired other resource, or a null resource, still binds the exact one. No previous expect was removed.
+- `tests/schema-reapply.test.ts` adds the 5-argument `fillip_reserve_ping` case (first call 1, second call -1, then the 3-argument call returns 2).
+- `tests/oauth-pkce-consent.test.ts` is new. `tests/http.test.ts` is unchanged.
 
-No assertion was weakened, skipped, or deleted.
+No round-3 or round-4 assertion was weakened, skipped, or deleted.
+
+## Suspect: the post-insert pass
+
+**Major.** The pass was not removed. `SupabaseFillipStore.dropInsertedIfOverCap` still runs after a successful insert. If the active list comes back longer than `open.cap`, it deletes only `saved.id` and does not throw. `createReminder` then `return saved`. `createOrRefuse` turns that into a reminder view. The tool wrapper does not set `isError`.
+
+A caller can get a success for a row that was just deleted. `set_reminder` returned `isError: undefined` and this body:
+
+`status: "active"`, `what: "should not stick"`, `state: "active"`, `note: "Fillip will email the verified address on this account."`
+
+The sibling test uses the same double: `setReminder` resolves with that id, `getReminder` of the id is null, and the older id in the same list is still stored. The delete filter was only the inserted id.
+
+The pass does not have to be the thing that enforces the cap. The `BEFORE INSERT OR UPDATE` trigger already does that when the profile cap and `open.cap` match. After the mixed Postgres races, every id a successful insert or resume returned was still `active`, and the open count was exactly the cap (10 free, 100 trialing). In that situation the list the pass reads is not longer than the cap, so the delete branch does not run. The function still returns the row whenever the branch does run. A hosted read that is longer than the cap — a lagging count, a missing trigger, or an app cap below the trigger cap — is enough. The fix is to delete that pass, or to throw the cap error instead of returning the row.
+
+It cannot delete a row a concurrent call already returned under a different id. The `DELETE` is `id=eq.<this call's id>`.
 
 ## Findings
 
 | Severity | What happens | Expected | Actual | Test |
 | --- | --- | --- | --- | --- |
-| Major | Attempt mark is older than the 2-minute lease and the provider never accepted | A delayed or failed notice, or a list status that is not a successful send | One-time reminder becomes `fired`, zero emails, note is null. A daily series moves to the next day and stays `active` with no note | `QA-FAIL: after the two-minute lease a never-accepted ping is dropped without a failed or delayed notice` and `QA-FAIL: a repeating occurrence past the lease is skipped with no failed notice` |
-| Major | Resume while 10 reminders are already open | Stay at 10, and the caller is refused | 12 parallel `UPDATE status = 'active'` calls leave 22 open. The app resume returns `Resumed. Next ping is Monday, October 12, 2026 at 9:00 AM.` and leaves 11 open | `QA-FAIL: resuming paused reminders walks past the open cap because the trigger is insert-only` and `QA-FAIL: the app resume path also turns a paused reminder back on when the account is already at 10` |
-| Major | Post-insert cap pass when `created_at` ties | Delete the new row and return an error | Deletes an older row (tie broken by id) and returns the new reminder | `QA-FAIL: the post-insert cap pass can delete an older row when timestamps match and still report success` |
-| Major | 12 parallel creates when 9 are already open | The losers throw | 11 calls return a view with `status: "active"` and the cap sentence as `note`, for ids that were not stored | `QA-FAIL: a caller that loses the open cap is told the reminder was not saved` |
-| Minor | Daily cap under parallel workers | At most the daily limit | `reserveSend` reads `countSentSince` and then calls `fillip_reserve_ping`, which locks only the monthly counter | Code review of `SupabaseFillipStore.reserveSend`. Not executed as a 12-worker send |
+| Major | Post-insert list is longer than the cap | Throw the cap error, or do not delete | Deletes the inserted id and the tool returns that row as `status: "active"` | `QA-FAIL: a hosted read over the cap deletes the inserted row and still returns it as saved` |
+| Major | Telegram attempt is past the 2-minute lease, 12 workers | List shows not delivered, and exactly one notice email | List shows `delayed` and "not delivered". Telegram is not called. The notice email is sent 12 times | `QA-FAIL: telegram past the lease lists not delivered and sends exactly one email notice under parallel workers` |
 
-### Major: a stale attempt is a silent drop
+### Major: the tool returns a reminder that was deleted
 
-Inside the lease, `provider_id === "attempt"` is retried with the same idempotency key, and `retryingAttempt` keeps the reminder due. That part holds: a fresh attempt is sent once. `QA-FAIL: a crash after the attempt mark and before the provider accepts does not skip that ping` now passes, and the new fresh-attempt test passes.
+Repro:
 
-After 2 minutes (`STALE_MS` and `CLAIM_LEASE_MS`), `claimDelivery` returns `already-sent` without calling the provider. `retryingAttempt` stays false, so `advanceIfSent` marks a one-time reminder `fired` or steps a series forward. `list_reminders` shows that status. The note is null. Twelve parallel jobs on one stale attempt sent 0 emails.
+1. Hosted `POST /rest/v1/reminders` returns the inserted row.
+2. The pre-insert active count stays under 10, so `gate` allows the create.
+3. The post-insert `GET` of active ids returns more than 10 ids and includes the new id.
+4. Call `set_reminder`.
 
-Repro, one-time: delivery row `provider_id = "attempt"`, `started_at` three minutes ago, reminder still due. Run the job. Sender length is 0. List status is `fired`.
+`dropInsertedIfOverCap` issues `DELETE` for that id only. The tool result is a normal reminder view, not `isError`. A following read of the id is empty. The older id is untouched.
 
-Repro, series: same mark on `every day at 9am`. Sender length is 0. `fireAt` moves to the next day. List status stays `active` and the note is empty.
+### Major: parallel workers each email the Telegram miss
 
-This is silent. The user does not get a delayed or failed notice.
+Repro:
 
-**Email retry after the lease is safe for 24 hours.** The key is `fillip/<reminder id>/<fireAt>`. Resend treats that key as idempotent for 24 hours: a retry returns the original response and does not send a second copy. Fillip should keep retrying email with that same key until the key expires, and only then show a failed or skipped row. Treating a stale attempt as already-sent is what drops the ping.
+1. One due Telegram reminder. Its delivery row has `provider_id = "attempt"` and `started_at` three minutes before the job.
+2. Twelve stores share that reminder, that delivery row, and the contact. Each store has its own in-flight set. `saveDelivery` waits on a Postgres round trip before the not-delivered write is visible, so every worker still sees `attempt` when it claims.
+3. Run the twelve jobs together.
 
-**Telegram double-send window: 2 minutes, and not longer.** `sendMessage` does not honor the idempotency key (`src/lib/telegram.ts`). While `provider_id` is still `"attempt"` and `started_at` is inside the lease, a second claim returns `send`, so Telegram can deliver a second copy. A claim 3 minutes after the mark returns `already-sent`, so there is no second Telegram send and also no retry. The window is the open interval from Telegram's accept until the message id replaces `"attempt"`, capped by the 2-minute lease.
+`list_reminders` shows `status: "delayed"` and a note containing "not delivered". `sendMessage` is not called. All 12 email sends use `fillip/<id>/<fireAt>/not-delivered`. The notice does not insert a delivery row before sending, and `beginSend` does not cross processes, so the second worker is not told the first one already sent. Resend would be the only collapse, and only if those 12 calls hit it while the key is still inside 24 hours. The app itself sends 12.
 
-### Major: resume walks past the open cap
+## Round 4, checked again
 
-`fillip_enforce_open_cap` is a `BEFORE INSERT` trigger. It locks `pg_advisory_xact_lock(hashtext(owner))` and `SELECT ... FROM profiles FOR UPDATE`, counts active rows, and raises. It does not delete. Inserts of a non-active row return immediately.
-
-Repro, SQL: 10 active rows and 12 paused rows. Twelve connections `UPDATE` the paused rows to `active`. Every update returns a row. Active count is 22. No error.
-
-Repro, app: free plan, 10 active, pause one, create one, resume the paused one. The reply is `Resumed. Next ping is Monday, October 12, 2026 at 9:00 AM.` Active count is 11. `snoozeOrReschedule` does not consult the cap on resume.
-
-Parallel inserts themselves hold. See verdict (b).
-
-### Major: the post-insert pass can delete an older row
-
-`SupabaseFillipStore.reconcileOpenCap` runs after a successful insert. It sorts active rows by `created_at`, then `id`, keeps the first `cap`, and deletes the rest. It throws `OpenCapError` only when the row just inserted is not in the keep set.
-
-Repro: 10 older rows and the new row share one `created_at`. The new id sorts first. The pass deletes the older id that sorts last, and `createReminder` returns the new reminder. The caller is not told that an older reminder was removed.
-
-The insert trigger stops a pure insert race from reaching this pass. A resume between the insert commit and this list can still make the list longer than the cap, which is when this sort runs.
-
-### Major: a lost create is returned as a saved reminder
-
-`createOrRefuse` catches `OpenCapError` and, when the active count is already at the cap, returns `view(...)` with `status: "active"` and the cap sentence as `note`. The tool wrapper sets `isError` only for thrown errors.
-
-Repro: free plan, 9 active reminders, 12 `setReminder` calls that all read the count before any insert. One reminder is stored. The other 11 resolve with views whose ids are not in the store. Each view is `status: "active"` and the note is `The free plan allows 10 open reminders. Upgrade to Pro for a higher allowance. The trial is 14 days, then Pro.`
-
-A database raise from the trigger is not an `OpenCapError`. That path still throws, and `publicError` returns 429 with the raise text because it contains `The free plan`. The false success is the `OpenCapError` path used by the memory and file stores and by the post-insert pass.
-
-### Minor: the daily cap is still a read, then the monthly lock
-
-`fillip_reserve_ping` locks the profile row and stops at the monthly count. That part holds under 12 workers (below). `reserveSend` still calls `countSentSince` and the global counts before the RPC. Those reads are not in the locked update. On a plan where the daily limit binds first (Pro is 100 a day and 1000 a month), workers that all see 99 sent can all pass the RPC and all send.
-
-## Verdicts
-
-### (a) Crash recovery
-
-Yes. After the 2-minute lease the ping is dropped silently. List shows `fired` for a one-time reminder, or the next occurrence for a series, with no failed or delayed note, and the provider is not called.
-
-Retrying email with the same `fillip/<id>/<fireAt>` key for up to 24 hours is the safe fix. Resend will not send a second copy.
-
-The Telegram double-send window is 2 minutes: a second claim while the mark is still `attempt` and still inside the lease returns `send`, and Telegram will not dedupe. After the lease, Telegram is not called again.
-
-### (b) Open cap
-
-The trigger does not delete. It raises before the insert, so the new row is never written and older rows stay.
-
-Proven on Postgres with 12 workers:
-
-- Nine older rows plus 12 inserts that all use the same `created_at`: 10 active rows, the original nine still present, one new row, 11 errors `The free plan allows 10 open reminders.`
-- Empty account, 12 inserts, same timestamp: exactly 10 succeed and 2 raise that same error.
-- Trialing account, 99 older rows, 12 inserts: 100 active, all 99 older rows remain, the rest raise `Too many reminders are still open.`
-
-The post-insert pass does not have that property. On equal timestamps it can delete an older row and return success. Resume does not go through the trigger, so the cap does not hold for pause then resume.
-
-A trigger raise is an error to the caller. An `OpenCapError` is not: `setReminder` returns a saved-looking view.
-
-### (c) tools/list is public
-
-Holds in code and over HTTP. `publicMethods` is only `tools/list`.
-
-`POST /mcp` `tools/list` is 200 and includes `delete_reminder` with `destructiveHint: true`. `initialize`, `tools/call`, `resources/list`, `ping`, and `notifications/initialized` are 401 with `WWW-Authenticate` pointing at `oauth-protected-resource/mcp`, without `invalid_token` when no token is presented, and the body is `Authentication required.` `GET /mcp` is 401.
-
-## Round 3, re-checked
-
-| Round 3 item | This build |
+| Round 4 finding | On 8231447 |
 | --- | --- |
-| Hosted open cap of 10 on parallel inserts | Fixed for inserts. The trigger holds under 12 workers, including equal timestamps. Resume still bypasses it (major above). |
-| Two workers wipe the monthly counter | Fixed. 12 workers × 4 calls, cap 30: exactly the counts 1 through 30, 18 nulls, stored counter 30. A further 12 calls return null and the counter stays 30. |
-| Stale claim lease sends twice | Fixed. 12 workers, one stale sending row, unique `dedupe_key`: exactly one `send`. |
-| Crash after the attempt mark | Fixed inside the 2-minute lease (one retry, same email key, reminder not skipped). After the lease it is the silent-drop major. |
-| Phrase edit drops `until` | Fixed. Parallel edits `every 2 weeks`, `first Monday of every month`, `every Monday 9am`, and `weekly` keep March 31, 2027. |
-| Paused reminder resumes on edit | Fixed. Those edits leave `status: paused`. The list note matches `paused (would next send `. |
-| Authenticated delete of own deliveries | Fixed once `schema.sql` is applied. `SELECT` and `DELETE` are granted, the other user's row stays, and the old assertion passes unchanged. |
+| Silent drop after the lease | Fixed for the cases below. The two old `QA-FAIL` tests pass unchanged. |
+| Resume walks past the open cap | Fixed. The trigger is `BEFORE INSERT OR UPDATE` and only counts a row that is newly becoming active. |
+| Post-insert pass deletes an older row on a timestamp tie | Fixed. The old `QA-FAIL` passes. The pass now deletes only the inserted id, and that return is the new major above. |
+| Loser of the open cap is told the reminder was saved | Fixed. `createOrRefuse` no longer catches `OpenCapError`. Both the memory `OpenCapError` path and a P0001 / plain "The free plan allows 10 open reminders." error are tool errors (`isError: true`, no `status: "active"`). |
+| Daily cap is a read, then a monthly lock | Fixed inside the 5-argument `fillip_reserve_ping`. Twelve sessions at 99 of 100 daily: one positive return, eleven `-1`, `emails_sent_today` is 100, and the monthly counter moves by 1. |
 
-## New behavior
+One-time email, attempt three minutes old (inside 24 hours): one send, key `fillip/<id>/<fireAt>`, the reminder is still `active` at the moment of send, then `fired`. A later job sends 0. An attempt older than 24 hours sends 0 and the delivery error matches "not delivered".
 
-| Area | Result |
-| --- | --- |
-| S256 only | Pass. `plain`, `s256`, empty method, and a missing challenge are `invalid_request`. `S256` is accepted and forwarded. |
-| Consent before redirect | Pass. The consent section is unhidden before any `redirect_url` assignment. The old auto-redirect snippet is gone. |
-| Exact resource audience | Pass. The configured resource matches. A path prefix, another host, a query string, and `http` instead of `https` throw `Reconnect Fillip`. |
-| Grants | Pass. `has_table_privilege` for `anon` is false for `SELECT`, `INSERT`, `UPDATE`, and `DELETE` on every public table. `authenticated` has no `INSERT` or `UPDATE` on any public table. `reminders`, `deliveries`, and `digest_settings` have `SELECT` and `DELETE`. `profiles` has `SELECT` only. `fillip_runtime` and `fillip_support_requests` have none. `service_role` can execute `fillip_reserve_ping`. `authenticated` cannot. |
-| `accept_shifted_time` | Pass for the spring gap. `March 14, 2027 at 2:30am` in `America/New_York` throws `WhenError` without the flag and saves `2027-03-14T07:30:00.000Z` with a "does not exist" note when the flag is true. `November 1, 2026 at 1:30am` saves without the flag and the note says the clock is ambiguous. That matches the tool text, which reserves the flag for a clock that does not exist. |
-| `delete_reminder` | Pass. `tools/list` has `destructiveHint: true`. Deleting one user leaves the other user's reminder. |
-| Paused next send | Pass. The list note contains `paused (would next send `. |
-| Per-call logs | Pass. The `mcp` JSON line has the tool name and not the bearer, the account email, the reminder text, or a feed token. |
-| Copy | Pass. No `$` plus a digit, `USD`, or `dollars` in the README, public pages, tool text, landing page, consent page, connect page, `glama.json`, or `server.json`. Those files do not advertise SMS, Slack, or push notifications. |
+Twelve workers on that same one-time retry each call send with that one key (12 calls on this run). A job after the provider id is stored sends 0. That matches the README: Resend treats a repeat of `fillip/<id>/<fireAt>` as the same send. It is not filed. The single-worker path already sends once, and nothing is sent again after the accept is stored.
 
-## What this run did not hit
+Repeating email past the lease: the user is told on the list. `status` is `delayed` and the note is `This ping was not delivered. It was delayed and could not be sent.` The series moves to the next fire time. No ping is sent and no notice email is sent. The miss is only on the list.
 
-GoTrue OTP expiry, reuse, and brute force. A live Resend or Telegram call. Stripe signature traffic. A ChatGPT or Claude OAuth browser. Production PostgREST. The daily-cap race above was read from `reserveSend` and was not driven through 12 real sends.
+Resume at 10 open is a tool error and the paused row stays paused. Editing `what` on an already-active row at the cap does not raise.
+
+## Regression
+
+The author suite on this head, which includes the round-3 file and the round-4 file unchanged, is 234 passed, 0 failed. That covers the round-3 and round-4 passes: phrase edits keep `until`, paused stays paused, S256-only, consent before redirect, audience binding, grants, the spring-gap and fall-back clocks, `delete_reminder`, per-call logs, copy, and `tools/list` public with the other MCP methods returning 401. The new consent file and the new audience case passed in that suite.
+
+## Not exercised here
+
+GoTrue one-time codes, a live Resend send, a live Telegram `sendMessage`, Stripe webhooks, and a hosted PostgREST instance. The cap and daily races ran on Postgres with `schema.sql`. The post-insert major used a hosted double that returns a long active list after the insert. The notice major used the product delivery loop with the row shared across 12 stores.
