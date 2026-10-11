@@ -353,11 +353,10 @@ describe("QA round 4 real Postgres concurrency", () => {
       return [row(freshId, stamp), ...olderIds.map((id) => row(id, stamp))].map((item) => ({ id: item.id, created_at: item.created_at }));
     };
     const store = new SupabaseFillipStore(null, db, "service");
-    const saved = await store.createReminder(row(freshId, stamp) as unknown as Reminder, {
+    await expect(store.createReminder(row(freshId, stamp) as unknown as Reminder, {
       cap: 10,
       message: "The free plan allows 10 open reminders."
-    });
-    expect(saved.id).toBe(freshId);
+    })).rejects.toThrow(/The free plan allows 10 open reminders/);
     expect(deleted, "only the reminder just inserted may be removed").toEqual([freshId]);
   });
 
@@ -419,7 +418,7 @@ describe("QA round 4 real Postgres concurrency", () => {
         const counts: Array<number | null> = [];
         for (let attempt = 0; attempt < 4; attempt += 1) {
           const result = await item.query<{ n: number | null }>(
-            "select public.fillip_reserve_ping($1::uuid, 30, $2::timestamptz) as n",
+            "select public.fillip_reserve_ping($1::uuid, 30, $2::timestamptz, null::integer, null::timestamptz) as n",
             [owner, period]
           );
           counts.push(result.rows[0]?.n ?? null);
@@ -434,7 +433,7 @@ describe("QA round 4 real Postgres concurrency", () => {
       const stored = await opened[0].query<{ n: number }>("select emails_sent_in_period as n from public.profiles where id = $1", [owner]);
       expect(stored.rows[0]?.n).toBe(30);
       const again = await Promise.all(opened.map((item) => item.query<{ n: number | null }>(
-        "select public.fillip_reserve_ping($1::uuid, 30, $2::timestamptz) as n",
+        "select public.fillip_reserve_ping($1::uuid, 30, $2::timestamptz, null::integer, null::timestamptz) as n",
         [owner, period]
       )));
       expect(again.every((item) => item.rows[0]?.n == null)).toBe(true);
@@ -553,11 +552,11 @@ describe("QA round 4 real Postgres concurrency", () => {
       expect(matrix.fillip_runtime["authenticated:SELECT"]).toBe(false);
       expect(matrix.fillip_support_requests["authenticated:SELECT"]).toBe(false);
       const execute = await db.query<{ ok: boolean }>(
-        "select has_function_privilege('service_role', 'public.fillip_reserve_ping(uuid, integer, timestamptz)', 'EXECUTE') as ok"
+        "select has_function_privilege('service_role', 'public.fillip_reserve_ping(uuid, integer, timestamptz, integer, timestamptz)', 'EXECUTE') as ok"
       );
       expect(execute.rows[0]?.ok).toBe(true);
       const hidden = await db.query<{ ok: boolean }>(
-        "select has_function_privilege('authenticated', 'public.fillip_reserve_ping(uuid, integer, timestamptz)', 'EXECUTE') as ok"
+        "select has_function_privilege('authenticated', 'public.fillip_reserve_ping(uuid, integer, timestamptz, integer, timestamptz)', 'EXECUTE') as ok"
       );
       expect(hidden.rows[0]?.ok).toBe(false);
     } finally {
@@ -855,11 +854,15 @@ describe("QA round 4 auth, logs, and copy", () => {
     expect(plain.headers.get("location") ?? "").toContain("error=invalid_request");
     const consent = await fetch(`${base}/oauth/consent?authorization_id=auth-1`);
     const html = await consent.text();
+    const assign = html.indexOf("if(details.data&&details.data.redirect_url){location.assign(details.data.redirect_url);return}");
+    const proof = html.indexOf("/oauth/pkce-proof");
+    const clientName = html.indexOf("details.data.client||{}");
     const shown = html.indexOf("el('consent').hidden=false");
-    const redirect = html.indexOf("details.data.redirect_url");
-    expect(shown).toBeGreaterThan(0);
-    expect(redirect).toBeGreaterThan(shown);
-    expect(html).not.toContain("if(details.data.redirect_url){location.assign(details.data.redirect_url);return}");
+    expect(assign).toBeGreaterThan(0);
+    expect(assign).toBeLessThan(proof);
+    expect(proof).toBeLessThan(clientName);
+    expect(clientName).toBeLessThan(shown);
+    expect(html).not.toContain("details.data.client.name||");
   });
 
   it("QA-PASS: the audience must equal a configured resource, not a prefix or another host", () => {

@@ -216,9 +216,10 @@ export class SupabaseFillipStore implements ServiceStore {
   }
 
   /**
-   * The insert trigger is what enforces the cap. This pass never deletes a
-   * different row. If a read still shows more open reminders than the cap,
-   * the only row removed is the one this call just inserted.
+   * The insert trigger is what enforces the cap. If a read still shows more
+   * open reminders than the cap, delete only the row this call just inserted
+   * and throw. An older row is never removed, and the deleted row is not
+   * returned as saved.
    */
   private async dropInsertedIfOverCap(saved: Reminder, open: OpenCap): Promise<void> {
     const listed = rows<{ id: string }>(await this.persist()(
@@ -229,6 +230,7 @@ export class SupabaseFillipStore implements ServiceStore {
       method: "DELETE",
       headers: { Prefer: "return=minimal" }
     });
+    throw new OpenCapError(open.message);
   }
 
   async deleteReminder(ownerId: string, id: string): Promise<void> {

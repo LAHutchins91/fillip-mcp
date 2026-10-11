@@ -166,7 +166,7 @@ describe("streamable HTTP", () => {
     delete process.env.FILLIP_AUTH_GOOGLE_ENABLED;
   });
 
-  it("rejects a missing or non-S256 PKCE challenge and shows consent without auto-redirect", async () => {
+  it("rejects a missing or non-S256 PKCE challenge and follows an existing redirect before reading the client", async () => {
     const plain = await fetch(`${base}/oauth/authorize?redirect_uri=${encodeURIComponent("https://client.example/cb")}&code_challenge_method=plain&code_challenge=abc&state=xyz`, { redirect: "manual" });
     expect(plain.status).toBeGreaterThanOrEqual(300);
     expect(plain.status).toBeLessThan(400);
@@ -191,8 +191,14 @@ describe("streamable HTTP", () => {
     expect(html).toContain("denyAuthorization");
     expect(html).toContain("code_challenge_method");
     expect(html).toContain("S256");
-    expect(html).not.toContain("if(details.data.redirect_url){location.assign(details.data.redirect_url);return}");
+    const assign = html.indexOf("if(details.data&&details.data.redirect_url){location.assign(details.data.redirect_url);return}");
+    const proof = html.indexOf("/oauth/pkce-proof");
+    const clientName = html.indexOf("details.data.client||{}");
+    expect(assign).toBeGreaterThan(0);
+    expect(assign).toBeLessThan(proof);
+    expect(proof).toBeLessThan(clientName);
     expect(html).toContain("el('consent').hidden=false");
+    expect(html).not.toContain("details.data.client.name||");
   });
 
   it("serves connect, health, and OAuth metadata", async () => {

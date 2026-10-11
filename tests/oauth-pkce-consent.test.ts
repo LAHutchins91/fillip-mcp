@@ -1,10 +1,11 @@
 /**
  * Authorize records S256 in a cookie the consent page can read.
  * Supabase details often omit PKCE, and an empty pair must not deny consent.
- * A code Supabase already returned is single-use: Connect follows redirect_url
- * once and does not call approveAuthorization again.
+ * When consent already exists, the details body is only redirect_url. The page
+ * assigns that URL before it reads client and before the PKCE check.
  */
 import http, { type Server } from "node:http";
+import vm from "node:vm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { app } from "../src/server.js";
 
@@ -122,13 +123,16 @@ describe("PKCE proof through the first authenticated MCP call", () => {
 
     const consent = await request(fillipBase, "GET", "/oauth/consent?authorization_id=auth-1");
     const html = consent.text;
+    const assign = html.indexOf("if(details.data&&details.data.redirect_url){location.assign(details.data.redirect_url);return}");
+    const proofAt = html.indexOf("/oauth/pkce-proof");
+    const clientName = html.indexOf("details.data.client||{}");
     const shown = html.indexOf("el('consent').hidden=false");
-    const redirect = html.indexOf("details.data.redirect_url");
-    expect(shown).toBeGreaterThan(-1);
-    expect(redirect).toBeGreaterThan(shown);
+    expect(assign).toBeGreaterThan(-1);
+    expect(assign).toBeLessThan(proofAt);
+    expect(proofAt).toBeLessThan(clientName);
+    expect(clientName).toBeLessThan(shown);
     expect(html).toContain("(method||challenge)?rejectPkce(method,challenge):null");
-    expect(html).toContain("if(approved&&details.data.redirect_url){location.assign(details.data.redirect_url);return}");
-    expect(html).not.toContain("if(details.data.redirect_url){location.assign(details.data.redirect_url);return}");
+    expect(html).not.toContain("details.data.client.name||");
 
     const initialize = await request(fillipBase, "POST", "/mcp", {
       "content-type": "application/json",
@@ -141,5 +145,94 @@ describe("PKCE proof through the first authenticated MCP call", () => {
       params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "claude", version: "1" } }
     }));
     expect(initialize.status).toBe(200);
+  });
+
+  it("redirects when an existing consent response has only redirect_url and no client", async () => {
+    const consent = await request(fillipBase, "GET", "/oauth/consent?authorization_id=auth-existing");
+    const redirectUrl = "https://client.example/cb?code=issued";
+    const details = { redirect_url: redirectUrl };
+    expect(details).not.toHaveProperty("client");
+    const started = consent.text.lastIndexOf("<script>");
+    const ended = consent.text.lastIndexOf("</script>");
+    const source = consent.text.slice(started + "<script>".length, ended);
+    const assigned: string[] = [];
+    const calls: string[] = [];
+    const element = () => ({
+      hidden: true,
+      textContent: "",
+      disabled: false,
+      value: "",
+      onclick: null as unknown,
+      onsubmit: null as unknown,
+      querySelector: () => ({ disabled: false })
+    });
+    const sandbox = {
+      Error,
+      Promise,
+      JSON,
+      Object,
+      Array,
+      window: {
+        supabase: {
+          createClient() {
+            return {
+              auth: {
+                async getSession() {
+                  return { data: { session: { user: { email: "owner@example.com" } } }, error: null };
+                },
+                async signOut() {
+                  return { error: null };
+                },
+                oauth: {
+                  async getAuthorizationDetails() {
+                    calls.push("details");
+                    return { data: details, error: null };
+                  },
+                  async approveAuthorization() {
+                    calls.push("approve");
+                    return { data: {}, error: null };
+                  },
+                  async denyAuthorization() {
+                    calls.push("deny");
+                    return { data: {}, error: null };
+                  }
+                }
+              }
+            };
+          }
+        }
+      },
+      document: {
+        getElementById: () => element(),
+        createElement: () => element()
+      },
+      location: {
+        search: "?authorization_id=auth-existing",
+        pathname: "/oauth/consent",
+        origin: "https://fillip.example",
+        assign(url: string) {
+          assigned.push(url);
+        },
+        reload() {
+          calls.push("reload");
+        }
+      },
+      URLSearchParams,
+      fetch: async () => {
+        calls.push("proof");
+        return { json: async () => ({}) };
+      },
+      sessionStorage: {
+        setItem() {
+          return undefined;
+        },
+        getItem() {
+          return null;
+        }
+      }
+    };
+    await vm.runInContext(source, vm.createContext(sandbox));
+    expect(assigned).toEqual([redirectUrl]);
+    expect(calls).toEqual(["details"]);
   });
 });

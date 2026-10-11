@@ -302,46 +302,9 @@ grant execute on function public.fillip_set_telegram_link(text, timestamptz) to 
 grant execute on function public.fillip_clear_telegram() to authenticated;
 grant execute on function public.fillip_set_calendar_token(text) to authenticated;
 
--- One conditional update for the monthly ping counter. A number is the new
--- count. Null means the cap already held. Service role only.
-create or replace function public.fillip_reserve_ping(owner uuid, max_count integer, period_start timestamptz)
-returns integer
-language plpgsql
-security definer
-set search_path = public
-as $$
-declare
-  next_count integer;
-begin
-  update public.profiles
-  set emails_sent_in_period = case
-        when email_period_start is null or email_period_start < period_start then 1
-        else emails_sent_in_period + 1
-      end,
-      email_period_start = case
-        when email_period_start is null or email_period_start < period_start then period_start
-        else email_period_start
-      end,
-      updated_at = now()
-  where id = owner
-    and (
-      email_period_start is null
-      or email_period_start < period_start
-      or emails_sent_in_period < max_count
-    )
-  returning emails_sent_in_period into next_count;
-  return next_count;
-end;
-$$;
-
-revoke all on function public.fillip_reserve_ping(uuid, integer, timestamptz) from public, anon, authenticated;
-do $$
-begin
-  if exists (select 1 from pg_roles where rolname = 'service_role') then
-    grant execute on function public.fillip_reserve_ping(uuid, integer, timestamptz) to service_role;
-  end if;
-end
-$$;
+-- The 3-argument overload skipped the daily cap. Callers use the 5-argument
+-- function. Drop the old signature so a re-run does not leave it behind.
+drop function if exists public.fillip_reserve_ping(uuid, integer, timestamptz);
 
 -- Same profile lock as the monthly counter. -1 means the daily cap held.
 -- Null means the monthly cap held. A positive integer is the new monthly count.

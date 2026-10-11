@@ -199,8 +199,8 @@ describe("schema re-run", () => {
       expect(active.rows[0]?.n).toBe(10);
       const period = "2026-10-01T00:00:00.000Z";
       const [first, second] = await Promise.all([
-        left.query("select public.fillip_reserve_ping($1::uuid, 30, $2::timestamptz) as n", [owner, period]),
-        right.query("select public.fillip_reserve_ping($1::uuid, 30, $2::timestamptz) as n", [owner, period])
+        left.query("select public.fillip_reserve_ping($1::uuid, 30, $2::timestamptz, null::integer, null::timestamptz) as n", [owner, period]),
+        right.query("select public.fillip_reserve_ping($1::uuid, 30, $2::timestamptz, null::integer, null::timestamptz) as n", [owner, period])
       ]);
       const counts = [first.rows[0]?.n, second.rows[0]?.n].map(Number).sort((a, b) => a - b);
       expect(counts).toEqual([1, 2]);
@@ -233,11 +233,17 @@ describe("schema re-run", () => {
         [owner]
       );
       expect(stored.rows[0]).toEqual({ emails_sent_in_period: 1, emails_sent_today: 1 });
-      const third = await db.query<{ n: number | null }>(
-        "select public.fillip_reserve_ping($1::uuid, 30, $2::timestamptz) as n",
-        [owner, period]
-      );
-      expect(third.rows[0]?.n).toBe(2);
+      const gone = await db.query<{ n: number }>(`
+        select count(*)::int as n
+        from pg_proc p
+        join pg_namespace n on n.oid = p.pronamespace
+        where n.nspname = 'public'
+          and p.proname = 'fillip_reserve_ping'
+          and pg_get_function_identity_arguments(p.oid) = 'owner uuid, max_count integer, period_start timestamp with time zone'
+      `);
+      expect(gone.rows[0]?.n).toBe(0);
+      const still = await call(1);
+      expect(still.rows[0]?.n).toBe(-1);
     } finally {
       await db.end();
     }

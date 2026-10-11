@@ -360,12 +360,17 @@ describe("QA round 3 reservations, claims, and caps", () => {
       await setReminder(store, actor, { what: `Open ${i}`, when: "tomorrow 9am", timezone: "UTC" }, createdAt, caps);
     }
     db.armActiveStall();
-    await Promise.all([
+    const raced = await Promise.allSettled([
       setReminder(store, actor, { what: "Tenth", when: "tomorrow 9am", timezone: "UTC" }, createdAt, caps),
       setReminder(store, actor, { what: "Eleventh", when: "tomorrow 9am", timezone: "UTC" }, createdAt, caps)
     ]);
-    const active = books.get(db)?.reminders.filter((row) => row.status === "active").length ?? 0;
-    expect(active, "parallel creates at 9 of 10").toBeLessThanOrEqual(10);
+    const activeRows = books.get(db)?.reminders.filter((row) => row.status === "active") ?? [];
+    expect(activeRows.length, "parallel creates at 9 of 10").toBeLessThanOrEqual(10);
+    const stored = new Set(activeRows.map((row) => row.id));
+    for (const item of raced) {
+      if (item.status === "fulfilled") expect(stored.has(item.value.id), "a saved view must still be stored").toBe(true);
+      else expect(String(item.reason)).toMatch(/The free plan allows 10 open reminders/);
+    }
   });
 
   it("QA-FAIL: two hosted workers that both send keep one counter increment per ping", async () => {

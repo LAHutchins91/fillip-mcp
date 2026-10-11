@@ -198,11 +198,12 @@ try{
    var grants=await client.auth.oauth.listGrants();if(grants.error)throw grants.error;
    var rows=Array.isArray(grants.data)?grants.data:(grants.data&&grants.data.grants)||[];
    if(!rows.length)el('grants').textContent='No applications are connected.';
-   rows.forEach(function(grant){var row=document.createElement('div');row.className='card';var title=document.createElement('p');title.textContent=grant.client.name||grant.client.id;row.appendChild(title);var button=document.createElement('button');button.textContent='Disconnect';row.appendChild(button);button.onclick=async function(){button.disabled=true;try{var r=await client.auth.oauth.revokeGrant({clientId:grant.client.id});if(r.error)throw r.error;row.remove();if(!el('grants').children.length)el('grants').textContent='No applications are connected.'}catch(e){fail(e);button.disabled=false}};el('grants').appendChild(row)});
+   rows.forEach(function(grant){var row=document.createElement('div');row.className='card';var title=document.createElement('p');var app=grant.client||{};title.textContent=app.name||app.id||'Connected application';row.appendChild(title);var button=document.createElement('button');button.textContent='Disconnect';row.appendChild(button);button.onclick=async function(){button.disabled=true;try{var r=await client.auth.oauth.revokeGrant({clientId:app.id});if(r.error)throw r.error;row.remove();if(!el('grants').children.length)el('grants').textContent='No applications are connected.'}catch(e){fail(e);button.disabled=false}};el('grants').appendChild(row)});
    return;
  }
  if(!id)throw new Error('Open Fillip from your assistant connection to start a new authorization request.');
  var details=await client.auth.oauth.getAuthorizationDetails(id);if(details.error)throw details.error;
+ if(details.data&&details.data.redirect_url){location.assign(details.data.redirect_url);return}
  var query=new URLSearchParams(location.search);
  var nested=details.data&&details.data.authorization?details.data.authorization:{};
  var proof={};
@@ -217,9 +218,10 @@ try{
    location.assign(oauthErrorRedirect(back, rejection.error, rejection.error_description, details.data.state||query.get('state')));
    return;
  }
- el('client').textContent='Connect '+(details.data.client.name||'this application')+'?';
- el('destination').textContent='Return address: '+details.data.redirect_uri;
- el('scopes').textContent='Requested scopes: '+details.data.scope;
+ var app=details.data.client||{};
+ el('client').textContent='Connect '+(app.name||'this application')+'?';
+ el('destination').textContent='Return address: '+(details.data.redirect_uri||'');
+ el('scopes').textContent='Requested scopes: '+(details.data.scope||'');
  el('consent').hidden=false;
  async function decide(approved){el('approve').disabled=true;el('deny').disabled=true;try{if(approved&&details.data.redirect_url){location.assign(details.data.redirect_url);return}var r=await client.auth.oauth[approved?'approveAuthorization':'denyAuthorization'](id,{skipBrowserRedirect:true});if(r.error)throw r.error;location.assign(r.data.redirect_url)}catch(e){fail(e);el('approve').disabled=false;el('deny').disabled=false}}
  el('approve').onclick=function(){decide(true)};el('deny').onclick=function(){decide(false)};
