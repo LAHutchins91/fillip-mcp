@@ -95,4 +95,30 @@ export class FileFillipStore extends MemoryFillipStore {
     await super.setProviderBackoffUntil(untilIso);
     this.persist();
   }
+
+  override async setDefaultChannel(ownerId: string, channel: Parameters<MemoryFillipStore["setDefaultChannel"]>[1]): Promise<void> {
+    await super.setDefaultChannel(ownerId, channel);
+    this.persist();
+  }
+
+  override async beginTelegramLink(ownerId: string, token: string, expiresIso: string): Promise<void> {
+    await super.beginTelegramLink(ownerId, token, expiresIso);
+    this.persist();
+  }
+
+  override async unlinkTelegram(ownerId: string): Promise<void> {
+    await super.unlinkTelegram(ownerId);
+    this.persist();
+  }
+
+  override async setCalendarToken(ownerId: string, token: string): Promise<void> {
+    await super.setCalendarToken(ownerId, token);
+    this.persist();
+  }
+
+  override async claimTelegramLink(token: string, chatId: string, nowIso: string): Promise<string | null> {
+    const ownerId = await super.claimTelegramLink(token, chatId, nowIso);
+    if (ownerId) this.persist();
+    return ownerId;
+  }
 }

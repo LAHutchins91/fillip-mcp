@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { ClaimResult, Delivery, DigestSettings, OwnerContact, OwnerIdentity, PlanName, Recurrence, Reminder, ReminderStatus } from "./types.js";
+import type { ClaimResult, Delivery, DeliveryChannel, DigestSettings, OwnerContact, OwnerIdentity, PlanName, Recurrence, Reminder, ReminderStatus } from "./types.js";
 import type { ListQuery, ServiceStore } from "./store.js";
 
 export type Db = (pathname: string, options?: RequestInit) => Promise<unknown>;
@@ -24,6 +24,7 @@ type ReminderRow = {
   timezone: string;
   fire_at: string;
   recurrence: Recurrence | null;
+  channel?: DeliveryChannel | null;
   status: ReminderStatus;
   hold_until: string | null;
   created_at: string;
@@ -39,6 +40,7 @@ type DeliveryRow = {
   occurrence_at: string;
   status: Delivery["status"];
   idempotency_key: string;
+  channel?: "email" | "telegram" | null;
   provider_id: string | null;
   started_at: string;
   sent_at: string | null;
@@ -55,6 +57,7 @@ function fromReminder(row: ReminderRow): Reminder {
     timezone: row.timezone,
     fireAt: row.fire_at,
     recurrence: row.recurrence,
+    channel: row.channel === "telegram" || row.channel === "both" ? row.channel : "email",
     status: row.status,
     holdUntil: row.hold_until,
     createdAt: row.created_at,
@@ -73,6 +76,7 @@ function toReminder(reminder: Reminder): ReminderRow {
     timezone: reminder.timezone,
     fire_at: reminder.fireAt,
     recurrence: reminder.recurrence,
+    channel: reminder.channel,
     status: reminder.status,
     hold_until: reminder.holdUntil,
     created_at: reminder.createdAt,
@@ -90,6 +94,7 @@ function fromDelivery(row: DeliveryRow): Delivery {
     occurrenceAt: row.occurrence_at,
     status: row.status,
     idempotencyKey: row.idempotency_key,
+    channel: row.channel === "telegram" ? "telegram" : "email",
     providerId: row.provider_id,
     startedAt: row.started_at,
     sentAt: row.sent_at,
@@ -244,7 +249,12 @@ export class SupabaseFillipStore implements ServiceStore {
       plan: usage.plan,
       subscriptionStatus: usage.subscriptionStatus,
       emailsSentInPeriod: usage.emailsSentInPeriod,
-      emailPeriodStart: usage.emailPeriodStart
+      emailPeriodStart: usage.emailPeriodStart,
+      defaultChannel: usage.defaultChannel,
+      telegramChatId: usage.telegramChatId,
+      telegramLinkToken: usage.telegramLinkToken,
+      telegramLinkExpires: usage.telegramLinkExpires,
+      calendarToken: usage.calendarToken
     };
   }
 
@@ -259,22 +269,33 @@ export class SupabaseFillipStore implements ServiceStore {
     };
   }
 
-  private async readUsage(ownerId: string): Promise<Pick<OwnerContact, "unsubscribed" | "plan" | "subscriptionStatus" | "emailsSentInPeriod" | "emailPeriodStart">> {
+  private async readUsage(ownerId: string): Promise<Pick<OwnerContact, "unsubscribed" | "plan" | "subscriptionStatus" | "emailsSentInPeriod" | "emailPeriodStart" | "defaultChannel" | "telegramChatId" | "telegramLinkToken" | "telegramLinkExpires" | "calendarToken">> {
     const profiles = rows<{
       unsubscribed?: boolean;
       plan?: string;
       subscription_status?: string;
       emails_sent_in_period?: number;
       email_period_start?: string | null;
-    }>(await this.db(`/rest/v1/profiles?id=eq.${encodeURIComponent(ownerId)}&select=unsubscribed,plan,subscription_status,emails_sent_in_period,email_period_start`));
+      default_channel?: string | null;
+      telegram_chat_id?: string | null;
+      telegram_link_token?: string | null;
+      telegram_link_expires?: string | null;
+      calendar_token?: string | null;
+    }>(await this.db(`/rest/v1/profiles?id=eq.${encodeURIComponent(ownerId)}&select=unsubscribed,plan,subscription_status,emails_sent_in_period,email_period_start,default_channel,telegram_chat_id,telegram_link_token,telegram_link_expires,calendar_token`));
     const row = profiles[0];
-    const plan: PlanName = row?.plan === "pro" || row?.plan === "annual" ? row.plan : "none";
+    const plan: PlanName = row?.plan === "pro" || row?.plan === "annual" || row?.plan === "free" ? row.plan : "free";
+    const channel: DeliveryChannel = row?.default_channel === "telegram" || row?.default_channel === "both" ? row.default_channel : "email";
     return {
       unsubscribed: Boolean(row?.unsubscribed),
       plan,
       subscriptionStatus: typeof row?.subscription_status === "string" ? row.subscription_status : "none",
       emailsSentInPeriod: typeof row?.emails_sent_in_period === "number" ? row.emails_sent_in_period : 0,
-      emailPeriodStart: typeof row?.email_period_start === "string" ? row.email_period_start : null
+      emailPeriodStart: typeof row?.email_period_start === "string" ? row.email_period_start : null,
+      defaultChannel: channel,
+      telegramChatId: typeof row?.telegram_chat_id === "string" ? row.telegram_chat_id : null,
+      telegramLinkToken: typeof row?.telegram_link_token === "string" ? row.telegram_link_token : null,
+      telegramLinkExpires: typeof row?.telegram_link_expires === "string" ? row.telegram_link_expires : null,
+      calendarToken: typeof row?.calendar_token === "string" ? row.calendar_token : null
     };
   }
 
@@ -309,6 +330,7 @@ export class SupabaseFillipStore implements ServiceStore {
     dedupeKey: string;
     occurrenceAt: string;
     idempotencyKey: string;
+    channel: "email" | "telegram";
     nowIso: string;
     staleBeforeIso: string;
   }): Promise<ClaimResult> {
@@ -321,6 +343,7 @@ export class SupabaseFillipStore implements ServiceStore {
       occurrence_at: input.occurrenceAt,
       status: "sending",
       idempotency_key: input.idempotencyKey,
+      channel: input.channel,
       provider_id: null,
       started_at: input.nowIso,
       sent_at: null,
@@ -378,7 +401,7 @@ export class SupabaseFillipStore implements ServiceStore {
   async countAllSentSince(sinceIso: string): Promise<number> {
     if (this.mode !== "service") throw new Error("Reminder not found");
     const value = await this.db(
-      `/rest/v1/deliveries?status=eq.sent&sent_at=gte.${encodeURIComponent(sinceIso)}&select=id`,
+      `/rest/v1/deliveries?status=eq.sent&channel=neq.telegram&sent_at=gte.${encodeURIComponent(sinceIso)}&select=id`,
       { method: "GET", headers: { Prefer: "count=exact", Range: "0-0" } }
     );
     if (typeof value === "number" && Number.isFinite(value)) return value;
@@ -390,6 +413,70 @@ export class SupabaseFillipStore implements ServiceStore {
     const value = await this.db("/rest/v1/fillip_runtime?id=eq.1&select=provider_backoff_until");
     const row = rows<{ provider_backoff_until?: string | null }>(value)[0];
     return typeof row?.provider_backoff_until === "string" ? row.provider_backoff_until : null;
+  }
+
+  async setDefaultChannel(ownerId: string, channel: DeliveryChannel): Promise<void> {
+    this.owned(ownerId);
+    if (this.mode === "user") {
+      await this.db("/rest/v1/rpc/fillip_set_default_channel", { method: "POST", body: JSON.stringify({ channel }) });
+      return;
+    }
+    await this.patchProfile(ownerId, { default_channel: channel });
+  }
+
+  async beginTelegramLink(ownerId: string, token: string, expiresIso: string): Promise<void> {
+    this.owned(ownerId);
+    if (this.mode === "user") {
+      await this.db("/rest/v1/rpc/fillip_set_telegram_link", {
+        method: "POST",
+        body: JSON.stringify({ token, expires: expiresIso })
+      });
+      return;
+    }
+    await this.patchProfile(ownerId, { telegram_link_token: token, telegram_link_expires: expiresIso });
+  }
+
+  async unlinkTelegram(ownerId: string): Promise<void> {
+    this.owned(ownerId);
+    if (this.mode === "user") {
+      await this.db("/rest/v1/rpc/fillip_clear_telegram", { method: "POST", body: JSON.stringify({}) });
+      return;
+    }
+    await this.patchProfile(ownerId, { telegram_chat_id: null, telegram_link_token: null, telegram_link_expires: null, default_channel: "email" });
+  }
+
+  async setCalendarToken(ownerId: string, token: string): Promise<void> {
+    this.owned(ownerId);
+    if (this.mode === "user") {
+      await this.db("/rest/v1/rpc/fillip_set_calendar_token", { method: "POST", body: JSON.stringify({ token }) });
+      return;
+    }
+    await this.patchProfile(ownerId, { calendar_token: token });
+  }
+
+  async ownerIdForCalendarToken(token: string): Promise<string | null> {
+    if (this.mode !== "service") throw new Error("Reminder not found");
+    const rowsFound = rows<{ id: string }>(await this.db(`/rest/v1/profiles?calendar_token=eq.${encodeURIComponent(token)}&select=id`));
+    return rowsFound[0]?.id ?? null;
+  }
+
+  async claimTelegramLink(token: string, chatId: string, nowIso: string): Promise<string | null> {
+    if (this.mode !== "service") throw new Error("Reminder not found");
+    const found = rows<{ id: string; telegram_link_expires?: string | null }>(await this.db(
+      `/rest/v1/profiles?telegram_link_token=eq.${encodeURIComponent(token)}&select=id,telegram_link_expires`
+    ));
+    const row = found[0];
+    if (!row?.telegram_link_expires || row.telegram_link_expires <= nowIso) return null;
+    await this.patchProfile(row.id, { telegram_chat_id: chatId, telegram_link_token: null, telegram_link_expires: null });
+    return row.id;
+  }
+
+  private async patchProfile(ownerId: string, patch: Record<string, unknown>): Promise<void> {
+    await this.db(`/rest/v1/profiles?id=eq.${encodeURIComponent(ownerId)}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({ ...patch, updated_at: new Date().toISOString() })
+    });
   }
 
   async setProviderBackoffUntil(untilIso: string): Promise<void> {

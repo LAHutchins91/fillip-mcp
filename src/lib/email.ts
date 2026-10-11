@@ -1,3 +1,9 @@
+export type OutboundAttachment = {
+  filename: string;
+  content: string;
+  contentType: string;
+};
+
 export type OutboundEmail = {
   from: string;
   to: string;
@@ -6,6 +12,7 @@ export type OutboundEmail = {
   html: string;
   idempotencyKey: string;
   headers: Record<string, string>;
+  attachments?: OutboundAttachment[];
 };
 
 export interface MailSender {
@@ -53,7 +60,16 @@ export function createResendSender(apiKey: string, fetchImpl: typeof fetch = fet
           subject: message.subject,
           text: message.text,
           html: message.html,
-          headers: message.headers
+          headers: message.headers,
+          ...(message.attachments?.length
+            ? {
+              attachments: message.attachments.map((item) => ({
+                filename: item.filename,
+                content: Buffer.from(item.content, "utf8").toString("base64"),
+                content_type: item.contentType
+              }))
+            }
+            : {})
         }),
         signal: AbortSignal.timeout(20000)
       });

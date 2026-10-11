@@ -30,7 +30,7 @@ export function installPluginAuth(app: Express, baseUrl: string, supabaseUrl: st
 <details id="passwordLogin" hidden><summary>Sign in with email and password</summary><form id="passwordForm"><label>Email<input id="loginEmail" type="email" required autocomplete="username"></label><label>Password<input id="loginPassword" type="password" required autocomplete="current-password"></label><button>Sign in</button></form><small>For existing email and password accounts, including a review account. Google sign-in remains available above.</small></details>
 <section id="consent" class="card" hidden><h2 id="client"></h2><p>This application will be able to:</p>
 <ul><li>Save reminders and follow-ups you ask for, and read the ones already on your account.</li><li>Email only the verified address on this account when a reminder is due.</li><li>Read your account email and subscription status.</li></ul>
-<p>Fillip does not take a recipient from the chat. Billing changes are not available through the reminder tools. The trial is 14 days, then Pro. Checkout shows the plan terms.</p>
+<p>Fillip does not take a recipient from the chat. Billing changes are not available through the reminder tools. A free plan does not expire. The trial is 14 days, then Pro. If you do not continue, you stay on the free plan. Checkout shows the plan terms.</p>
 <small id="destination"></small><small id="scopes"></small>
 <button id="approve">Connect</button><button id="deny" class="secondary">Cancel</button></section>
 <section id="connections" hidden><p>You can disconnect an application at any time.</p><div id="grants"></div></section>

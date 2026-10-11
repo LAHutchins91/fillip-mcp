@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { ClaimResult, Delivery, DigestSettings, OwnerContact, OwnerIdentity, Reminder, ReminderStatus } from "./types.js";
+import type { ClaimResult, Delivery, DeliveryChannel, DigestSettings, OwnerContact, OwnerIdentity, Reminder, ReminderStatus } from "./types.js";
 
 export type ListQuery = { status?: ReminderStatus | "all" };
 
@@ -16,6 +16,10 @@ export interface ReminderStore {
   saveDigest(settings: DigestSettings): Promise<void>;
   deleteOwnerData(ownerId: string): Promise<void>;
   getUsage(ownerId: string): Promise<OwnerContact | null>;
+  setDefaultChannel(ownerId: string, channel: DeliveryChannel): Promise<void>;
+  beginTelegramLink(ownerId: string, token: string, expiresIso: string): Promise<void>;
+  unlinkTelegram(ownerId: string): Promise<void>;
+  setCalendarToken(ownerId: string, token: string): Promise<void>;
 }
 
 export interface ServiceStore extends ReminderStore {
@@ -28,9 +32,12 @@ export interface ServiceStore extends ReminderStore {
     dedupeKey: string;
     occurrenceAt: string;
     idempotencyKey: string;
+    channel: "email" | "telegram";
     nowIso: string;
     staleBeforeIso: string;
   }): Promise<ClaimResult>;
+  ownerIdForCalendarToken(token: string): Promise<string | null>;
+  claimTelegramLink(token: string, chatId: string, nowIso: string): Promise<string | null>;
   saveDelivery(delivery: Delivery): Promise<void>;
   countSentSince(ownerId: string, sinceIso: string): Promise<number>;
   countAllSentSince(sinceIso: string): Promise<number>;

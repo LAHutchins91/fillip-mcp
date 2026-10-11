@@ -4,6 +4,7 @@ import { createResendSender, ProviderQuotaError, type MailSender, type OutboundE
 import { MemoryFillipStore } from "../src/lib/memory-store.js";
 import { followUp, saveDigestSettings, setReminder } from "../src/lib/reminders.js";
 import { verifyStopToken } from "../src/lib/stop-token.js";
+import type { TelegramSender } from "../src/lib/telegram.js";
 import type { Actor, Delivery } from "../src/lib/types.js";
 import { nextMonthStart, type TierCaps } from "../src/lib/usage.js";
 
@@ -34,7 +35,15 @@ class RecordingSender implements MailSender {
   }
 }
 
-function job(store: MemoryFillipStore, sender: RecordingSender, now: Date, limits?: { maxEmailsPerUserPerDay?: number; maxSends?: number; minIntervalMs?: number; caps?: TierCaps; global?: GlobalEmailLimits; sleep?: (ms: number) => Promise<void>; warn?: (message: string) => void }) {
+class RecordingTelegram implements TelegramSender {
+  sent: Array<{ chatId: string; text: string }> = [];
+  async send(chatId: string, text: string) {
+    this.sent.push({ chatId, text });
+    return { id: `tg_${this.sent.length}` };
+  }
+}
+
+function job(store: MemoryFillipStore, sender: RecordingSender, now: Date, limits?: { maxEmailsPerUserPerDay?: number; maxSends?: number; minIntervalMs?: number; caps?: TierCaps; global?: GlobalEmailLimits; sleep?: (ms: number) => Promise<void>; warn?: (message: string) => void; telegram?: { sender: TelegramSender } | null }) {
   return runDueJob({
     store,
     sender,
@@ -48,7 +57,8 @@ function job(store: MemoryFillipStore, sender: RecordingSender, now: Date, limit
     caps: limits?.caps ?? openCaps,
     global: limits?.global ?? openGlobal,
     warn: limits?.warn,
-    sleep: limits?.sleep
+    sleep: limits?.sleep,
+    telegram: limits?.telegram
   });
 }
 
@@ -378,6 +388,78 @@ describe("due reminder job", () => {
     expect(store.reminders[0]?.status).toBe("active");
     expect(warnings.join("\n")).toMatch(/not set/);
   });
+
+  it("says a held reminder was delayed and attaches a timezone calendar file", async () => {
+    const store = new MemoryFillipStore();
+    const created = await setReminder(store, actor, {
+      what: "Weekly standup",
+      when: "every Monday 9am",
+      timezone: "America/New_York"
+    }, new Date("2026-10-11T12:00:00.000Z"));
+    const row = store.reminders.find((item) => item.id === created.id);
+    if (!row) throw new Error("missing reminder");
+    const now = new Date("2026-10-12T16:00:00.000Z");
+    row.fireAt = new Date(now.getTime() - 3 * 60 * 60 * 1000).toISOString();
+    row.holdUntil = new Date(now.getTime() - 1000).toISOString();
+    const sender = new RecordingSender();
+    const report = await job(store, sender, now);
+    expect(report.sent).toBe(1);
+    const message = sender.sent[0];
+    expect(message?.text).toMatch(/It is 3 hours late because sending was held/);
+    expect(message?.text).not.toMatch(/\$\d/);
+    const file = message?.attachments?.[0];
+    expect(file?.filename).toBe("fillip.ics");
+    expect(file?.contentType).toBe("text/calendar");
+    expect(file?.content).toMatch(/TZID=America\/New_York/);
+    expect(file?.content).toMatch(/DTSTART;TZID=America\/New_York:/);
+    expect(file?.content).toMatch(/RRULE:FREQ=WEEKLY/);
+    expect(file?.content).toMatch(/BEGIN:VTIMEZONE/);
+  });
+
+  it("sends Telegram while the email guard is closed and stops after unlink", async () => {
+    const store = new MemoryFillipStore();
+    const createdAt = new Date("2026-10-11T12:00:00.000Z");
+    const now = new Date("2026-10-11T16:00:00.000Z");
+    await setReminder(store, actor, {
+      what: "Ping the chat",
+      when: "in 1 hour",
+      timezone: "UTC",
+      channel: "telegram"
+    }, createdAt, openCaps, true);
+    const contact = store.contacts.get(actor.id);
+    if (!contact) throw new Error("missing contact");
+    contact.telegramChatId = "4242";
+    const sender = new RecordingSender();
+    const telegram = new RecordingTelegram();
+    const report = await job(store, sender, now, {
+      global: { perDay: 0, perMonth: 0 },
+      telegram: { sender: telegram }
+    });
+    expect(sender.sent).toHaveLength(0);
+    expect(telegram.sent).toHaveLength(1);
+    expect(telegram.sent[0]?.chatId).toBe("4242");
+    expect(telegram.sent[0]?.text).toMatch(/Ping the chat/);
+    expect(report.global.daySent).toBe(0);
+    expect(store.deliveries.filter((row) => row.channel === "telegram" && row.status === "sent")).toHaveLength(1);
+    expect(store.contacts.get(actor.id)?.emailsSentInPeriod).toBe(1);
+
+    await setReminder(store, actor, {
+      what: "After unlink",
+      when: "in 1 hour",
+      timezone: "UTC",
+      channel: "telegram"
+    }, now, openCaps, true);
+    await store.unlinkTelegram(actor.id);
+    const later = new Date(now.getTime() + 2 * 60 * 60 * 1000);
+    const again = await job(store, sender, later, {
+      global: { perDay: 0, perMonth: 0 },
+      telegram: { sender: telegram }
+    });
+    expect(again.sent).toBe(0);
+    expect(telegram.sent).toHaveLength(1);
+    expect(store.reminders.find((row) => row.what === "After unlink")?.status).toBe("active");
+    expect(await store.countAllSentSince("2020-01-01T00:00:00.000Z")).toBe(0);
+  });
 });
 
 function sentDelivery(ownerId: string, reminderId: string | null, sentAt: string): Delivery {
@@ -390,6 +472,7 @@ function sentDelivery(ownerId: string, reminderId: string | null, sentAt: string
     occurrenceAt: sentAt,
     status: "sent",
     idempotencyKey: key,
+    channel: "email",
     providerId: "email_prior",
     startedAt: sentAt,
     sentAt,

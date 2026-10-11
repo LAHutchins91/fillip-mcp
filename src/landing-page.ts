@@ -7,7 +7,7 @@ export function renderLanding(input: { appBaseUrl: string; connectLead: string; 
 <h1>Fillip, reminders that fire.</h1>
 <p>Remind me to follow up on this next Tuesday at 2pm, and actually ping me. Fillip emails you when that reminder is due, even if your laptop is off. It works from ChatGPT, Claude, Cursor, and Grok.</p>
 ${input.connectLead}
-<p>The trial is 14 days, then Pro. Checkout shows the plan terms. This page does not print a price.</p>
+<p>A free plan does not expire. The trial is 14 days, then Pro. If you do not continue, you stay on the free plan. Checkout shows the plan terms. This page does not print a price.</p>
 <button id="monthly" type="button">Start the 14-day trial</button>
 <button id="annual" class="secondary" type="button">Pro yearly</button>
 <button id="portal" class="secondary" type="button">Manage billing</button>

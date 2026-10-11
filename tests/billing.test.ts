@@ -69,11 +69,12 @@ describe("billing webhook filter", () => {
     expect(action.patch.plan).toBe("annual");
   });
 
-  it("drops access when the Fillip subscription is no longer entitled", () => {
+  it("moves a Fillip subscription that is no longer entitled onto the free plan", () => {
     const action = decideBillingAction({ ...subscription({ status: "canceled" }), type: "customer.subscription.deleted" }, config);
     expect(action.type).toBe("subscription");
     if (action.type !== "subscription") return;
-    expect(action.patch.plan).toBe("none");
+    expect(action.patch.plan).toBe("free");
+    expect(action.patch.subscription_status).toBe("canceled");
   });
 
   it("ignores checkout completed for another product", () => {

@@ -15,6 +15,8 @@ import { nextMonthStart, tierCapsFromEnv, usageCapsConfigured } from "./lib/usag
 import { globalEmailLimitsFromEnv, nextUtcDay, readGlobalEmailSnapshot, runDueJob, type GlobalEmailSnapshot } from "./lib/deliver.js";
 import { createResendSender } from "./lib/email.js";
 import { publicError } from "./lib/errors.js";
+import { renderCalendarFeed } from "./lib/reminders.js";
+import { acceptTelegramUpdate, createTelegramSender, telegramConfigured } from "./lib/telegram.js";
 import { FileFillipStore } from "./lib/file-store.js";
 import { MemoryFillipStore } from "./lib/memory-store.js";
 import { verifyStopToken } from "./lib/stop-token.js";
@@ -139,14 +141,13 @@ function actorFromUser(user: AuthUser): Actor {
   return { id: user.id, email: user.email ?? null, emailVerified: Boolean(user.email_confirmed_at) };
 }
 
-async function subscriptionState(userId: string, token: string): Promise<"ok" | "inactive" | "error"> {
+async function subscriptionState(userId: string, token: string): Promise<"ok" | "error"> {
   try {
-    const profiles = await supabaseRequest<Array<{ subscription_status: string }>>(
+    await supabaseRequest<Array<{ subscription_status: string }>>(
       `/rest/v1/profiles?id=eq.${encodeURIComponent(userId)}&select=subscription_status`,
       {},
       token
     );
-    if (!profiles[0] || !["active", "trialing"].includes(profiles[0].subscription_status)) return "inactive";
     return "ok";
   } catch {
     return "error";
@@ -291,6 +292,7 @@ app.get("/health", async (_req, res) => {
     usageCapsConfigured: usageCapsConfigured(),
     resendConfigured: Boolean(envValue("RESEND_API_KEY")),
     senderConfigured: Boolean(envValue("FILLIP_FROM_EMAIL")),
+    telegramConfigured: telegramConfigured(),
     globalEmails: {
       daySent,
       dayLimit: limits.perDay,
@@ -407,7 +409,8 @@ async function deliver(req: Request, res: Response) {
       maxSends: intEnv("FILLIP_MAX_SENDS_PER_RUN", 40),
       minIntervalMs: intEnv("FILLIP_RESEND_MIN_INTERVAL_MS", 500),
       caps: tierCapsFromEnv(),
-      global: globalEmailLimitsFromEnv()
+      global: globalEmailLimitsFromEnv(),
+      telegram: envValue("TELEGRAM_BOT_TOKEN") ? { sender: createTelegramSender(envValue("TELEGRAM_BOT_TOKEN")) } : null
     });
     res.json(report);
   } catch (error) {
@@ -419,6 +422,37 @@ async function deliver(req: Request, res: Response) {
 
 app.get("/internal/deliver", deliver);
 app.post("/internal/deliver", deliver);
+
+app.get("/calendar/:token", async (req, res) => {
+  const raw = String(req.params.token ?? "").replace(/\.ics$/i, "");
+  if (raw.length < 20) return res.status(404).type("text").send("Not found");
+  try {
+    const body = await renderCalendarFeed(createServiceStore(), raw, new Date());
+    if (!body) return res.status(404).type("text").send("Not found");
+    res.set("Cache-Control", "private, no-store");
+    res.type("text/calendar; charset=utf-8").send(body);
+  } catch {
+    res.status(503).type("text").send("Calendar feed is unavailable.");
+  }
+});
+
+app.post("/telegram/webhook", async (req, res) => {
+  const token = envValue("TELEGRAM_BOT_TOKEN");
+  if (!token) return res.status(404).type("text").send("Not found");
+  const secret = envValue("TELEGRAM_WEBHOOK_SECRET");
+  const header = req.header("x-telegram-bot-api-secret-token") ?? "";
+  if (!secret || !safeEqual(header, secret)) return res.status(401).type("text").send("Unauthorized");
+  try {
+    const store = createServiceStore();
+    const result = await acceptTelegramUpdate(store, req.body ?? {}, new Date());
+    if (result.replyChatId && result.replyText) {
+      await createTelegramSender(token).send(result.replyChatId, result.replyText);
+    }
+    res.json({ ok: true });
+  } catch {
+    res.status(503).json({ error: "Telegram update could not be processed." });
+  }
+});
 
 function guardMcpOrigin(req: Request, res: Response) {
   const origin = req.header("origin");
@@ -454,8 +488,7 @@ app.post("/mcp", ensureStreamableHttpAccept, async (req, res) => {
     }
     try {
       const state = await subscriptionState(actor.id, bearer(req));
-      if (state === "error") return res.status(503).json({ error: "Could not verify your subscription. Please retry." });
-      if (state !== "ok") return res.status(403).json({ error: "This Fillip account does not currently include reminders. The trial is 14 days, then Pro.", access_information: `${appBaseUrl()}/access` });
+      if (state === "error") return res.status(503).json({ error: "Could not verify your account. Please retry." });
     } catch {
       return res.status(503).json({ error: "Could not verify your subscription. Please retry." });
     }

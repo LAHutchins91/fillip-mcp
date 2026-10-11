@@ -17,7 +17,7 @@ export type BillingConfig = {
 };
 
 export type ProfilePatch = {
-  plan: "pro" | "annual" | "none";
+  plan: "pro" | "annual" | "free";
   stripe_customer_id: string | null;
   stripe_subscription_id: string | null;
   subscription_status: string;
@@ -115,7 +115,7 @@ export function decideBillingAction(event: StripeEvent, config: BillingConfig): 
     if (!userId) return { type: "ignore", reason: "missing user" };
     const status = typeof object.status === "string" ? object.status : "unknown";
     const entitled = status === "active" || status === "trialing";
-    const plan = !entitled ? "none" : priceId === config.yearlyPriceId ? "annual" : "pro";
+    const plan = !entitled ? "free" : priceId === config.yearlyPriceId ? "annual" : "pro";
     const periodEnd = typeof object.current_period_end === "number" ? new Date(object.current_period_end * 1000).toISOString() : null;
     return {
       type: "subscription",

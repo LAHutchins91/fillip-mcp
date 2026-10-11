@@ -1,7 +1,20 @@
+export type RecurrenceEnd = {
+  /** Exclusive instant. The next occurrence at or after this is not scheduled. */
+  until: string | null;
+  count: number | null;
+  completed: number;
+};
+
 export type Recurrence =
-  | { kind: "daily"; hour: number; minute: number }
-  | { kind: "weekdays"; hour: number; minute: number }
-  | { kind: "weekly"; weekday: number; hour: number; minute: number };
+  | { kind: "daily"; hour: number; minute: number; ends?: RecurrenceEnd }
+  | { kind: "weekdays"; hour: number; minute: number; ends?: RecurrenceEnd }
+  | { kind: "weekly"; weekday: number; hour: number; minute: number; ends?: RecurrenceEnd }
+  | { kind: "every_n_days"; interval: number; hour: number; minute: number; anchor: string; ends?: RecurrenceEnd }
+  | { kind: "every_n_weeks"; interval: number; weekday: number; hour: number; minute: number; anchor: string; ends?: RecurrenceEnd }
+  | { kind: "monthly_date"; day: number; hour: number; minute: number; ends?: RecurrenceEnd }
+  | { kind: "monthly_nth"; nth: number; weekday: number; hour: number; minute: number; ends?: RecurrenceEnd };
+
+export type DeliveryChannel = "email" | "telegram" | "both";
 
 export type ReminderStatus = "active" | "fired" | "completed" | "cancelled" | "paused";
 export type ReminderKind = "reminder" | "follow_up";
@@ -15,6 +28,7 @@ export type Reminder = {
   timezone: string;
   fireAt: string;
   recurrence: Recurrence | null;
+  channel: DeliveryChannel;
   status: ReminderStatus;
   holdUntil: string | null;
   createdAt: string;
@@ -32,6 +46,7 @@ export type Delivery = {
   occurrenceAt: string;
   status: DeliveryStatus;
   idempotencyKey: string;
+  channel: "email" | "telegram";
   providerId: string | null;
   startedAt: string;
   sentAt: string | null;
@@ -48,7 +63,7 @@ export type DigestSettings = {
   updatedAt: string;
 };
 
-export type PlanName = "none" | "pro" | "annual";
+export type PlanName = "none" | "free" | "pro" | "annual";
 
 export type OwnerContact = {
   id: string;
@@ -59,6 +74,11 @@ export type OwnerContact = {
   subscriptionStatus: string;
   emailsSentInPeriod: number;
   emailPeriodStart: string | null;
+  defaultChannel: DeliveryChannel;
+  telegramChatId: string | null;
+  telegramLinkToken: string | null;
+  telegramLinkExpires: string | null;
+  calendarToken: string | null;
 };
 
 /** Identity written when someone opts in. Plan and the monthly counter stay on the stored contact. */

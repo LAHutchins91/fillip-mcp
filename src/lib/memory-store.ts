@@ -1,4 +1,4 @@
-import type { ClaimResult, Delivery, DigestSettings, OwnerContact, OwnerIdentity, Reminder, ReminderStatus } from "./types.js";
+import type { ClaimResult, Delivery, DeliveryChannel, DigestSettings, OwnerContact, OwnerIdentity, Reminder, ReminderStatus } from "./types.js";
 import type { ListQuery, ServiceStore } from "./store.js";
 import { blankContact } from "./usage.js";
 
@@ -78,6 +78,36 @@ export class MemoryFillipStore implements ServiceStore {
     return this.contacts.get(ownerId) ?? null;
   }
 
+  async setDefaultChannel(ownerId: string, channel: DeliveryChannel): Promise<void> {
+    const existing = this.contacts.get(ownerId) ?? blankContact(ownerId);
+    this.contacts.set(ownerId, { ...existing, defaultChannel: channel });
+  }
+
+  async beginTelegramLink(ownerId: string, token: string, expiresIso: string): Promise<void> {
+    const existing = this.contacts.get(ownerId) ?? blankContact(ownerId);
+    this.contacts.set(ownerId, { ...existing, telegramLinkToken: token, telegramLinkExpires: expiresIso });
+  }
+
+  async unlinkTelegram(ownerId: string): Promise<void> {
+    const existing = this.contacts.get(ownerId) ?? blankContact(ownerId);
+    const defaultChannel = existing.defaultChannel === "email" ? "email" : "email";
+    this.contacts.set(ownerId, {
+      ...existing,
+      telegramChatId: null,
+      telegramLinkToken: null,
+      telegramLinkExpires: null,
+      defaultChannel
+    });
+  }
+
+  async setCalendarToken(ownerId: string, token: string): Promise<void> {
+    for (const [id, contact] of this.contacts) {
+      if (id !== ownerId && contact.calendarToken === token) throw new Error("Fillip could not complete this request. Your reminder may not have been saved.");
+    }
+    const existing = this.contacts.get(ownerId) ?? blankContact(ownerId);
+    this.contacts.set(ownerId, { ...existing, calendarToken: token });
+  }
+
   async saveUsage(ownerId: string, usage: { emailsSentInPeriod: number; emailPeriodStart: string }): Promise<void> {
     const existing = this.contacts.get(ownerId) ?? blankContact(ownerId);
     this.contacts.set(ownerId, {
@@ -104,6 +134,7 @@ export class MemoryFillipStore implements ServiceStore {
     dedupeKey: string;
     occurrenceAt: string;
     idempotencyKey: string;
+    channel: "email" | "telegram";
     nowIso: string;
     staleBeforeIso: string;
   }): Promise<ClaimResult> {
@@ -117,6 +148,7 @@ export class MemoryFillipStore implements ServiceStore {
         occurrenceAt: input.occurrenceAt,
         status: "sending",
         idempotencyKey: input.idempotencyKey,
+        channel: input.channel,
         providerId: null,
         startedAt: input.nowIso,
         sentAt: null,
@@ -147,7 +179,24 @@ export class MemoryFillipStore implements ServiceStore {
   }
 
   async countAllSentSince(sinceIso: string): Promise<number> {
-    return this.deliveries.filter((row) => row.status === "sent" && (row.sentAt ?? "") >= sinceIso).length;
+    return this.deliveries.filter((row) => row.status === "sent" && row.channel !== "telegram" && (row.sentAt ?? "") >= sinceIso).length;
+  }
+
+  async ownerIdForCalendarToken(token: string): Promise<string | null> {
+    for (const [id, contact] of this.contacts) {
+      if (contact.calendarToken === token) return id;
+    }
+    return null;
+  }
+
+  async claimTelegramLink(token: string, chatId: string, nowIso: string): Promise<string | null> {
+    for (const [id, contact] of this.contacts) {
+      if (contact.telegramLinkToken !== token) continue;
+      if (!contact.telegramLinkExpires || contact.telegramLinkExpires <= nowIso) return null;
+      this.contacts.set(id, { ...contact, telegramChatId: chatId, telegramLinkToken: null, telegramLinkExpires: null });
+      return id;
+    }
+    return null;
   }
 
   async getProviderBackoffUntil(): Promise<string | null> {

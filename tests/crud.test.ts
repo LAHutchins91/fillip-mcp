@@ -3,7 +3,7 @@ import { MemoryFillipStore } from "../src/lib/memory-store.js";
 import { completeOrCancel, followUp, listReminders, saveDigestSettings, setReminder, snoozeOrReschedule } from "../src/lib/reminders.js";
 import { WhenError } from "../src/lib/time.js";
 import { MAX_ACTIVE_REMINDERS, type Actor, type Reminder } from "../src/lib/types.js";
-import { ALLOWANCE_REACHED, monthStart } from "../src/lib/usage.js";
+import { ALLOWANCE_REACHED, freeOpenMessage, monthStart, tierCapsFromEnv, UPGRADE_PROMPT } from "../src/lib/usage.js";
 
 const now = new Date("2026-10-11T18:00:00.000Z");
 const actor: Actor = { id: "11111111-1111-4111-8111-111111111111", email: "owner@example.com", emailVerified: true };
@@ -117,6 +117,41 @@ describe("reminder CRUD", () => {
       timezone: "America/New_York"
     }, now, { trialEmailsPerMonth: 5, proEmailsPerMonth: 2, annualEmailsPerMonth: 9 })).rejects.toThrow(ALLOWANCE_REACHED);
     expect(store.reminders).toHaveLength(0);
+  });
+
+  it("keeps a free plan inside its open-reminder cap and says how to upgrade", async () => {
+    const store = storeWithActor();
+    await store.rememberOwner({
+      id: actor.id,
+      email: actor.email,
+      emailVerified: true,
+      plan: "free",
+      subscriptionStatus: "none"
+    });
+    const caps = { trialEmailsPerMonth: 30, proEmailsPerMonth: 60, annualEmailsPerMonth: 60, freeEmailsPerMonth: 30, freeOpenReminders: 2 };
+    await setReminder(store, actor, { what: "One", when: "tomorrow 9am", timezone: "UTC" }, now, caps);
+    await setReminder(store, actor, { what: "Two", when: "tomorrow 10am", timezone: "UTC" }, now, caps);
+    await expect(setReminder(store, actor, { what: "Three", when: "tomorrow 11am", timezone: "UTC" }, now, caps))
+      .rejects.toThrow(freeOpenMessage(2));
+    await expect(setReminder(store, actor, { what: "Three", when: "tomorrow 11am", timezone: "UTC" }, now, caps))
+      .rejects.toThrow(UPGRADE_PROMPT);
+    expect(tierCapsFromEnv({})).toMatchObject({ freeOpenReminders: 10, freeEmailsPerMonth: 30 });
+    expect(tierCapsFromEnv({ FILLIP_CAP_FREE_OPEN_REMINDERS: "4", FILLIP_CAP_FREE_EMAILS_PER_MONTH: "12" }))
+      .toMatchObject({ freeOpenReminders: 4, freeEmailsPerMonth: 12 });
+  });
+
+  it("shows a delayed state when a reminder is held past its due time", async () => {
+    const store = storeWithActor();
+    const created = await setReminder(store, actor, { what: "Held ping", when: "tomorrow 9am", timezone: "UTC" }, now);
+    const row = await store.getReminder(actor.id, created.id);
+    if (!row) throw new Error("missing reminder");
+    row.fireAt = new Date(now.getTime() - 3 * 60 * 60 * 1000).toISOString();
+    row.holdUntil = new Date(now.getTime() + 60 * 60 * 1000).toISOString();
+    await store.saveReminder(row);
+    const listed = await listReminders(store, actor.id, {}, now);
+    expect(listed[0]?.state).toBe("delayed");
+    expect(listed[0]?.delayed).toBe(true);
+    expect(listed[0]?.delay).toBe("3 hours");
   });
 
   it("saves and disables a daily summary", async () => {

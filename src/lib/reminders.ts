@@ -1,7 +1,9 @@
-import { newId, type ReminderStore } from "./store.js";
+import { calendarFeed } from "./ics.js";
+import { newId, type ReminderStore, type ServiceStore } from "./store.js";
+import { newSecretToken, telegramDeepLink, telegramUsername } from "./telegram.js";
 import { applyRepeat, describeRecurrence, nextFire, parseClock, recurrenceFromCadence, resolveWhen, type RepeatChoice, type ResolvedWhen } from "./time.js";
-import { MAX_ACTIVE_REMINDERS, MAX_CREATES_PER_HOUR, type Actor, type DigestSettings, type Reminder, type ReminderStatus } from "./types.js";
-import { assertWithinAllowance, STAND_IN_CAPS, type TierCaps } from "./usage.js";
+import { MAX_ACTIVE_REMINDERS, MAX_CREATES_PER_HOUR, type Actor, type DeliveryChannel, type DigestSettings, type Reminder, type ReminderStatus } from "./types.js";
+import { assertWithinAllowance, freeOpenMessage, freeOpenReminders, STAND_IN_CAPS, tierFor, type TierCaps } from "./usage.js";
 import { assertTimeZone, formatWhen, localDateKey, zonedParts } from "./zone.js";
 
 export type ReminderView = {
@@ -14,12 +16,34 @@ export type ReminderView = {
   fireAt: string;
   localTime: string;
   repeats: string;
+  channel: DeliveryChannel;
+  state: ReminderStatus | "delayed";
+  delayed: boolean;
+  delay: string | null;
   overdue: boolean;
   corrected: boolean;
   note: string | null;
 };
 
+export function formatDelay(ms: number): string {
+  const minutes = Math.max(1, Math.round(ms / 60000));
+  if (minutes < 60) return `${minutes} ${minutes === 1 ? "minute" : "minutes"}`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 36) return `${hours} ${hours === 1 ? "hour" : "hours"}`;
+  const days = Math.max(1, Math.round(hours / 24));
+  return `${days} ${days === 1 ? "day" : "days"}`;
+}
+
+export function delayLength(reminder: Pick<Reminder, "fireAt" | "holdUntil" | "status">, now: Date): string | null {
+  if (reminder.status !== "active" || !reminder.holdUntil) return null;
+  const late = now.getTime() - new Date(reminder.fireAt).getTime();
+  if (late < 60_000) return null;
+  return formatDelay(late);
+}
+
 function view(reminder: Reminder, now: Date, extra?: { corrected?: boolean; note?: string | null }): ReminderView {
+  const delay = delayLength(reminder, now);
+  const delayed = delay !== null;
   return {
     id: reminder.id,
     what: reminder.what,
@@ -30,13 +54,17 @@ function view(reminder: Reminder, now: Date, extra?: { corrected?: boolean; note
     fireAt: reminder.fireAt,
     localTime: formatWhen(new Date(reminder.fireAt), reminder.timezone),
     repeats: describeRecurrence(reminder.recurrence),
+    channel: reminder.channel ?? "email",
+    state: delayed ? "delayed" : reminder.status,
+    delayed,
+    delay,
     overdue: reminder.status === "active" && reminder.fireAt <= now.toISOString(),
     corrected: extra?.corrected ?? false,
     note: extra?.note ?? null
   };
 }
 
-async function gate(store: ReminderStore, actor: Actor, now: Date) {
+async function gate(store: ReminderStore, actor: Actor, now: Date, caps: TierCaps) {
   if (!actor.id || !actor.email || !actor.emailVerified) {
     throw new Error("A verified account email is required before Fillip can ping you.");
   }
@@ -44,14 +72,35 @@ async function gate(store: ReminderStore, actor: Actor, now: Date) {
   if (await store.countCreatedSince(actor.id, since) >= MAX_CREATES_PER_HOUR) {
     throw new Error("Too many reminders. Wait before setting another.");
   }
-  if (await store.countActive(actor.id) >= MAX_ACTIVE_REMINDERS) {
-    throw new Error("Too many reminders are still open. Complete or cancel one first.");
-  }
   await store.rememberOwner({ id: actor.id, email: actor.email, emailVerified: true, unsubscribed: false });
   await store.setMailOptIn(actor.id, true);
+  const usage = await store.getUsage(actor.id);
+  const tier = tierFor(usage?.plan, usage?.subscriptionStatus);
+  const openCap = tier === "free" ? freeOpenReminders(caps) : MAX_ACTIVE_REMINDERS;
+  if (await store.countActive(actor.id) >= openCap) {
+    throw new Error(tier === "free" ? freeOpenMessage(openCap) : "Too many reminders are still open. Complete or cancel one first.");
+  }
 }
 
-function stamp(actor: Actor, what: string, context: string | null, timezone: string, resolved: ResolvedWhen, kind: Reminder["kind"], now: Date): Reminder {
+function channelNote(channel: DeliveryChannel): string {
+  if (channel === "telegram") return "Fillip will ping your linked Telegram chat.";
+  if (channel === "both") return "Fillip will email the verified address on this account and ping your linked Telegram chat.";
+  return "Fillip will email the verified address on this account.";
+}
+
+function followNote(channel: DeliveryChannel, repeats: string): string {
+  if (channel === "telegram") return `Fillip will keep pinging your Telegram chat ${repeats} until you mark it done.`;
+  if (channel === "both") return `Fillip will keep emailing you and pinging Telegram ${repeats} until you mark it done.`;
+  return `Fillip will keep emailing you ${repeats} until you mark it done.`;
+}
+
+function chosenChannel(input: DeliveryChannel | undefined, fallback: DeliveryChannel | undefined, telegramEnabled: boolean): DeliveryChannel {
+  const channel = input ?? fallback ?? "email";
+  if (!telegramEnabled && channel !== "email") throw new Error("Telegram is not offered on this Fillip.");
+  return channel;
+}
+
+function stamp(actor: Actor, what: string, context: string | null, timezone: string, resolved: ResolvedWhen, kind: Reminder["kind"], channel: DeliveryChannel, now: Date): Reminder {
   return {
     id: newId(),
     ownerId: actor.id,
@@ -61,6 +110,7 @@ function stamp(actor: Actor, what: string, context: string | null, timezone: str
     timezone,
     fireAt: resolved.fireAt.toISOString(),
     recurrence: resolved.recurrence,
+    channel,
     status: "active",
     holdUntil: null,
     createdAt: now.toISOString(),
@@ -75,12 +125,15 @@ export async function setReminder(store: ReminderStore, actor: Actor, input: {
   timezone: string;
   repeat?: RepeatChoice;
   context?: string | null;
-}, now: Date, caps: TierCaps = STAND_IN_CAPS): Promise<ReminderView> {
-  await gate(store, actor, now);
+  channel?: DeliveryChannel;
+}, now: Date, caps: TierCaps = STAND_IN_CAPS, telegramEnabled = false): Promise<ReminderView> {
+  await gate(store, actor, now, caps);
   await assertWithinAllowance(store, actor.id, now, caps);
+  const usage = await store.getUsage(actor.id);
+  const channel = chosenChannel(input.channel, usage?.defaultChannel, telegramEnabled);
   const resolved = applyRepeat(resolveWhen(input.when, input.timezone, now), input.repeat, input.timezone);
-  const reminder = await store.createReminder(stamp(actor, input.what, input.context ?? null, input.timezone, resolved, "reminder", now));
-  const note = [resolved.note, "Fillip will email the verified address on this account."].filter(Boolean).join(" ");
+  const reminder = await store.createReminder(stamp(actor, input.what, input.context ?? null, input.timezone, resolved, "reminder", channel, now));
+  const note = [resolved.note, channelNote(channel)].filter(Boolean).join(" ");
   return view(reminder, now, { corrected: resolved.corrected, note });
 }
 
@@ -145,17 +198,22 @@ export async function followUp(store: ReminderStore, actor: Actor, input: {
   cadence?: string;
   timezone: string;
   context?: string | null;
-}, now: Date, caps: TierCaps = STAND_IN_CAPS): Promise<ReminderView> {
-  await gate(store, actor, now);
+  channel?: DeliveryChannel;
+}, now: Date, caps: TierCaps = STAND_IN_CAPS, telegramEnabled = false): Promise<ReminderView> {
+  await gate(store, actor, now, caps);
   await assertWithinAllowance(store, actor.id, now, caps);
   if (!input.after && !input.cadence) throw new Error("Follow-ups need a first time or a cadence, such as next Tuesday at 2pm.");
+  const usage = await store.getUsage(actor.id);
+  const channel = chosenChannel(input.channel, usage?.defaultChannel, telegramEnabled);
   let first: ResolvedWhen;
   if (input.after) {
     first = resolveWhen(input.after, input.timezone, now);
     if (input.cadence) first = { ...first, recurrence: recurrenceFromCadence(input.cadence, input.timezone, now) };
   } else {
     const recurrence = recurrenceFromCadence(input.cadence ?? "", input.timezone, now);
-    first = { fireAt: nextFire(recurrence, input.timezone, now), recurrence, corrected: false, note: null };
+    const fireAt = nextFire(recurrence, input.timezone, now);
+    if (!fireAt) throw new Error("That repeating reminder has already ended.");
+    first = { fireAt, recurrence, corrected: false, note: null };
   }
   if (!first.recurrence) {
     const parts = zonedParts(first.fireAt, input.timezone);
@@ -164,8 +222,8 @@ export async function followUp(store: ReminderStore, actor: Actor, input: {
       recurrence: { kind: "weekly", weekday: parts.weekday, hour: parts.hour, minute: parts.minute }
     };
   }
-  const reminder = await store.createReminder(stamp(actor, input.topic, input.context ?? null, input.timezone, first, "follow_up", now));
-  const note = [first.note, `Fillip will keep emailing you ${describeRecurrence(reminder.recurrence)} until you mark it done.`].filter(Boolean).join(" ");
+  const reminder = await store.createReminder(stamp(actor, input.topic, input.context ?? null, input.timezone, first, "follow_up", channel, now));
+  const note = [first.note, followNote(channel, describeRecurrence(reminder.recurrence))].filter(Boolean).join(" ");
   return view(reminder, now, { corrected: first.corrected, note });
 }
 
@@ -207,4 +265,72 @@ export async function saveDigestSettings(store: ReminderStore, actor: Actor, inp
     ? "Fillip will email you one daily summary. It goes only to the verified address on this account."
     : "Daily summary is off. Individual reminders still email you until you stop them.";
   return { ...settings, note };
+}
+
+const LINK_MS = 30 * 60 * 1000;
+
+export async function calendarLink(store: ReminderStore, actor: Actor, action: "get" | "rotate", appBaseUrl: string): Promise<{ url: string; rotated: boolean; note: string }> {
+  if (!actor.id) throw new Error("A verified account email is required before Fillip can ping you.");
+  await store.rememberOwner({ id: actor.id, email: actor.email, emailVerified: actor.emailVerified, unsubscribed: false });
+  const existing = await store.getUsage(actor.id);
+  let token = existing?.calendarToken ?? null;
+  let rotated = false;
+  if (action === "rotate" || !token) {
+    token = newSecretToken();
+    await store.setCalendarToken(actor.id, token);
+    rotated = action === "rotate";
+  }
+  const url = `${appBaseUrl.replace(/\/$/, "")}/calendar/${token}.ics`;
+  return {
+    url,
+    rotated,
+    note: rotated
+      ? "The previous calendar link no longer works. Subscribe to this one in Google, Apple, or Outlook."
+      : "Subscribe to this private link in Google, Apple, or Outlook. It lists your active Fillip reminders. Rotate it if the link leaks."
+  };
+}
+
+export async function renderCalendarFeed(store: ServiceStore, token: string, now: Date): Promise<string | null> {
+  const ownerId = await store.ownerIdForCalendarToken(token);
+  if (!ownerId) return null;
+  const reminders = await store.listReminders(ownerId, { status: "active" });
+  return calendarFeed(reminders, now);
+}
+
+export async function deliverySettings(store: ReminderStore, actor: Actor, input: {
+  action: "status" | "link_telegram" | "unlink_telegram" | "set_default";
+  channel?: DeliveryChannel;
+}, now: Date, env: NodeJS.ProcessEnv = process.env, fetchImpl: typeof fetch = fetch): Promise<Record<string, unknown>> {
+  if (!actor.id || !actor.email || !actor.emailVerified) throw new Error("A verified account email is required before Fillip can ping you.");
+  await store.rememberOwner({ id: actor.id, email: actor.email, emailVerified: true, unsubscribed: false });
+  if (input.action === "unlink_telegram") {
+    await store.unlinkTelegram(actor.id);
+    return { linked: false, defaultChannel: "email", note: "Telegram is unlinked. Fillip will not ping that chat." };
+  }
+  if (input.action === "set_default") {
+    if (!input.channel) throw new Error("Choose email, Telegram, or both.");
+    if (input.channel !== "email" && !env.TELEGRAM_BOT_TOKEN?.trim()) throw new Error("Telegram is not offered on this Fillip.");
+    const usage = await store.getUsage(actor.id);
+    if (input.channel !== "email" && !usage?.telegramChatId) throw new Error("Telegram is not linked. Ask Fillip for a link first.");
+    await store.setDefaultChannel(actor.id, input.channel);
+    return { defaultChannel: input.channel, note: `Fillip will use ${input.channel} unless a reminder says otherwise.` };
+  }
+  if (input.action === "link_telegram") {
+    if (!env.TELEGRAM_BOT_TOKEN?.trim()) throw new Error("Telegram is not offered on this Fillip.");
+    const token = newSecretToken();
+    const expires = new Date(now.getTime() + LINK_MS).toISOString();
+    await store.beginTelegramLink(actor.id, token, expires);
+    const username = await telegramUsername(env, fetchImpl);
+    return {
+      url: telegramDeepLink(username, token),
+      expires,
+      note: "Open this link, then press Start in Telegram. It expires in 30 minutes. Fillip pings only this chat after you do."
+    };
+  }
+  const usage = await store.getUsage(actor.id);
+  return {
+    defaultChannel: usage?.defaultChannel ?? "email",
+    telegramLinked: Boolean(usage?.telegramChatId),
+    note: usage?.telegramChatId ? "Telegram is linked." : "Telegram is not linked."
+  };
 }

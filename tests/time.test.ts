@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { WhenError, resolveWhen } from "../src/lib/time.js";
+import { advanceSeries, nextFire, WhenError, resolveWhen } from "../src/lib/time.js";
 import { zonedParts, zonedTimeToUtc } from "../src/lib/zone.js";
 
 const zone = "America/New_York";
@@ -112,5 +112,57 @@ describe("past and wrong-year guards", () => {
 
   it("rejects a year more than one year out", () => {
     expect(() => resolveWhen("March 3, 2030 at 8am", zone, now)).toThrow(/That year \(2030\)/);
+  });
+
+  it("reads the first Monday of every month", () => {
+    const resolved = resolveWhen("first Monday of every month", zone, now);
+    expect(resolved.recurrence).toMatchObject({ kind: "monthly_nth", nth: 1, weekday: 1, hour: 9, minute: 0 });
+    expectParts(resolved.fireAt, { year: 2026, month: 11, day: 2, hour: 9, minute: 0 });
+  });
+
+  it("reads a monthly date", () => {
+    const resolved = resolveWhen("the 15th of every month", zone, now);
+    expect(resolved.recurrence).toMatchObject({ kind: "monthly_date", day: 15, hour: 9, minute: 0 });
+    expectParts(resolved.fireAt, { year: 2026, month: 10, day: 15, hour: 9, minute: 0 });
+  });
+
+  it("reads every N days and every N weeks until a month", () => {
+    const days = resolveWhen("every 3 days", zone, now);
+    expect(days.recurrence).toMatchObject({ kind: "every_n_days", interval: 3, hour: 9, minute: 0 });
+    expectParts(days.fireAt, { year: 2026, month: 10, day: 12, hour: 9, minute: 0 });
+
+    const weeks = resolveWhen("every 2 weeks until Dec", zone, now);
+    expect(weeks.recurrence).toMatchObject({
+      kind: "every_n_weeks",
+      interval: 2,
+      weekday: 1,
+      hour: 9,
+      minute: 0,
+      ends: { until: "2027-01-01T05:00:00.000Z", count: null, completed: 0 }
+    });
+    expectParts(weeks.fireAt, { year: 2026, month: 10, day: 12, hour: 9, minute: 0 });
+  });
+
+  it("stops a series on a count and refuses an end date on a one-shot", () => {
+    const counted = resolveWhen("every weekday 9am for 4 times", zone, now);
+    expect(counted.recurrence?.ends).toEqual({ until: null, count: 4, completed: 0 });
+    expect(() => resolveWhen("tomorrow 9am until Dec", zone, now)).toThrow(/end date needs a repeating reminder/);
+    const ended = {
+      kind: "every_n_days" as const,
+      interval: 1,
+      hour: 9,
+      minute: 0,
+      anchor: "2026-10-12T13:00:00.000Z",
+      ends: { until: "2026-10-12T13:00:00.000Z", count: null, completed: 0 }
+    };
+    expect(nextFire(ended, zone, now)).toBeNull();
+    const series = advanceSeries({
+      kind: "daily",
+      hour: 9,
+      minute: 0,
+      ends: { until: null, count: 2, completed: 1 }
+    });
+    expect(series.done).toBe(true);
+    expect(series.recurrence.ends?.completed).toBe(2);
   });
 });

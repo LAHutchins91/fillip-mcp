@@ -18,7 +18,7 @@ export function connectPageBody(baseUrl: string) {
   const fallbackHtml = fallback
     ? `<p>The earlier address <code>${htmlEscape(fallback)}</code> still reaches this server.</p>`
     : "";
-  return `<p>Fillip by Ouroboros emails you when a reminder is due, even if your laptop is off. It works with ChatGPT, Claude, Gemini, Grok, Cursor, and any other MCP client that speaks Streamable HTTP. Reminders need your Fillip account with Pro or an active 14-day trial. Checkout shows the plan terms. This page does not print a price. No assistant can change your plan.</p>
+  return `<p>Fillip by Ouroboros pings you when a reminder is due, even if your laptop is off. It works with ChatGPT, Claude, Gemini, Grok, Cursor, and any other MCP client that speaks Streamable HTTP. A free plan does not expire. The trial is 14 days, then Pro. If you do not continue, you stay on the free plan. Checkout shows the plan terms. This page does not print a price. No assistant can change your plan.</p>
 <section><h2>Shared connection</h2>
 <p>MCP address:</p><p><code>${mcp}</code></p>
 ${fallbackHtml}

@@ -1,8 +1,11 @@
 import { assertSingleRecipient, ProviderQuotaError, type MailSender, type OutboundEmail } from "./email.js";
+import { reminderCalendar } from "./ics.js";
+import { delayLength } from "./reminders.js";
 import type { ServiceStore } from "./store.js";
 import { signStopToken } from "./stop-token.js";
-import { nextFire } from "./time.js";
-import type { DigestSettings, OwnerContact, Reminder } from "./types.js";
+import { isTelegramBackoff, type TelegramSender } from "./telegram.js";
+import { advanceSeries, nextFire } from "./time.js";
+import type { DeliveryChannel, DigestSettings, OwnerContact, Reminder } from "./types.js";
 import { allowanceFor, monthStart, nextMonthStart, type TierCaps } from "./usage.js";
 import { formatClock, formatWhen, localDateKey, zonedParts } from "./zone.js";
 
@@ -103,10 +106,18 @@ function stopLink(appBaseUrl: string, userId: string, secret: string, now: Date)
   return `${appBaseUrl.replace(/\/$/, "")}/stop?token=${encodeURIComponent(token)}`;
 }
 
-function messageForReminder(reminder: Reminder, from: string, to: string, stopUrl: string): OutboundEmail {
+function delaySentence(reminder: Reminder, now: Date): string | null {
+  const late = delayLength(reminder, now);
+  if (!late) return null;
+  const when = formatWhen(new Date(reminder.fireAt), reminder.timezone);
+  return `This reminder was due ${when}. It is ${late} late because sending was held.`;
+}
+
+function messageForReminder(reminder: Reminder, from: string, to: string, stopUrl: string, now: Date): OutboundEmail {
   const when = formatWhen(new Date(reminder.fireAt), reminder.timezone);
   const subject = `Fillip: ${reminder.what}`.slice(0, 140);
   const context = reminder.context ? `\n\n${reminder.context}` : "";
+  const delayed = delaySentence(reminder, now);
   const text = [
     "Fillip, reminders that fire.",
     "",
@@ -114,12 +125,15 @@ function messageForReminder(reminder: Reminder, from: string, to: string, stopUr
     context,
     "",
     `Due ${when}.`,
+    delayed ? `\n${delayed}` : "",
+    "",
+    "A calendar file is attached.",
     "",
     "This ping goes only to the verified address on your Fillip account.",
     `Stop these emails: ${stopUrl}`,
     "Setting another reminder turns them back on."
-  ].join("\n");
-  const html = `<p><strong>Fillip, reminders that fire.</strong></p><p>${escapeHtml(reminder.what)}</p>${reminder.context ? `<p>${escapeHtml(reminder.context)}</p>` : ""}<p>Due ${escapeHtml(when)}.</p><p>This ping goes only to the verified address on your Fillip account.</p><p><a href="${escapeHtml(stopUrl)}">Stop these emails</a>. Setting another reminder turns them back on.</p>`;
+  ].filter((line) => line !== "").join("\n");
+  const html = `<p><strong>Fillip, reminders that fire.</strong></p><p>${escapeHtml(reminder.what)}</p>${reminder.context ? `<p>${escapeHtml(reminder.context)}</p>` : ""}<p>Due ${escapeHtml(when)}.</p>${delayed ? `<p>${escapeHtml(delayed)}</p>` : ""}<p>A calendar file is attached.</p><p>This ping goes only to the verified address on your Fillip account.</p><p><a href="${escapeHtml(stopUrl)}">Stop these emails</a>. Setting another reminder turns them back on.</p>`;
   return {
     from,
     to,
@@ -130,15 +144,60 @@ function messageForReminder(reminder: Reminder, from: string, to: string, stopUr
     headers: {
       "List-Unsubscribe": `<${stopUrl}>`,
       "List-Unsubscribe-Post": "List-Unsubscribe=One-Click"
-    }
+    },
+    attachments: [{
+      filename: "fillip.ics",
+      content: reminderCalendar(reminder, now),
+      contentType: "text/calendar"
+    }]
   };
+}
+
+function telegramText(reminder: Reminder, now: Date): string {
+  const when = formatWhen(new Date(reminder.fireAt), reminder.timezone);
+  const delayed = delaySentence(reminder, now);
+  return [
+    "Fillip, reminders that fire.",
+    "",
+    reminder.what,
+    reminder.context ?? "",
+    "",
+    `Due ${when}.`,
+    delayed ?? "",
+    "",
+    "This chat is linked to your Fillip account. Ask Fillip to unlink Telegram to stop these messages."
+  ].filter((line) => line !== "").join("\n");
+}
+
+function wants(reminder: Reminder, contact: OwnerContact, telegramEnabled: boolean): { email: boolean; telegram: boolean } {
+  let channel: DeliveryChannel = reminder.channel || contact.defaultChannel || "email";
+  if (!telegramEnabled && channel !== "email") channel = "email";
+  return { email: channel !== "telegram", telegram: channel !== "email" && telegramEnabled };
 }
 
 async function advanceIfSent(store: ServiceStore, reminder: Reminder, occurrenceAt: string, now: Date) {
   if (reminder.fireAt !== occurrenceAt || reminder.status !== "active") return;
   if (reminder.recurrence) {
-    const next = nextFire(reminder.recurrence, reminder.timezone, new Date(occurrenceAt));
-    await store.saveReminder({ ...reminder, fireAt: next.toISOString(), holdUntil: null, updatedAt: now.toISOString() });
+    const series = advanceSeries(reminder.recurrence);
+    const next = series.done ? null : nextFire(series.recurrence, reminder.timezone, new Date(occurrenceAt));
+    if (!next) {
+      await store.saveReminder({
+        ...reminder,
+        recurrence: series.recurrence,
+        status: "completed",
+        holdUntil: null,
+        completedAt: now.toISOString(),
+        updatedAt: now.toISOString()
+      });
+      return;
+    }
+    await store.saveReminder({
+      ...reminder,
+      recurrence: series.recurrence,
+      fireAt: next.toISOString(),
+      holdUntil: null,
+      updatedAt: now.toISOString()
+    });
     return;
   }
   await store.saveReminder({ ...reminder, status: "fired", holdUntil: null, updatedAt: now.toISOString() });
@@ -156,6 +215,7 @@ export async function runDueJob(options: {
   minIntervalMs: number;
   caps: TierCaps;
   global: GlobalEmailLimits;
+  telegram?: { sender: TelegramSender } | null;
   warn?: (message: string) => void;
   sleep?: (ms: number) => Promise<void>;
 }): Promise<JobReport> {
@@ -186,10 +246,14 @@ export async function runDueJob(options: {
     global.reason = providerHold ? "provider" : monthHit ? "month" : dayHit ? "day" : null;
   };
 
-  const holdActive = async (until: string) => {
+  const holdActive = async (until: string, onlyEmail = false) => {
     for (const reminder of due) {
       const current = await options.store.getReminder(reminder.ownerId, reminder.id);
       if (!current || current.status !== "active") continue;
+      if (onlyEmail) {
+        const contact = await options.store.getContact(current.ownerId).catch(() => null);
+        if (contact && !wants(current, contact, Boolean(options.telegram)).email) continue;
+      }
       const holdUntil = current.holdUntil && current.holdUntil > until ? current.holdUntil : until;
       if (current.holdUntil === holdUntil) continue;
       await options.store.saveReminder({ ...current, status: "active", holdUntil, updatedAt: nowIso });
@@ -201,7 +265,7 @@ export async function runDueJob(options: {
     await options.store.setProviderBackoffUntil(providerHold);
     refreshStop();
     note(`Fillip email provider returned a quota or rate limit. Backing off until ${providerHold}. Due reminders stay queued and were not marked sent. ${guardText()}`);
-    await holdActive(providerHold);
+    await holdActive(providerHold, true);
   };
 
   if (global.dayLimit <= 0 || global.monthLimit <= 0) {
@@ -217,14 +281,10 @@ export async function runDueJob(options: {
     providerHold = existingBackoff;
     refreshStop();
     note(`Fillip email provider asked for a backoff until ${existingBackoff}. Due reminders stay queued and were not marked sent. ${guardText()}`);
-    await holdActive(existingBackoff);
-    return report;
-  }
-
-  if (global.stopped) {
+    await holdActive(existingBackoff, true);
+  } else if (global.stopped) {
     const until = global.reason === "month" ? global.monthResetsAt : global.dayResetsAt;
-    await holdActive(until);
-    return report;
+    await holdActive(until, true);
   }
 
   const pause = async () => {
@@ -238,7 +298,6 @@ export async function runDueJob(options: {
   };
 
   for (const reminder of due) {
-    if (providerCalls >= options.maxSends) break;
     let contact: Awaited<ReturnType<ServiceStore["getContact"]>> = null;
     try {
       contact = await options.store.getContact(reminder.ownerId);
@@ -246,14 +305,24 @@ export async function runDueJob(options: {
       report.failed += 1;
       continue;
     }
-    if (!contact || contact.unsubscribed || !contact.emailVerified || !contact.email) {
-      if (contact && !contact.emailVerified) {
+    if (!contact) {
+      report.skipped += 1;
+      continue;
+    }
+    const mode = wants(reminder, contact, Boolean(options.telegram));
+    const emailPossible = Boolean(contact.emailVerified && contact.email && !contact.unsubscribed);
+    if (!emailPossible && !mode.telegram) {
+      if (!contact.emailVerified) {
         await options.store.saveReminder({
           ...reminder,
           holdUntil: new Date(options.now.getTime() + DAY_MS).toISOString(),
           updatedAt: nowIso
         });
       }
+      report.skipped += 1;
+      continue;
+    }
+    if (mode.email && !emailPossible && mode.telegram && !contact.telegramChatId) {
       report.skipped += 1;
       continue;
     }
@@ -267,8 +336,8 @@ export async function runDueJob(options: {
       report.deferred += 1;
       continue;
     }
-    const sentToday = await options.store.countSentSince(reminder.ownerId, since);
-    if (sentToday >= options.maxEmailsPerUserPerDay) {
+    const underUserCap = async () => (await options.store.countSentSince(reminder.ownerId, since)) < options.maxEmailsPerUserPerDay;
+    if (!(await underUserCap())) {
       await options.store.saveReminder({
         ...reminder,
         holdUntil: new Date(options.now.getTime() + DAY_MS).toISOString(),
@@ -277,72 +346,144 @@ export async function runDueJob(options: {
       report.deferred += 1;
       continue;
     }
-    refreshStop();
-    if (global.stopped) {
-      note(guardText());
-      const until = global.reason === "month" ? global.monthResetsAt : global.dayResetsAt;
-      await holdActive(until);
-      break;
-    }
-    const to = assertSingleRecipient(contact.email);
-    const idempotencyKey = `fillip/${reminder.id}/${reminder.fireAt}`;
-    const claim = await options.store.claimDelivery({
-      ownerId: reminder.ownerId,
-      reminderId: reminder.id,
-      dedupeKey: `reminder:${reminder.id}:${reminder.fireAt}`,
-      occurrenceAt: reminder.fireAt,
-      idempotencyKey,
-      nowIso,
-      staleBeforeIso: staleBefore
-    });
-    if (claim.outcome === "already-sent") {
-      await advanceIfSent(options.store, reminder, reminder.fireAt, options.now);
-      report.skipped += 1;
-      continue;
-    }
-    if (claim.outcome === "in-progress") {
-      report.skipped += 1;
-      continue;
-    }
-    const stopUrl = stopLink(options.appBaseUrl, reminder.ownerId, options.unsubscribeSecret, options.now);
-    const message = messageForReminder(reminder, options.from, to, stopUrl);
-    try {
-      await takeSlot();
-      const result = await options.sender.send(message);
-      await options.store.saveDelivery({
-        ...claim.delivery,
-        status: "sent",
-        providerId: result.id,
-        sentAt: nowIso,
-        error: null
-      });
-      await noteSent(options.store, contact, options.now);
-      global.daySent += 1;
-      global.monthSent += 1;
-      refreshStop();
-      await advanceIfSent(options.store, reminder, reminder.fireAt, options.now);
-      report.sent += 1;
-    } catch (error) {
-      if (error instanceof ProviderQuotaError) {
-        await options.store.saveDelivery({
-          ...claim.delivery,
-          status: "failed",
-          error: "provider backoff",
-          providerId: null,
-          sentAt: null,
-          startedAt: nowIso
-        });
-        await beginProviderBackoff();
+
+    let emailDone = !mode.email;
+    let telegramDone = !mode.telegram;
+    let delivered = false;
+
+    if (mode.telegram && options.telegram && contact.telegramChatId) {
+      if (!(await underUserCap())) {
         report.deferred += 1;
-        break;
+      } else {
+        const claim = await options.store.claimDelivery({
+          ownerId: reminder.ownerId,
+          reminderId: reminder.id,
+          dedupeKey: `reminder:${reminder.id}:${reminder.fireAt}:telegram`,
+          occurrenceAt: reminder.fireAt,
+          idempotencyKey: `fillip/${reminder.id}/${reminder.fireAt}/telegram`,
+          channel: "telegram",
+          nowIso,
+          staleBeforeIso: staleBefore
+        });
+        if (claim.outcome === "already-sent") telegramDone = true;
+        else if (claim.outcome === "send") {
+          try {
+            const result = await options.telegram.sender.send(contact.telegramChatId, telegramText(reminder, options.now));
+            await options.store.saveDelivery({ ...claim.delivery, status: "sent", providerId: result.id, sentAt: nowIso, error: null });
+            await noteSent(options.store, contact, options.now);
+            telegramDone = true;
+            delivered = true;
+            report.sent += 1;
+          } catch (error) {
+            await options.store.saveDelivery({
+              ...claim.delivery,
+              status: "failed",
+              error: isTelegramBackoff(error) ? "provider backoff" : "send failed",
+              sentAt: null,
+              startedAt: nowIso
+            });
+            if (isTelegramBackoff(error)) {
+              await options.store.saveReminder({
+                ...reminder,
+                holdUntil: new Date(options.now.getTime() + PROVIDER_BACKOFF_MS).toISOString(),
+                updatedAt: nowIso
+              });
+              report.deferred += 1;
+            } else report.failed += 1;
+          }
+        }
       }
-      await options.store.saveDelivery({
-        ...claim.delivery,
-        status: "failed",
-        error: "send failed",
-        startedAt: nowIso
-      });
-      report.failed += 1;
+    } else if (mode.telegram && !contact.telegramChatId) {
+      telegramDone = mode.email;
+      if (!mode.email) {
+        await options.store.saveReminder({
+          ...reminder,
+          holdUntil: new Date(options.now.getTime() + 60 * 60 * 1000).toISOString(),
+          updatedAt: nowIso
+        });
+        report.deferred += 1;
+      }
+    }
+
+    refreshStop();
+    const emailBlocked = Boolean(providerHold) || global.stopped;
+    if (mode.email && emailPossible && contact.email) {
+      if (emailBlocked || providerCalls >= options.maxSends) {
+        note(guardText());
+        const until = providerHold ?? (global.reason === "month" ? global.monthResetsAt : global.dayResetsAt);
+        const current = await options.store.getReminder(reminder.ownerId, reminder.id);
+        if (current && current.status === "active") {
+          const holdUntil = current.holdUntil && current.holdUntil > until ? current.holdUntil : until;
+          await options.store.saveReminder({ ...current, status: "active", holdUntil, updatedAt: nowIso });
+        }
+        report.deferred += 1;
+      } else if (!(await underUserCap())) {
+        report.deferred += 1;
+      } else {
+        const to = assertSingleRecipient(contact.email);
+        const idempotencyKey = `fillip/${reminder.id}/${reminder.fireAt}`;
+        const claim = await options.store.claimDelivery({
+          ownerId: reminder.ownerId,
+          reminderId: reminder.id,
+          dedupeKey: `reminder:${reminder.id}:${reminder.fireAt}:email`,
+          occurrenceAt: reminder.fireAt,
+          idempotencyKey,
+          channel: "email",
+          nowIso,
+          staleBeforeIso: staleBefore
+        });
+        if (claim.outcome === "already-sent") emailDone = true;
+        else if (claim.outcome === "in-progress") report.skipped += 1;
+        else {
+          const stopUrl = stopLink(options.appBaseUrl, reminder.ownerId, options.unsubscribeSecret, options.now);
+          const fresh = await options.store.getReminder(reminder.ownerId, reminder.id) ?? reminder;
+          const message = messageForReminder(fresh, options.from, to, stopUrl, options.now);
+          try {
+            await takeSlot();
+            const result = await options.sender.send(message);
+            await options.store.saveDelivery({
+              ...claim.delivery,
+              status: "sent",
+              providerId: result.id,
+              sentAt: nowIso,
+              error: null
+            });
+            await noteSent(options.store, contact, options.now);
+            global.daySent += 1;
+            global.monthSent += 1;
+            refreshStop();
+            emailDone = true;
+            delivered = true;
+            report.sent += 1;
+          } catch (error) {
+            if (error instanceof ProviderQuotaError) {
+              await options.store.saveDelivery({
+                ...claim.delivery,
+                status: "failed",
+                error: "provider backoff",
+                providerId: null,
+                sentAt: null,
+                startedAt: nowIso
+              });
+              await beginProviderBackoff();
+              report.deferred += 1;
+            } else {
+              await options.store.saveDelivery({
+                ...claim.delivery,
+                status: "failed",
+                error: "send failed",
+                startedAt: nowIso
+              });
+              report.failed += 1;
+            }
+          }
+        }
+      }
+    }
+
+    if (emailDone && telegramDone && (delivered || emailDone)) {
+      const current = await options.store.getReminder(reminder.ownerId, reminder.id);
+      if (current) await advanceIfSent(options.store, current, reminder.fireAt, options.now);
     }
   }
 
@@ -420,6 +561,7 @@ async function sendDigest(
     dedupeKey: `digest:${digest.ownerId}:${today}`,
     occurrenceAt: `${today}T${String(digest.hour).padStart(2, "0")}:${String(digest.minute).padStart(2, "0")}:00.000Z`,
     idempotencyKey,
+    channel: "email",
     nowIso,
     staleBeforeIso: staleBefore
   });

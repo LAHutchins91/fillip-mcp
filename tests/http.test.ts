@@ -51,6 +51,8 @@ function postMcp(accept: string | undefined, body: unknown) {
 
 describe("streamable HTTP", () => {
   it("returns Fillip tools from tools/list without a pasted token", async () => {
+    const previous = process.env.TELEGRAM_BOT_TOKEN;
+    delete process.env.TELEGRAM_BOT_TOKEN;
     const response = await fetch(`${base}/mcp`, {
       method: "POST",
       headers,
@@ -60,7 +62,8 @@ describe("streamable HTTP", () => {
     const body = await response.json() as { result?: { tools?: Array<{ name: string; description?: string; inputSchema?: { properties?: Record<string, unknown> } }> } };
     const tools = body.result?.tools ?? [];
     const names = tools.map((tool) => tool.name);
-    expect(names).toEqual(["set_reminder", "list_reminders", "snooze_or_reschedule", "complete_or_cancel", "follow_up", "digest_settings"]);
+    expect(names).toEqual(["set_reminder", "list_reminders", "snooze_or_reschedule", "complete_or_cancel", "follow_up", "digest_settings", "calendar_feed"]);
+    expect(names).not.toContain("delivery_settings");
     const text = JSON.stringify(tools);
     expect(text).not.toMatch(/\$\d/);
     expect(text).toMatch(/verified/);
@@ -68,6 +71,9 @@ describe("streamable HTTP", () => {
     const properties = Object.keys(setReminder?.inputSchema?.properties ?? {});
     expect(properties).toEqual(expect.arrayContaining(["what", "when", "timezone"]));
     expect(properties).not.toEqual(expect.arrayContaining(["email", "to", "recipient"]));
+    expect(properties).not.toContain("channel");
+    if (previous === undefined) delete process.env.TELEGRAM_BOT_TOKEN;
+    else process.env.TELEGRAM_BOT_TOKEN = previous;
   });
 
   it("rejects a tool call that is not an OAuth sign-in", async () => {
@@ -92,6 +98,7 @@ describe("streamable HTTP", () => {
     expect(health.status).toBe(200);
     const healthBody = await health.json() as {
       service: string;
+      telegramConfigured: boolean;
       globalEmails: {
         daySent: number | null;
         monthSent: number | null;
@@ -105,6 +112,7 @@ describe("streamable HTTP", () => {
       };
     };
     expect(healthBody.service).toBe("fillip");
+    expect(healthBody.telegramConfigured).toBe(Boolean(process.env.TELEGRAM_BOT_TOKEN?.trim()));
     expect(healthBody.globalEmails).toMatchObject({
       daySent: null,
       monthSent: null,
@@ -150,6 +158,35 @@ describe("streamable HTTP", () => {
     const body = JSON.parse(response.text) as { result?: { tools?: Array<{ name: string }> }; error?: { message?: string } };
     expect(body.error?.message ?? "").not.toMatch(/Not Acceptable/);
     expect(body.result?.tools?.map((tool) => tool.name)).toContain("set_reminder");
+  });
+
+  it("hides the Telegram webhook until a bot token is set", async () => {
+    const token = process.env.TELEGRAM_BOT_TOKEN;
+    const secret = process.env.TELEGRAM_WEBHOOK_SECRET;
+    delete process.env.TELEGRAM_BOT_TOKEN;
+    try {
+      const hidden = await fetch(`${base}/telegram/webhook`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}"
+      });
+      expect(hidden.status).toBe(404);
+      process.env.TELEGRAM_BOT_TOKEN = "123456:test";
+      process.env.TELEGRAM_WEBHOOK_SECRET = "hook-secret";
+      const denied = await fetch(`${base}/telegram/webhook`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-telegram-bot-api-secret-token": "nope" },
+        body: "{}"
+      });
+      expect(denied.status).toBe(401);
+      const calendar = await fetch(`${base}/calendar/short.ics`);
+      expect(calendar.status).toBe(404);
+    } finally {
+      if (token === undefined) delete process.env.TELEGRAM_BOT_TOKEN;
+      else process.env.TELEGRAM_BOT_TOKEN = token;
+      if (secret === undefined) delete process.env.TELEGRAM_WEBHOOK_SECRET;
+      else process.env.TELEGRAM_WEBHOOK_SECRET = secret;
+    }
   });
 
   it("rejects a browser origin that is not an assistant", async () => {

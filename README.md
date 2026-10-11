@@ -6,7 +6,7 @@ Remind me to follow up on this next Tuesday at 2pm, and actually ping me. You sa
 
 It works with any MCP client that can do Streamable HTTP and OAuth. It is not a ChatGPT-only plugin.
 
-Sign in with your Fillip account when the assistant opens OAuth. Do not paste an access token or password into a header. Reminder tools need Pro or an active trial. The trial is 14 days, then Pro. Checkout shows the plan terms. This page does not print a price.
+Sign in with your Fillip account when the assistant opens OAuth. Do not paste an access token or password into a header. A free plan does not expire. The trial is 14 days, then Pro. If you do not continue, you stay on the free plan. Checkout shows the plan terms. This page does not print a price.
 
 More from Ouroboros: https://ouroborosapps.com
 
@@ -14,16 +14,22 @@ More from Ouroboros: https://ouroborosapps.com
 
 After you approve the connection, the server exposes these tools:
 
-- `set_reminder` — “next Tue 2pm” or “every weekday 9am”, in your timezone. Fillip reads the time itself. A past date or a wrong year is rejected or moved forward, and the assistant is told which.
-- `list_reminders`
+- `set_reminder` — “next Tue 2pm”, “every weekday 9am”, “first Monday of every month”, or “every 2 weeks until Dec”, in your timezone. Fillip reads the time itself. A past date or a wrong year is rejected or moved forward, and the assistant is told which. Repeats can be every N days or weeks, a calendar date each month, or the nth weekday each month, and they can stop on a date or after a count.
+- `list_reminders` — includes a delayed state when a ping was held past its due time
 - `snooze_or_reschedule`
 - `complete_or_cancel` — marking a follow-up done stops the nudges
-- `follow_up` — keeps emailing until you mark it done
-- `digest_settings` — an optional once-a-day summary
+- `follow_up` — keeps pinging until you mark it done
+- `digest_settings` — an optional once-a-day email summary
+- `calendar_feed` — a private calendar subscription link, and a way to rotate it
+- `delivery_settings` — only when Telegram is configured: link the bot, unlink it, or set the default channel
 
-Creating a reminder opts you in. Fillip emails only the verified address on that account. There is no field for another recipient. Every email has a stop link. Setting another reminder turns mail back on.
+Creating a reminder opts you in. Fillip emails only the verified address on that account. There is no field for another recipient. Every reminder email includes a calendar file in your timezone, with a repeat rule when the reminder repeats, and a stop link. Setting another reminder turns mail back on.
 
-Each plan has its own monthly reminder-email allowance. The numbers are configuration, not printed here. When the allowance is used up, Fillip says so and does not send more until it resets. A heavier month cannot cost more than that plan pays for.
+If the shared mail guard or the email provider holds a reminder past its due time, the email says it was delayed and by how long. `list_reminders` shows that same delayed state. The reminder stays queued. It is not marked sent and it is not dropped.
+
+Each plan has its own monthly reminder-email allowance. The free plan also caps how many reminders can stay open. The numbers are configuration, not printed here. When a free or trial cap is hit, the tool says so and tells you that Pro has a higher allowance. A heavier month cannot cost more than that plan pays for. After the trial, an account that does not continue stays on the free plan and keeps using reminders inside those caps.
+
+When Telegram is configured, a reminder can go by email, Telegram, or both. Telegram messages count toward your allowance. They do not count toward the shared email guard. Unlinking stops that chat. If the bot token is unset, Telegram tools and the webhook are absent.
 
 The assistant only calls these tools when you and the host allow it.
 
@@ -64,7 +70,7 @@ npm run build
 npm start
 ```
 
-`GET /health` reports whether Supabase, Stripe, and the sender are configured. `POST /mcp` with `tools/list` answers without a sign-in. Tool calls require OAuth and an active trial or Pro.
+`GET /health` reports whether Supabase, Stripe, the sender, and Telegram are configured. `POST /mcp` with `tools/list` answers without a sign-in. Tool calls require OAuth. A signed-in account on the free plan, the trial, or Pro can use them. Caps, not a lockout, enforce the plan.
 
 ```bash
 docker build -t fillip-mcp .
@@ -103,21 +109,37 @@ Copy `.env.example` to `.env`. Fillip reads these variables and does not invent 
 | `FILLIP_CAP_TRIAL_EMAILS_PER_MONTH` | Reminder emails allowed during the 14-day trial. Empty uses a stand-in count so an unset variable is not unlimited. Set the real allowance before launch. |
 | `FILLIP_CAP_PRO_EMAILS_PER_MONTH` | Reminder emails allowed in a month on the monthly plan. Empty uses a stand-in count. |
 | `FILLIP_CAP_ANNUAL_EMAILS_PER_MONTH` | Reminder emails allowed in a month on the yearly plan. Empty uses a stand-in count. |
-| `FILLIP_GLOBAL_MAX_EMAILS_PER_DAY` | Fillip's share of the shared Resend account for one UTC day, counting every reminder, follow-up, and digest. The account itself allows 100 emails a day across products. Empty means Fillip sends nothing and leaves due reminders queued. |
+| `FILLIP_CAP_FREE_OPEN_REMINDERS` | Open reminders on the free plan. Defaults to 10. The free plan does not expire. |
+| `FILLIP_CAP_FREE_EMAILS_PER_MONTH` | Reminder emails and Telegram pings allowed in a month on the free plan. Defaults to 30. |
+| `TELEGRAM_BOT_TOKEN` | Optional. Bot token from BotFather. Empty hides Telegram: no delivery tool and the webhook answers not found. |
+| `TELEGRAM_WEBHOOK_SECRET` | Shared secret Telegram sends as `X-Telegram-Bot-Api-Secret-Token`. Required before the webhook accepts an update. |
+| `TELEGRAM_BOT_USERNAME` | Optional bot username, without @. If empty, Fillip reads it from Telegram when someone asks for a link. |
+| `FILLIP_GLOBAL_MAX_EMAILS_PER_DAY` | Fillip's share of the shared Resend account for one UTC day, counting every reminder, follow-up, and digest email. Telegram does not count. The account itself allows 100 emails a day across products. Empty means Fillip sends no email and leaves due email reminders queued. |
 | `FILLIP_GLOBAL_MAX_EMAILS_PER_MONTH` | Fillip's share of that account for one UTC month. The account itself allows 3,000 emails a month across products. Empty means Fillip sends nothing and leaves due reminders queued. |
 
-Accounts can also keep at most 100 open reminders and create at most 30 in an hour.
+Pro and the trial can keep at most 100 open reminders. The free plan uses `FILLIP_CAP_FREE_OPEN_REMINDERS`. Every account can create at most 30 reminders in an hour.
 
 ## Hosting setup
 
 Nothing in this repo creates a Vercel project, a Supabase project, a Stripe product, or a Resend domain. Do these on the accounts you host with. Fillip does not share a Stripe product with other apps.
 
 1. Create a Supabase project. Run `supabase/schema.sql`, then `supabase/oauth_resource_binding.sql`. In Authentication → Auth Hooks, set Customize Access Token Claims to `public.fillip_access_token_hook`. Set `fillip_private.settings.mcp_resource` to `APP_BASE_URL/mcp` (see `supabase/README-oauth.md`). Add redirect URLs for `APP_BASE_URL` and `APP_BASE_URL/oauth/consent`. Enable Google sign-in if you want the one-click button.
-2. In Stripe, create Fillip's own product and two prices on it, monthly and yearly. Put those ids in `STRIPE_PRODUCT_ID`, `STRIPE_PRICE_MONTHLY`, and `STRIPE_PRICE_YEARLY`. Point a webhook at `APP_BASE_URL/billing/webhook` for `checkout.session.completed` and the customer subscription events. Checkout starts a 14-day trial, then Pro, and stamps the Fillip product id on the session. The webhook applies an event only when every product id on it is `STRIPE_PRODUCT_ID` and the price is one of those two. Other products on the same Stripe account are ignored. Set `FILLIP_CAP_TRIAL_EMAILS_PER_MONTH`, `FILLIP_CAP_PRO_EMAILS_PER_MONTH`, and `FILLIP_CAP_ANNUAL_EMAILS_PER_MONTH` to the allowances those plans can afford. Until they are set, Fillip uses a stand-in count so a missing variable cannot mean unlimited mail.
+2. In Stripe, create Fillip's own product and two prices on it, monthly and yearly. Put those ids in `STRIPE_PRODUCT_ID`, `STRIPE_PRICE_MONTHLY`, and `STRIPE_PRICE_YEARLY`. Point a webhook at `APP_BASE_URL/billing/webhook` for `checkout.session.completed` and the customer subscription events. Checkout starts a 14-day trial, then Pro, and stamps the Fillip product id on the session. The webhook applies an event only when every product id on it is `STRIPE_PRODUCT_ID` and the price is one of those two. Other products on the same Stripe account are ignored. When the subscription is no longer entitled, the account moves to the free plan and reminders keep working inside the free caps. Set `FILLIP_CAP_TRIAL_EMAILS_PER_MONTH`, `FILLIP_CAP_PRO_EMAILS_PER_MONTH`, and `FILLIP_CAP_ANNUAL_EMAILS_PER_MONTH` to the allowances those plans can afford. Until they are set, Fillip uses a stand-in count so a missing variable cannot mean unlimited mail. `FILLIP_CAP_FREE_OPEN_REMINDERS` and `FILLIP_CAP_FREE_EMAILS_PER_MONTH` default to 10 and 30.
 3. In Resend, verify the domain you will send from. Set `RESEND_API_KEY` and `FILLIP_FROM_EMAIL` to an address on that domain. Fillip sends one recipient, the account's verified email, with an idempotency key of `fillip/<reminder>/<occurrence>` so a retry does not send a second copy. The shared Resend account on the free tier allows 100 emails a day and 3,000 a month for every product together. Set `FILLIP_GLOBAL_MAX_EMAILS_PER_DAY` and `FILLIP_GLOBAL_MAX_EMAILS_PER_MONTH` to Fillip's share of that, low enough that other products still fit. When either number is reached, or Resend returns a quota or rate-limit response, Fillip keeps the due reminders queued and sends them in order after the window or the backoff passes. It does not mark them sent. `GET /health` shows the current counts under `globalEmails`. Re-run `supabase/schema.sql` so the provider backoff row exists.
 4. Generate `FILLIP_UNSUBSCRIBE_SECRET` and `CRON_SECRET`. Set `APP_BASE_URL` to the public origin.
 5. Deploy the Dockerfile or `npm start`. Do not commit `.env`.
 6. Schedule delivery once a minute. On Vercel, `vercel.json` already calls `GET /internal/deliver`. Set `CRON_SECRET` on the project and Vercel sends it as a bearer token. On Supabase, the commented schedule in `supabase/cron.sql` posts to the same path with `pg_cron` and `pg_net`. One of those is enough.
 7. After the public URL exists, put it in `server.json` `remotes` and in the connect instructions you give people. Update `mcp_resource` if the host changed, then reconnect clients.
+8. Re-run `supabase/schema.sql` so the free-plan default, reminder channel, calendar token, and Telegram columns exist. The calendar feed is `GET /calendar/<token>.ics`. `calendar_feed` returns that secret link and can rotate it. Old links stop working after a rotation.
+9. Telegram is optional and uses a webhook, not polling. In BotFather, create a bot and copy its token into `TELEGRAM_BOT_TOKEN`. Set `TELEGRAM_WEBHOOK_SECRET` to a long random string. Optionally set `TELEGRAM_BOT_USERNAME`. Then register the webhook (replace the two secrets and the public origin):
+
+```bash
+curl -sS "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \
+  -d "url=$APP_BASE_URL/telegram/webhook" \
+  -d "secret_token=$TELEGRAM_WEBHOOK_SECRET" \
+  -d "allowed_updates=[\"message\"]"
+```
+
+People link a chat from `delivery_settings`, which returns a `t.me` start link that expires in 30 minutes. Fillip answers `POST /telegram/webhook` only when the bot token is set and the secret header matches. If `TELEGRAM_BOT_TOKEN` is empty, that path is not found and the delivery tool is not listed. Telegram sends count toward the per-account allowance and do not count toward the Resend global guard.
 
 `GET /health` should show the Supabase, Stripe, Resend, and sender flags as true before you rely on a ping. `globalEmails` shows how close the shared send guard is. `stopped: true` means due reminders are waiting, not dropped.
