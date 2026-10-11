@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ClaimResult, Delivery, DeliveryChannel, DigestSettings, OwnerContact, OwnerIdentity, PlanName, Recurrence, Reminder, ReminderStatus } from "./types.js";
-import type { ListQuery, ServiceStore } from "./store.js";
+import type { ListQuery, SendReserve, SendReserveResult, ServiceStore } from "./store.js";
 
 export type Db = (pathname: string, options?: RequestInit) => Promise<unknown>;
 
@@ -128,6 +128,8 @@ export function dueRemindersPath(nowIso: string, limit: number): string {
 }
 
 export class SupabaseFillipStore implements ServiceStore {
+  private sendHolds = new Set<string>();
+  private inFlight = new Set<string>();
   constructor(private ownerId: string | null, private db: Db, private mode: Mode) {}
 
   private owned(ownerId: string) {
@@ -367,6 +369,23 @@ export class SupabaseFillipStore implements ServiceStore {
     if (existing.status === "sending" && existing.started_at > input.staleBeforeIso) {
       return { delivery: fromDelivery(existing), outcome: "in-progress" };
     }
+    const ticketKey = `claim:${input.dedupeKey}:${existing.started_at}`;
+    try {
+      await this.db("/rest/v1/deliveries", {
+        method: "POST",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify({
+          ...fresh,
+          id: randomUUID(),
+          dedupe_key: ticketKey,
+          idempotency_key: `lock/${ticketKey}`,
+          status: "sending"
+        })
+      });
+    } catch (error) {
+      if (isDuplicate(error)) return { delivery: fromDelivery(existing), outcome: "in-progress" };
+      throw error;
+    }
     const taken = rows<DeliveryRow>(await this.db(`/rest/v1/deliveries?dedupe_key=eq.${encodeURIComponent(input.dedupeKey)}&status=neq.sent`, {
       method: "PATCH",
       headers: { Prefer: "return=representation" },
@@ -394,7 +413,8 @@ export class SupabaseFillipStore implements ServiceStore {
 
   async countSentSince(ownerId: string, sinceIso: string): Promise<number> {
     if (this.mode !== "service") throw new Error("Reminder not found");
-    const value = await this.db(`/rest/v1/deliveries?owner_id=eq.${encodeURIComponent(ownerId)}&status=eq.sent&sent_at=gte.${encodeURIComponent(sinceIso)}&select=id&limit=100`);
+    const value = await this.db(`/rest/v1/deliveries?owner_id=eq.${encodeURIComponent(ownerId)}&status=eq.sent&sent_at=gte.${encodeURIComponent(sinceIso)}&select=id&limit=1000`);
+    if (typeof value === "number" && Number.isFinite(value)) return value;
     return rows<{ id: string }>(value).length;
   }
 
@@ -477,6 +497,26 @@ export class SupabaseFillipStore implements ServiceStore {
       headers: { Prefer: "return=minimal" },
       body: JSON.stringify({ ...patch, updated_at: new Date().toISOString() })
     });
+  }
+
+  reserveSend(_input: SendReserve): SendReserveResult {
+    const id = randomUUID();
+    this.sendHolds.add(id);
+    return { ok: true, id };
+  }
+
+  releaseSend(id: string): void {
+    this.sendHolds.delete(id);
+  }
+
+  beginSend(idempotencyKey: string): boolean {
+    if (this.inFlight.has(idempotencyKey)) return false;
+    this.inFlight.add(idempotencyKey);
+    return true;
+  }
+
+  finishSend(idempotencyKey: string): void {
+    this.inFlight.delete(idempotencyKey);
   }
 
   async setProviderBackoffUntil(untilIso: string): Promise<void> {

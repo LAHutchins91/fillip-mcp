@@ -103,7 +103,7 @@ export function createFillipServer(store: ReminderStore, actor: Actor, now: () =
       status: args.status === "fired" || args.status === "completed" || args.status === "cancelled" || args.status === "paused" || args.status === "all" || args.status === "active" ? args.status : undefined,
       range: args.range === "today" || args.range === "week" || args.range === "past" || args.range === "any" || args.range === "upcoming" ? args.range : undefined,
       timezone: typeof args.timezone === "string" ? args.timezone : undefined
-    }, now());
+    }, now(), caps);
     const allowance = allowanceFor(actor.id ? await store.getUsage(actor.id) : null, now(), caps);
     return { reminders, allowance };
   });

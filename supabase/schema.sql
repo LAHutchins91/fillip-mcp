@@ -18,6 +18,7 @@ create table if not exists public.profiles (
 
 alter table public.profiles add column if not exists emails_sent_in_period integer not null default 0;
 alter table public.profiles add column if not exists email_period_start timestamptz;
+alter table public.profiles add column if not exists billing_event_created bigint not null default 0;
 
 create table if not exists public.reminders (
   id uuid primary key,

@@ -22,6 +22,24 @@ export interface ReminderStore {
   setCalendarToken(ownerId: string, token: string): Promise<void>;
 }
 
+export type SendReserve = {
+  ownerId: string;
+  now: Date;
+  timeZone: string;
+  sinceIso: string;
+  monthlyLimit: number;
+  dailyLimit: number;
+  globalDayStartIso: string;
+  globalMonthStartIso: string;
+  globalDayLimit: number;
+  globalMonthLimit: number;
+  countGlobal: boolean;
+};
+
+export type SendReserveResult =
+  | { ok: true; id: string }
+  | { ok: false; reason: "month" | "day" | "global-day" | "global-month" };
+
 export interface ServiceStore extends ReminderStore {
   getContact(ownerId: string): Promise<OwnerContact | null>;
   listDue(nowIso: string, limit: number): Promise<Reminder[]>;
@@ -44,6 +62,12 @@ export interface ServiceStore extends ReminderStore {
   getProviderBackoffUntil(): Promise<string | null>;
   setProviderBackoffUntil(untilIso: string): Promise<void>;
   saveUsage(ownerId: string, usage: { emailsSentInPeriod: number; emailPeriodStart: string }): Promise<void>;
+  /** Synchronous cap hold. Two callers in one process cannot both pass the same remaining slot. */
+  reserveSend(input: SendReserve): SendReserveResult;
+  releaseSend(id: string): void;
+  /** One in-flight provider call per idempotency key. False when another caller already holds it or it was sent. */
+  beginSend(idempotencyKey: string): boolean;
+  finishSend(idempotencyKey: string): void;
 }
 
 export function newId(): string {

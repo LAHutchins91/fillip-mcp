@@ -1,6 +1,7 @@
 import type { ClaimResult, Delivery, DeliveryChannel, DigestSettings, OwnerContact, OwnerIdentity, Reminder, ReminderStatus } from "./types.js";
-import type { ListQuery, ServiceStore } from "./store.js";
-import { blankContact } from "./usage.js";
+import type { ListQuery, SendReserve, SendReserveResult, ServiceStore } from "./store.js";
+import { blankContact, sentThisMonth } from "./usage.js";
+import { randomUUID } from "node:crypto";
 
 export class MemoryFillipStore implements ServiceStore {
   reminders: Reminder[] = [];
@@ -8,6 +9,8 @@ export class MemoryFillipStore implements ServiceStore {
   digests = new Map<string, DigestSettings>();
   contacts = new Map<string, OwnerContact>();
   providerBackoffUntil: string | null = null;
+  private holds: Array<{ id: string; ownerId: string; global: boolean }> = [];
+  private inFlight = new Set<string>();
 
   async listReminders(ownerId: string, query: ListQuery): Promise<Reminder[]> {
     return this.reminders
@@ -205,6 +208,40 @@ export class MemoryFillipStore implements ServiceStore {
 
   async setProviderBackoffUntil(untilIso: string): Promise<void> {
     this.providerBackoffUntil = untilIso;
+  }
+
+  reserveSend(input: SendReserve): SendReserveResult {
+    const contact = this.contacts.get(input.ownerId) ?? null;
+    const ownerHolds = this.holds.filter((hold) => hold.ownerId === input.ownerId).length;
+    const monthUsed = sentThisMonth(contact, input.now, input.timeZone) + ownerHolds;
+    if (monthUsed >= input.monthlyLimit) return { ok: false, reason: "month" };
+    const dayUsed = this.deliveries.filter((row) => row.ownerId === input.ownerId && row.status === "sent" && (row.sentAt ?? "") >= input.sinceIso).length + ownerHolds;
+    if (dayUsed >= input.dailyLimit) return { ok: false, reason: "day" };
+    if (input.countGlobal) {
+      const globalHolds = this.holds.filter((hold) => hold.global).length;
+      const globalDay = this.deliveries.filter((row) => row.status === "sent" && row.channel !== "telegram" && (row.sentAt ?? "") >= input.globalDayStartIso).length + globalHolds;
+      if (globalDay >= input.globalDayLimit) return { ok: false, reason: "global-day" };
+      const globalMonth = this.deliveries.filter((row) => row.status === "sent" && row.channel !== "telegram" && (row.sentAt ?? "") >= input.globalMonthStartIso).length + globalHolds;
+      if (globalMonth >= input.globalMonthLimit) return { ok: false, reason: "global-month" };
+    }
+    const id = randomUUID();
+    this.holds.push({ id, ownerId: input.ownerId, global: input.countGlobal });
+    return { ok: true, id };
+  }
+
+  releaseSend(id: string): void {
+    this.holds = this.holds.filter((hold) => hold.id !== id);
+  }
+
+  beginSend(idempotencyKey: string): boolean {
+    if (this.inFlight.has(idempotencyKey)) return false;
+    if (this.deliveries.some((row) => row.idempotencyKey === idempotencyKey && row.status === "sent")) return false;
+    this.inFlight.add(idempotencyKey);
+    return true;
+  }
+
+  finishSend(idempotencyKey: string): void {
+    this.inFlight.delete(idempotencyKey);
   }
 }
 

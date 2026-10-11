@@ -6,6 +6,7 @@ import {
   isRealDate,
   weekdayOf,
   zonedParts,
+  interpretWall,
   zonedTimeToUtc
 } from "./zone.js";
 import type { Recurrence, RecurrenceEnd } from "./types.js";
@@ -132,14 +133,22 @@ function withinEnd(recurrence: Recurrence, instant: Date): Date | null {
   return instant.getTime() >= new Date(recurrence.ends.until).getTime() ? null : instant;
 }
 
+function instantAfter(year: number, month: number, day: number, hour: number, minute: number, timeZone: string, after: Date): Date | null {
+  const wall = interpretWall(year, month, day, hour, minute, timeZone);
+  for (const instant of wall.instants) {
+    if (instant.getTime() > after.getTime()) return instant;
+  }
+  return null;
+}
+
 /** Next instant strictly after `after`, or null when the series has ended. */
 export function nextFire(recurrence: Recurrence, timeZone: string, after: Date): Date | null {
   if (recurrence.kind === "every_n_days" || recurrence.kind === "every_n_weeks") {
     const step = recurrence.kind === "every_n_days" ? recurrence.interval : recurrence.interval * 7;
     let cursor: { year: number; month: number; day: number } = zonedParts(new Date(recurrence.anchor), timeZone);
     for (let i = 0; i < 400; i += 1) {
-      const instant = zonedTimeToUtc(cursor.year, cursor.month, cursor.day, recurrence.hour, recurrence.minute, timeZone);
-      if (instant.getTime() > after.getTime()) return withinEnd(recurrence, instant);
+      const instant = instantAfter(cursor.year, cursor.month, cursor.day, recurrence.hour, recurrence.minute, timeZone, after);
+      if (instant) return withinEnd(recurrence, instant);
       cursor = addCalendarDays(cursor.year, cursor.month, cursor.day, step);
     }
     throw new WhenError("Fillip could not read that time. Try \"next Tue 2pm\" or \"every weekday 9am\".");
@@ -154,21 +163,21 @@ export function nextFire(recurrence: Recurrence, timeZone: string, after: Date):
         ? Math.min(recurrence.day, daysInMonth(year, month))
         : nthWeekday(year, month, recurrence.nth, recurrence.weekday);
       if (!day) continue;
-      const instant = zonedTimeToUtc(year, month, day, recurrence.hour, recurrence.minute, timeZone);
-      if (instant.getTime() > after.getTime()) return withinEnd(recurrence, instant);
+      const instant = instantAfter(year, month, day, recurrence.hour, recurrence.minute, timeZone, after);
+      if (instant) return withinEnd(recurrence, instant);
     }
     throw new WhenError("Fillip could not read that time. Try \"next Tue 2pm\" or \"every weekday 9am\".");
   }
   const start = zonedParts(after, timeZone);
-  for (let i = 0; i < 21; i += 1) {
+  for (let i = 0; i < 400; i += 1) {
     const date = addCalendarDays(start.year, start.month, start.day, i);
     const weekday = weekdayOf(date.year, date.month, date.day);
     const matches = recurrence.kind === "daily"
       || (recurrence.kind === "weekdays" && weekday >= 1 && weekday <= 5)
       || (recurrence.kind === "weekly" && weekday === recurrence.weekday);
     if (!matches) continue;
-    const instant = zonedTimeToUtc(date.year, date.month, date.day, recurrence.hour, recurrence.minute, timeZone);
-    if (instant.getTime() > after.getTime()) return withinEnd(recurrence, instant);
+    const instant = instantAfter(date.year, date.month, date.day, recurrence.hour, recurrence.minute, timeZone, after);
+    if (instant) return withinEnd(recurrence, instant);
   }
   throw new WhenError("Fillip could not read that time. Try \"next Tue 2pm\" or \"every weekday 9am\".");
 }
@@ -400,17 +409,39 @@ function parseInterval(raw: string, timeZone: string, now: Date): ResolvedWhen |
   return { fireAt, recurrence, corrected: false, note: null };
 }
 
-function parseRelative(raw: string, now: Date): ResolvedWhen | null {
+function gapNote(hour: number, minute: number, fireAt: Date, timeZone: string): string {
+  return `${formatClock(hour, minute)} does not exist that day because of daylight saving. Fillip moved it to ${formatWhen(fireAt, timeZone)}.`;
+}
+
+function overlapNote(hour: number, minute: number, fireAt: Date, instants: Date[], timeZone: string): string {
+  const which = fireAt.getTime() === instants[0]?.getTime() ? "the first" : "the second";
+  return `${formatClock(hour, minute)} is ambiguous when daylight saving ends. Fillip chose ${which} one, ${formatWhen(fireAt, timeZone)}.`;
+}
+
+function parseRelative(raw: string, timeZone: string, now: Date): ResolvedWhen | null {
   const match = raw.match(/^(?:in|after)\s+(\d+)\s+(minutes?|mins?|hours?|days?|weeks?)$/i);
   if (!match) return null;
   const count = Number(match[1]);
   const unit = (match[2] ?? "").toLowerCase();
   if (!Number.isFinite(count) || count < 1) throw new WhenError("That time is in the past. Give a future time, such as tomorrow at 9am.");
+  if (unit.startsWith("day") || unit.startsWith("week")) {
+    const days = unit.startsWith("week") ? count * 7 : count;
+    if (days > 366) throw new WhenError("That year is too far out. Reminders use this year or the next one.");
+    const parts = zonedParts(now, timeZone);
+    const date = addCalendarDays(parts.year, parts.month, parts.day, days);
+    const wall = interpretWall(date.year, date.month, date.day, parts.hour, parts.minute, timeZone);
+    const fireAt = wall.instants.find((instant) => instant.getTime() > now.getTime()) ?? wall.instants[0];
+    if (!fireAt) throw new WhenError("Fillip could not read that time. Try \"next Tue 2pm\" or \"every weekday 9am\".");
+    const local = zonedParts(fireAt, timeZone);
+    const sameClock = local.hour === parts.hour && local.minute === parts.minute && !wall.gap;
+    const note = sameClock ? null : wall.gap
+      ? gapNote(parts.hour, parts.minute, fireAt, timeZone)
+      : `Daylight saving changes the clock that day, so Fillip set ${formatWhen(fireAt, timeZone)} instead of ${formatClock(parts.hour, parts.minute)}.`;
+    return { fireAt, recurrence: null, corrected: Boolean(note), note };
+  }
   let ms = 0;
   if (unit.startsWith("min")) ms = count * 60_000;
-  else if (unit.startsWith("hour")) ms = count * 3_600_000;
-  else if (unit.startsWith("day")) ms = count * 86_400_000;
-  else ms = count * 7 * 86_400_000;
+  else ms = count * 3_600_000;
   if (ms > 366 * 86_400_000) throw new WhenError("That year is too far out. Reminders use this year or the next one.");
   return { fireAt: new Date(now.getTime() + ms), recurrence: null, corrected: false, note: null };
 }
@@ -423,13 +454,17 @@ function parseTodayTomorrow(raw: string, timeZone: string, now: Date): ResolvedW
   const date = (match[1] ?? "").toLowerCase() === "tomorrow"
     ? addCalendarDays(parts.year, parts.month, parts.day, 1)
     : parts;
-  const instant = zonedTimeToUtc(date.year, date.month, date.day, clock.hour, clock.minute, timeZone);
-  if (instant.getTime() <= now.getTime()) {
+  const wall = interpretWall(date.year, date.month, date.day, clock.hour, clock.minute, timeZone);
+  const upcoming = wall.instants.filter((instant) => instant.getTime() > now.getTime());
+  const fireAt = upcoming[0];
+  if (!fireAt) {
     const tomorrow = addCalendarDays(parts.year, parts.month, parts.day, 1);
     const suggestion = formatWhen(zonedTimeToUtc(tomorrow.year, tomorrow.month, tomorrow.day, clock.hour, clock.minute, timeZone), timeZone);
     throw new WhenError("That time today has already passed.", suggestion);
   }
-  return { fireAt: instant, recurrence: null, corrected: false, note: null };
+  if (wall.gap) return { fireAt, recurrence: null, corrected: true, note: gapNote(clock.hour, clock.minute, fireAt, timeZone) };
+  if (wall.ambiguous) return { fireAt, recurrence: null, corrected: true, note: overlapNote(clock.hour, clock.minute, fireAt, wall.instants, timeZone) };
+  return { fireAt, recurrence: null, corrected: false, note: null };
 }
 
 function parseWeekday(raw: string, timeZone: string, now: Date): ResolvedWhen | null {
@@ -463,28 +498,40 @@ function parseNextWeek(raw: string, timeZone: string, now: Date): ResolvedWhen |
   return { fireAt: instant, recurrence: null, corrected: false, note: null };
 }
 
+function fromWall(year: number, month: number, day: number, hour: number, minute: number, timeZone: string, now: Date): ResolvedWhen {
+  const wall = interpretWall(year, month, day, hour, minute, timeZone);
+  const fireAt = wall.instants.find((instant) => instant.getTime() > now.getTime()) ?? null;
+  if (!fireAt) {
+    const suggestion = suggestCalendar(month, day, hour, minute, timeZone, now);
+    throw new WhenError("That date has already passed.", suggestion);
+  }
+  if (wall.gap) return { fireAt, recurrence: null, corrected: true, note: gapNote(hour, minute, fireAt, timeZone) };
+  if (wall.ambiguous) return { fireAt, recurrence: null, corrected: true, note: overlapNote(hour, minute, fireAt, wall.instants, timeZone) };
+  return { fireAt, recurrence: null, corrected: false, note: null };
+}
+
 function placeCalendar(month: number, day: number, hour: number, minute: number, explicitYear: number | null, timeZone: string, now: Date): ResolvedWhen {
   const current = zonedParts(now, timeZone).year;
   const year = explicitYear ?? current;
   if (!isRealDate(year, month, day)) throw new WhenError("That date is not a real calendar day.");
   if (explicitYear !== null) {
-    const instant = zonedTimeToUtc(year, month, day, hour, minute, timeZone);
-    return finishExplicit(instant, explicitYear, timeZone, now, month, day, hour, minute);
+    rejectBadYear(explicitYear, timeZone, now, month, day, hour, minute);
+    return fromWall(year, month, day, hour, minute, timeZone, now);
   }
-  let instant = zonedTimeToUtc(year, month, day, hour, minute, timeZone);
-  if (instant.getTime() <= now.getTime()) {
+  try {
+    return fromWall(year, month, day, hour, minute, timeZone, now);
+  } catch (error) {
+    if (!(error instanceof WhenError)) throw error;
     const rolled = year + 1;
-    if (!isRealDate(rolled, month, day)) throw new WhenError("That date is not a real calendar day.");
-    instant = zonedTimeToUtc(rolled, month, day, hour, minute, timeZone);
-    if (instant.getTime() <= now.getTime()) throw new WhenError("That date has already passed.");
+    if (!isRealDate(rolled, month, day)) throw error;
+    const next = fromWall(rolled, month, day, hour, minute, timeZone, now);
     return {
-      fireAt: instant,
+      fireAt: next.fireAt,
       recurrence: null,
       corrected: true,
-      note: `That date already passed this year, so Fillip moved it to ${formatWhen(instant, timeZone)}.`
+      note: next.note ?? `That date already passed this year, so Fillip moved it to ${formatWhen(next.fireAt, timeZone)}.`
     };
   }
-  return { fireAt: instant, recurrence: null, corrected: false, note: null };
 }
 
 function parseMonth(raw: string, timeZone: string, now: Date): ResolvedWhen | null {
@@ -555,7 +602,7 @@ export function resolveWhen(input: string, timeZone: string, now: Date): Resolve
   const parsed = parseMonthly(peeled.body, zone, now)
     ?? parseInterval(peeled.body, zone, now)
     ?? parseEvery(peeled.body, zone, now)
-    ?? parseRelative(peeled.body, now)
+    ?? parseRelative(peeled.body, zone, now)
     ?? parseTodayTomorrow(peeled.body, zone, now)
     ?? parseNextWeek(peeled.body, zone, now)
     ?? parseWeekday(peeled.body, zone, now)

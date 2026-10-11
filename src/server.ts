@@ -104,11 +104,14 @@ async function supabaseCount(pathname: string, serviceRole: boolean): Promise<nu
     },
     signal: AbortSignal.timeout(20000)
   });
+  if (response.status === 416) return 0;
   if (!response.ok && response.status !== 206) {
     const text = await response.text();
     throw new Error(`Supabase ${response.status}: ${text || response.statusText}`);
   }
-  return contentRangeTotal(response.headers.get("content-range"));
+  const header = response.headers.get("content-range");
+  if (!header || header.endsWith("/*") || header.endsWith("/0") && response.status === 204) return 0;
+  return contentRangeTotal(header);
 }
 
 async function supabaseRequest<T>(pathname: string, options: RequestInit = {}, accessToken?: string, serviceRole = false): Promise<T> {
@@ -165,6 +168,40 @@ async function stripeRequest<T>(pathname: string, params: URLSearchParams): Prom
   return JSON.parse(await response.text()) as T;
 }
 
+const billingApplied = new Map<string, { subscriptionId: string | null; created: number }>();
+
+function eventCreated(event: { created?: unknown }): number {
+  return typeof event.created === "number" && Number.isFinite(event.created) ? event.created : 0;
+}
+
+async function knownBilling(userId: string): Promise<{ subscriptionId: string | null; created: number } | null> {
+  const memory = billingApplied.get(userId) ?? null;
+  try {
+    const rows = await supabaseRequest<Array<{ stripe_subscription_id?: string | null; billing_event_created?: number | null }>>(
+      `/rest/v1/profiles?id=eq.${encodeURIComponent(userId)}&select=stripe_subscription_id,billing_event_created`,
+      { method: "GET" },
+      undefined,
+      true
+    );
+    const row = rows?.[0];
+    const created = typeof row?.billing_event_created === "number" ? row.billing_event_created : 0;
+    const subscriptionId = typeof row?.stripe_subscription_id === "string" ? row.stripe_subscription_id : null;
+    const stored = subscriptionId || created > 0 ? { subscriptionId, created } : null;
+    if (!memory) return stored;
+    if (!stored || memory.created >= stored.created) return memory;
+    return stored;
+  } catch {
+    return memory;
+  }
+}
+
+function billingIsStale(prior: { subscriptionId: string | null; created: number } | null, subscriptionId: string | null, created: number): boolean {
+  if (!prior) return false;
+  if (created < prior.created) return true;
+  if (subscriptionId && prior.subscriptionId && subscriptionId !== prior.subscriptionId && created <= prior.created) return true;
+  return false;
+}
+
 async function updateBillingProfile(userId: string, patch: JsonObject) {
   await supabaseRequest("/rest/v1/profiles?on_conflict=id", {
     method: "POST",
@@ -209,7 +246,13 @@ app.post("/billing/webhook", express.raw({ type: "application/json" }), async (r
         stripe_subscription_id: action.subscriptionId
       });
     } else if (action.type === "subscription") {
-      await updateBillingProfile(action.userId, action.patch);
+      const created = eventCreated(event as { created?: unknown });
+      const subscriptionId = action.patch.stripe_subscription_id;
+      const prior = await knownBilling(action.userId);
+      if (!billingIsStale(prior, subscriptionId, created)) {
+        await updateBillingProfile(action.userId, { ...action.patch, billing_event_created: created });
+        billingApplied.set(action.userId, { subscriptionId, created });
+      }
     }
     res.json({ received: true });
   } catch {
@@ -262,6 +305,9 @@ app.get("/", (_req, res) => {
 app.get("/health", async (_req, res) => {
   const now = new Date();
   const limits = globalEmailLimitsFromEnv();
+  if (limits.perDay <= 0 || limits.perMonth <= 0) {
+    console.warn("Fillip global email guard is closed because FILLIP_GLOBAL_MAX_EMAILS_PER_DAY or FILLIP_GLOBAL_MAX_EMAILS_PER_MONTH is not set. Due reminders stay queued.");
+  }
   let globalEmails: GlobalEmailSnapshot | null = null;
   if (envValue("SUPABASE_URL") && envValue("SUPABASE_SERVICE_ROLE_KEY")) {
     try {
@@ -379,6 +425,9 @@ async function stopMail(req: Request, res: Response) {
   const secret = envValue("FILLIP_UNSUBSCRIBE_SECRET");
   const userId = secret ? verifyStopToken(token, secret) : null;
   if (!userId) return res.status(400).type("html").send("<!doctype html><title>Fillip by Ouroboros</title><p>This stop link is not valid or has expired.</p>");
+  if (req.method !== "POST") {
+    return res.type("html").send("<!doctype html><title>Fillip by Ouroboros</title><p>This stops every Fillip email for the whole account.</p><form method=\"post\"><button type=\"submit\">Stop these emails</button></form><p><a href=\"https://ouroborosapps.com\">Ouroboros</a></p>");
+  }
   try {
     await createServiceStore().setMailOptIn(userId, false);
   } catch {
@@ -405,7 +454,7 @@ async function deliver(req: Request, res: Response) {
       from: envValue("FILLIP_FROM_EMAIL"),
       appBaseUrl: appBaseUrl(),
       unsubscribeSecret: envValue("FILLIP_UNSUBSCRIBE_SECRET"),
-      maxEmailsPerUserPerDay: intEnv("FILLIP_MAX_EMAILS_PER_USER_PER_DAY", 20),
+      maxEmailsPerUserPerDay: intEnv("FILLIP_MAX_EMAILS_PER_USER_PER_DAY", 100),
       maxSends: intEnv("FILLIP_MAX_SENDS_PER_RUN", 40),
       minIntervalMs: intEnv("FILLIP_RESEND_MIN_INTERVAL_MS", 500),
       caps: tierCapsFromEnv(),

@@ -6,8 +6,8 @@ import { signStopToken } from "./stop-token.js";
 import { isTelegramBackoff, type TelegramSender } from "./telegram.js";
 import { advanceSeries, nextFire } from "./time.js";
 import type { DeliveryChannel, DigestSettings, OwnerContact, Reminder } from "./types.js";
-import { allowanceFor, monthStart, nextMonthStart, type TierCaps } from "./usage.js";
-import { formatClock, formatWhen, localDateKey, zonedParts } from "./zone.js";
+import { allowanceFor, emailsPerMonth, monthStart, nextMonthStart, sentThisMonth, usagePeriodCurrent, type TierCaps } from "./usage.js";
+import { formatClock, formatWhen, localDateKey, localDayStart, nextLocalDayStart, nextLocalMonthStart, zonedParts, zonedTimeToUtc } from "./zone.js";
 
 export type GlobalEmailLimits = { perDay: number; perMonth: number };
 
@@ -65,6 +65,8 @@ function globalClose(sent: number, limit: number): boolean {
 export async function readGlobalEmailSnapshot(store: ServiceStore, now: Date, limits: GlobalEmailLimits): Promise<GlobalEmailSnapshot> {
   const daySent = await store.countAllSentSince(utcDayStart(now).toISOString());
   const monthSent = await store.countAllSentSince(monthStart(now).toISOString());
+  const backoff = await store.getProviderBackoffUntil().catch(() => null);
+  const provider = Boolean(backoff && backoff > now.toISOString());
   const dayHit = daySent >= limits.perDay;
   const monthHit = monthSent >= limits.perMonth;
   return {
@@ -74,24 +76,24 @@ export async function readGlobalEmailSnapshot(store: ServiceStore, now: Date, li
     monthLimit: limits.perMonth,
     dayResetsAt: nextUtcDay(now).toISOString(),
     monthResetsAt: nextMonthStart(now).toISOString(),
-    stopped: dayHit || monthHit,
-    close: globalClose(daySent, limits.perDay) || globalClose(monthSent, limits.perMonth),
-    reason: monthHit ? "month" : dayHit ? "day" : null
+    stopped: provider || dayHit || monthHit,
+    close: provider || globalClose(daySent, limits.perDay) || globalClose(monthSent, limits.perMonth),
+    reason: provider ? "provider" : monthHit ? "month" : dayHit ? "day" : null
   };
 }
 
 const STALE_MS = 2 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-function sentThisPeriod(contact: OwnerContact, now: Date): number {
-  const start = monthStart(now).toISOString();
-  if (!contact.emailPeriodStart || contact.emailPeriodStart < start) return 0;
-  return contact.emailsSentInPeriod;
+function localMonthStartIso(now: Date, timeZone: string): string {
+  const parts = zonedParts(now, timeZone);
+  return zonedTimeToUtc(parts.year, parts.month, 1, 0, 0, timeZone).toISOString();
 }
 
-async function noteSent(store: ServiceStore, contact: OwnerContact, now: Date) {
-  const emailPeriodStart = monthStart(now).toISOString();
-  const emailsSentInPeriod = sentThisPeriod(contact, now) + 1;
+async function noteSent(store: ServiceStore, contact: OwnerContact, now: Date, timeZone: string) {
+  const current = Boolean(contact.emailPeriodStart) && usagePeriodCurrent(contact.emailPeriodStart ?? "", now, timeZone, contact.subscriptionStatus);
+  const emailPeriodStart = current && contact.emailPeriodStart ? contact.emailPeriodStart : localMonthStartIso(now, timeZone);
+  const emailsSentInPeriod = (current ? sentThisMonth(contact, now, timeZone) : 0) + 1;
   contact.emailsSentInPeriod = emailsSentInPeriod;
   contact.emailPeriodStart = emailPeriodStart;
   await store.saveUsage(contact.id, { emailsSentInPeriod, emailPeriodStart });
@@ -130,10 +132,10 @@ function messageForReminder(reminder: Reminder, from: string, to: string, stopUr
     "A calendar file is attached.",
     "",
     "This ping goes only to the verified address on your Fillip account.",
-    `Stop these emails: ${stopUrl}`,
+    `Stop every Fillip email for the whole account: ${stopUrl}`,
     "Setting another reminder turns them back on."
   ].filter((line) => line !== "").join("\n");
-  const html = `<p><strong>Fillip, reminders that fire.</strong></p><p>${escapeHtml(reminder.what)}</p>${reminder.context ? `<p>${escapeHtml(reminder.context)}</p>` : ""}<p>Due ${escapeHtml(when)}.</p>${delayed ? `<p>${escapeHtml(delayed)}</p>` : ""}<p>A calendar file is attached.</p><p>This ping goes only to the verified address on your Fillip account.</p><p><a href="${escapeHtml(stopUrl)}">Stop these emails</a>. Setting another reminder turns them back on.</p>`;
+  const html = `<p><strong>Fillip, reminders that fire.</strong></p><p>${escapeHtml(reminder.what)}</p>${reminder.context ? `<p>${escapeHtml(reminder.context)}</p>` : ""}<p>Due ${escapeHtml(when)}.</p>${delayed ? `<p>${escapeHtml(delayed)}</p>` : ""}<p>A calendar file is attached.</p><p>This ping goes only to the verified address on your Fillip account.</p><p><a href="${escapeHtml(stopUrl)}">Stop every Fillip email for the whole account</a>. Setting another reminder turns them back on.</p>`;
   return {
     from,
     to,
@@ -179,7 +181,8 @@ async function advanceIfSent(store: ServiceStore, reminder: Reminder, occurrence
   if (reminder.fireAt !== occurrenceAt || reminder.status !== "active") return;
   if (reminder.recurrence) {
     const series = advanceSeries(reminder.recurrence);
-    const next = series.done ? null : nextFire(series.recurrence, reminder.timezone, new Date(occurrenceAt));
+    const after = new Date(Math.max(new Date(occurrenceAt).getTime(), now.getTime()));
+    const next = series.done ? null : nextFire(series.recurrence, reminder.timezone, after);
     if (!next) {
       await store.saveReminder({
         ...reminder,
@@ -326,21 +329,22 @@ export async function runDueJob(options: {
       report.skipped += 1;
       continue;
     }
-    const allowance = allowanceFor(contact, options.now, options.caps);
+    const allowance = allowanceFor(contact, options.now, options.caps, reminder.timezone);
     if (allowance.reached) {
       await options.store.saveReminder({
         ...reminder,
-        holdUntil: nextMonthStart(options.now).toISOString(),
+        holdUntil: nextLocalMonthStart(options.now, reminder.timezone).toISOString(),
         updatedAt: nowIso
       });
       report.deferred += 1;
       continue;
     }
-    const underUserCap = async () => (await options.store.countSentSince(reminder.ownerId, since)) < options.maxEmailsPerUserPerDay;
+    const daySince = localDayStart(options.now, reminder.timezone).toISOString();
+    const underUserCap = async () => (await options.store.countSentSince(reminder.ownerId, daySince)) < options.maxEmailsPerUserPerDay;
     if (!(await underUserCap())) {
       await options.store.saveReminder({
         ...reminder,
-        holdUntil: new Date(options.now.getTime() + DAY_MS).toISOString(),
+        holdUntil: nextLocalDayStart(options.now, reminder.timezone).toISOString(),
         updatedAt: nowIso
       });
       report.deferred += 1;
@@ -370,7 +374,7 @@ export async function runDueJob(options: {
           try {
             const result = await options.telegram.sender.send(contact.telegramChatId, telegramText(reminder, options.now));
             await options.store.saveDelivery({ ...claim.delivery, status: "sent", providerId: result.id, sentAt: nowIso, error: null });
-            await noteSent(options.store, contact, options.now);
+            await noteSent(options.store, contact, options.now, reminder.timezone);
             telegramDone = true;
             delivered = true;
             report.sent += 1;
@@ -408,7 +412,13 @@ export async function runDueJob(options: {
     refreshStop();
     const emailBlocked = Boolean(providerHold) || global.stopped;
     if (mode.email && emailPossible && contact.email) {
-      if (emailBlocked || providerCalls >= options.maxSends) {
+      if (providerCalls >= options.maxSends && !emailBlocked) {
+        // This run's send budget is spent. Leave the rest due for the next run
+        // instead of holding them until the following UTC day.
+        report.deferred += 1;
+        break;
+      }
+      if (emailBlocked) {
         note(guardText());
         const until = providerHold ?? (global.reason === "month" ? global.monthResetsAt : global.dayResetsAt);
         const current = await options.store.getReminder(reminder.ownerId, reminder.id);
@@ -420,63 +430,118 @@ export async function runDueJob(options: {
       } else if (!(await underUserCap())) {
         report.deferred += 1;
       } else {
-        const to = assertSingleRecipient(contact.email);
-        const idempotencyKey = `fillip/${reminder.id}/${reminder.fireAt}`;
-        const claim = await options.store.claimDelivery({
+        let to = "";
+        try {
+          to = assertSingleRecipient(contact.email);
+        } catch {
+          report.failed += 1;
+          continue;
+        }
+        const slot = options.store.reserveSend({
           ownerId: reminder.ownerId,
-          reminderId: reminder.id,
-          dedupeKey: `reminder:${reminder.id}:${reminder.fireAt}:email`,
-          occurrenceAt: reminder.fireAt,
-          idempotencyKey,
-          channel: "email",
-          nowIso,
-          staleBeforeIso: staleBefore
+          now: options.now,
+          timeZone: reminder.timezone,
+          sinceIso: daySince,
+          monthlyLimit: emailsPerMonth(allowance.tier, options.caps),
+          dailyLimit: options.maxEmailsPerUserPerDay,
+          globalDayStartIso: utcDayStart(options.now).toISOString(),
+          globalMonthStartIso: monthStart(options.now).toISOString(),
+          globalDayLimit: options.global.perDay,
+          globalMonthLimit: options.global.perMonth,
+          countGlobal: true
         });
-        if (claim.outcome === "already-sent") emailDone = true;
-        else if (claim.outcome === "in-progress") report.skipped += 1;
-        else {
-          const stopUrl = stopLink(options.appBaseUrl, reminder.ownerId, options.unsubscribeSecret, options.now);
-          const fresh = await options.store.getReminder(reminder.ownerId, reminder.id) ?? reminder;
-          const message = messageForReminder(fresh, options.from, to, stopUrl, options.now);
-          try {
-            await takeSlot();
-            const result = await options.sender.send(message);
-            await options.store.saveDelivery({
-              ...claim.delivery,
-              status: "sent",
-              providerId: result.id,
-              sentAt: nowIso,
-              error: null
-            });
-            await noteSent(options.store, contact, options.now);
-            global.daySent += 1;
-            global.monthSent += 1;
-            refreshStop();
-            emailDone = true;
-            delivered = true;
-            report.sent += 1;
-          } catch (error) {
-            if (error instanceof ProviderQuotaError) {
+        if (!slot.ok) {
+          const until = slot.reason === "global-month"
+            ? global.monthResetsAt
+            : slot.reason === "month"
+              ? nextLocalMonthStart(options.now, reminder.timezone).toISOString()
+              : slot.reason === "global-day"
+                ? global.dayResetsAt
+                : nextLocalDayStart(options.now, reminder.timezone).toISOString();
+          const current = await options.store.getReminder(reminder.ownerId, reminder.id);
+          if (current && current.status === "active") {
+            const holdUntil = current.holdUntil && current.holdUntil > until ? current.holdUntil : until;
+            await options.store.saveReminder({ ...current, status: "active", holdUntil, updatedAt: nowIso });
+          }
+          report.deferred += 1;
+          continue;
+        }
+        const idempotencyKey = `fillip/${reminder.id}/${reminder.fireAt}`;
+        let release = true;
+        try {
+          const claim = await options.store.claimDelivery({
+            ownerId: reminder.ownerId,
+            reminderId: reminder.id,
+            dedupeKey: `reminder:${reminder.id}:${reminder.fireAt}:email`,
+            occurrenceAt: reminder.fireAt,
+            idempotencyKey,
+            channel: "email",
+            nowIso,
+            staleBeforeIso: staleBefore
+          });
+          if (claim.outcome === "already-sent") emailDone = true;
+          else if (claim.outcome === "in-progress") report.skipped += 1;
+          else if (!options.store.beginSend(idempotencyKey)) report.skipped += 1;
+          else {
+            release = false;
+            let accepted = false;
+            try {
+              const stopUrl = stopLink(options.appBaseUrl, reminder.ownerId, options.unsubscribeSecret, options.now);
+              const fresh = await options.store.getReminder(reminder.ownerId, reminder.id) ?? reminder;
+              const message = messageForReminder(fresh, options.from, to, stopUrl, options.now);
+              await takeSlot();
+              const result = await options.sender.send(message);
+              accepted = true;
               await options.store.saveDelivery({
                 ...claim.delivery,
-                status: "failed",
-                error: "provider backoff",
-                providerId: null,
-                sentAt: null,
-                startedAt: nowIso
+                status: "sent",
+                providerId: result.id,
+                sentAt: nowIso,
+                error: null
               });
-              await beginProviderBackoff();
-              report.deferred += 1;
-            } else {
-              await options.store.saveDelivery({
-                ...claim.delivery,
-                status: "failed",
-                error: "send failed",
-                startedAt: nowIso
-              });
-              report.failed += 1;
+              try {
+                await noteSent(options.store, contact, options.now, reminder.timezone);
+              } catch {
+                warn("Fillip recorded the provider accept but could not update the allowance. The occurrence will not be sent again.");
+              }
+              global.daySent += 1;
+              global.monthSent += 1;
+              refreshStop();
+              emailDone = true;
+              delivered = true;
+              report.sent += 1;
+            } catch (error) {
+              if (accepted) {
+                emailDone = true;
+                delivered = true;
+                report.sent += 1;
+              } else if (error instanceof ProviderQuotaError) {
+                await options.store.saveDelivery({
+                  ...claim.delivery,
+                  status: "failed",
+                  error: "provider backoff",
+                  providerId: null,
+                  sentAt: null,
+                  startedAt: nowIso
+                });
+                await beginProviderBackoff();
+                report.deferred += 1;
+              } else {
+                await options.store.saveDelivery({
+                  ...claim.delivery,
+                  status: "failed",
+                  error: "send failed",
+                  startedAt: nowIso
+                });
+                report.failed += 1;
+              }
+            } finally {
+              options.store.finishSend(idempotencyKey);
+              options.store.releaseSend(slot.id);
             }
           }
+        } finally {
+          if (release) options.store.releaseSend(slot.id);
         }
       }
     }
@@ -544,8 +609,8 @@ async function sendDigest(
   const contact = await options.store.getContact(digest.ownerId);
   if (!contact || contact.unsubscribed || !contact.emailVerified || !contact.email) return "skipped";
   if (options.global.perDay <= 0 || options.global.perMonth <= 0) return "deferred";
-  if (allowanceFor(contact, options.now, options.caps).reached) return "deferred";
-  const sentToday = await options.store.countSentSince(digest.ownerId, since);
+  if (allowanceFor(contact, options.now, options.caps, digest.timezone).reached) return "deferred";
+  const sentToday = await options.store.countSentSince(digest.ownerId, localDayStart(options.now, digest.timezone).toISOString());
   if (sentToday >= options.maxEmailsPerUserPerDay) return "deferred";
   const rows = await options.store.listReminders(digest.ownerId, { status: "active" });
   const todays = rows.filter((row) => localDateKey(new Date(row.fireAt), digest.timezone) === today || row.fireAt <= nowIso);
@@ -598,7 +663,7 @@ async function sendDigest(
       }
     });
     await options.store.saveDelivery({ ...claim.delivery, status: "sent", providerId: result.id, sentAt: nowIso, error: null });
-    await noteSent(options.store, contact, options.now);
+    await noteSent(options.store, contact, options.now, digest.timezone);
     onSent();
     await options.store.saveDigest({ ...digest, lastSentOn: today, updatedAt: nowIso });
     return "sent";

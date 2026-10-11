@@ -3,7 +3,7 @@ import { MemoryFillipStore } from "../src/lib/memory-store.js";
 import { completeOrCancel, followUp, listReminders, saveDigestSettings, setReminder, snoozeOrReschedule } from "../src/lib/reminders.js";
 import { WhenError } from "../src/lib/time.js";
 import { MAX_ACTIVE_REMINDERS, type Actor, type Reminder } from "../src/lib/types.js";
-import { ALLOWANCE_REACHED, freeOpenMessage, monthStart, tierCapsFromEnv, UPGRADE_PROMPT } from "../src/lib/usage.js";
+import { ALLOWANCE_REACHED, freeEmailsPerMonth, freeOpenMessage, freeOpenReminders, monthStart, tierCapsFromEnv, UPGRADE_PROMPT } from "../src/lib/usage.js";
 
 const now = new Date("2026-10-11T18:00:00.000Z");
 const actor: Actor = { id: "11111111-1111-4111-8111-111111111111", email: "owner@example.com", emailVerified: true };
@@ -135,7 +135,8 @@ describe("reminder CRUD", () => {
       .rejects.toThrow(freeOpenMessage(2));
     await expect(setReminder(store, actor, { what: "Three", when: "tomorrow 11am", timezone: "UTC" }, now, caps))
       .rejects.toThrow(UPGRADE_PROMPT);
-    expect(tierCapsFromEnv({})).toMatchObject({ freeOpenReminders: 10, freeEmailsPerMonth: 30 });
+    expect(freeOpenReminders(tierCapsFromEnv({}))).toBe(10);
+    expect(freeEmailsPerMonth(tierCapsFromEnv({}))).toBe(30);
     expect(tierCapsFromEnv({ FILLIP_CAP_FREE_OPEN_REMINDERS: "4", FILLIP_CAP_FREE_EMAILS_PER_MONTH: "12" }))
       .toMatchObject({ freeOpenReminders: 4, freeEmailsPerMonth: 12 });
   });

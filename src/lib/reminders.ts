@@ -3,7 +3,7 @@ import { newId, type ReminderStore, type ServiceStore } from "./store.js";
 import { newSecretToken, telegramDeepLink, telegramUsername } from "./telegram.js";
 import { applyRepeat, describeRecurrence, nextFire, parseClock, recurrenceFromCadence, resolveWhen, type RepeatChoice, type ResolvedWhen } from "./time.js";
 import { MAX_ACTIVE_REMINDERS, MAX_CREATES_PER_HOUR, type Actor, type DeliveryChannel, type DigestSettings, type Reminder, type ReminderStatus } from "./types.js";
-import { assertWithinAllowance, freeOpenMessage, freeOpenReminders, STAND_IN_CAPS, tierFor, type TierCaps } from "./usage.js";
+import { allowanceFor, assertWithinAllowance, freeOpenMessage, freeOpenReminders, STAND_IN_CAPS, tierFor, type Allowance, type TierCaps } from "./usage.js";
 import { assertTimeZone, formatWhen, localDateKey, zonedParts } from "./zone.js";
 
 export type ReminderView = {
@@ -137,12 +137,19 @@ export async function setReminder(store: ReminderStore, actor: Actor, input: {
   return view(reminder, now, { corrected: resolved.corrected, note });
 }
 
+function holdExplanation(reminder: Reminder, allowance: Allowance): string | null {
+  if (reminder.status !== "active" || !reminder.holdUntil) return null;
+  if (allowance.reached && allowance.message) return allowance.message;
+  return "This reminder is queued and held by the email guard, so the email will be delayed.";
+}
+
 export async function listReminders(store: ReminderStore, ownerId: string, input: {
   status?: ReminderStatus | "all";
   range?: "upcoming" | "today" | "week" | "past" | "any";
   timezone?: string;
-}, now: Date): Promise<ReminderView[]> {
+}, now: Date, caps: TierCaps = STAND_IN_CAPS): Promise<ReminderView[]> {
   const rows = await store.listReminders(ownerId, { status: input.status ?? "active" });
+  const usage = await store.getUsage(ownerId);
   const weekEnd = now.getTime() + 7 * 86_400_000;
   const filtered = rows.filter((row) => {
     const fire = new Date(row.fireAt).getTime();
@@ -151,7 +158,10 @@ export async function listReminders(store: ReminderStore, ownerId: string, input
     if (input.range === "week") return fire >= now.getTime() - 86_400_000 && fire <= weekEnd;
     return true;
   });
-  return filtered.map((row) => view(row, now));
+  return filtered.map((row) => {
+    const allowance = allowanceFor(usage, now, caps, input.timezone || row.timezone);
+    return view(row, now, { note: holdExplanation(row, allowance) });
+  });
 }
 
 export async function snoozeOrReschedule(store: ReminderStore, ownerId: string, id: string, until: string, timezone: string | undefined, now: Date): Promise<ReminderView> {

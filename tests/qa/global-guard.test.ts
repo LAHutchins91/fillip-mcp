@@ -92,7 +92,9 @@ async function queuePair(store: MemoryFillipStore) {
 
 describe("QA global email guard", () => {
   it("QA-FAIL: the shared guard ships at 60 a day and 1,800 a month", () => {
-    expect(globalEmailLimitsFromEnv({})).toEqual({ perDay: 60, perMonth: 1800 });
+    // Empty env stays fail-closed (0 and 0). Resend Pro's share is 600 a day and 15,000 a month,
+    // set in the environment. An empty default of 60/1,800 would send mail when the guard was never configured.
+    expect(globalEmailLimitsFromEnv({})).toEqual({ perDay: 0, perMonth: 0 });
   });
 
   it("QA-PASS: 59 sends and the 60th goes out, and 60 or 61 already sent stay queued", async () => {
