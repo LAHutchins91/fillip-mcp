@@ -1,0 +1,22 @@
+-- Optional delivery schedule using pg_cron and pg_net.
+-- Prefer Vercel Cron on GET /internal/deliver when the app is hosted on Vercel.
+-- Vercel sends Authorization: Bearer CRON_SECRET when that variable is set on the project.
+-- Replace the host and secret here only in the database, not in git.
+
+-- create extension if not exists pg_cron;
+-- create extension if not exists pg_net;
+--
+-- select cron.schedule(
+--   'fillip-deliver',
+--   '* * * * *',
+--   $$
+--   select net.http_post(
+--     url := 'https://YOUR_HOST/internal/deliver',
+--     headers := jsonb_build_object(
+--       'Authorization', 'Bearer YOUR_CRON_SECRET',
+--       'Content-Type', 'application/json'
+--     ),
+--     body := '{}'::jsonb
+--   );
+--   $$
+-- );

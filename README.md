@@ -1,2 +1,121 @@
-# fillip-mcp
-Fillip by Ouroboros: reminders and follow-ups from ChatGPT, Claude, Cursor, and Grok that actually fire. Hosted MCP server.
+# Fillip by Ouroboros
+
+Fillip, reminders that fire.
+
+Remind me to follow up on this next Tuesday at 2pm, and actually ping me. You say that inside ChatGPT, Claude, Cursor, or Grok. Fillip emails you when it is due, even if your laptop is off.
+
+It works with any MCP client that can do Streamable HTTP and OAuth. It is not a ChatGPT-only plugin.
+
+Sign in with your Fillip account when the assistant opens OAuth. Do not paste an access token or password into a header. Reminder tools need Pro or an active trial. The trial is 14 days, then Pro. Checkout shows the plan terms. This page does not print a price.
+
+More from Ouroboros: https://ouroborosapps.com
+
+## What the assistant can do
+
+After you approve the connection, the server exposes these tools:
+
+- `set_reminder` — “next Tue 2pm” or “every weekday 9am”, in your timezone. Fillip reads the time itself. A past date or a wrong year is rejected or moved forward, and the assistant is told which.
+- `list_reminders`
+- `snooze_or_reschedule`
+- `complete_or_cancel` — marking a follow-up done stops the nudges
+- `follow_up` — keeps emailing until you mark it done
+- `digest_settings` — an optional once-a-day summary
+
+Creating a reminder opts you in. Fillip emails only the verified address on that account. There is no field for another recipient. Every email has a stop link. Setting another reminder turns mail back on.
+
+Each plan has its own monthly reminder-email allowance. The numbers are configuration, not printed here. When the allowance is used up, Fillip says so and does not send more until it resets. A heavier month cannot cost more than that plan pays for.
+
+The assistant only calls these tools when you and the host allow it.
+
+## Connect
+
+Run the server and use its `/mcp` path. With the default local base, that is `http://localhost:3000/mcp`. A deployed host uses the same path on `APP_BASE_URL`.
+
+Cursor, in `~/.cursor/mcp.json` or a project `.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "fillip": {
+      "url": "http://localhost:3000/mcp"
+    }
+  }
+}
+```
+
+Claude Code:
+
+```bash
+claude mcp add --transport http fillip http://localhost:3000/mcp
+```
+
+Do not pass an Authorization header. Other clients add the same URL, choose OAuth, and leave client id and secret empty. Fillip supports dynamic client registration. Full steps for ChatGPT, Claude, Gemini, Grok, and Cursor are on the server's `/connect` page.
+
+When stdin is a terminal, Fillip serves Streamable HTTP. When stdin is not a terminal, it also speaks MCP on stdio, so a launcher such as Glama can attach stdin. Local stdio can hold a schedule on disk. Email goes out only for a signed-in hosted account with a verified address.
+
+Registry metadata for this server is in `server.json` (`io.github.LAHutchins91/fillip`). Add the public remote URL there after the host exists.
+
+## Run
+
+```bash
+npm ci
+npm test
+npm run build
+npm start
+```
+
+`GET /health` reports whether Supabase, Stripe, and the sender are configured. `POST /mcp` with `tools/list` answers without a sign-in. Tool calls require OAuth and an active trial or Pro.
+
+```bash
+docker build -t fillip-mcp .
+docker run --rm -p 3000:3000 fillip-mcp
+```
+
+A container without a terminal on stdin speaks MCP on stdio and still listens on port 3000.
+
+## Environment
+
+Copy `.env.example` to `.env`. Fillip reads these variables and does not invent a sender address or a Stripe price.
+
+| Variable | Purpose |
+| --- | --- |
+| `PORT` | HTTP port. Defaults to 3000. |
+| `APP_BASE_URL` | Public origin, no trailing slash. Used for OAuth resource metadata, checkout return URLs, and stop links. |
+| `SUPABASE_URL` | Supabase project URL. |
+| `SUPABASE_ANON_KEY` | Supabase anon key for browser sign-in. |
+| `SUPABASE_SERVICE_ROLE_KEY` | Service role for the delivery job, billing profile writes, and the stop link. |
+| `STRIPE_SECRET_KEY` | Stripe secret for Checkout and the billing portal. |
+| `STRIPE_WEBHOOK_SECRET` | Signing secret for `POST /billing/webhook`. |
+| `STRIPE_PRODUCT_ID` | Fillip's own Stripe product id. Webhook events for any other product are ignored. |
+| `STRIPE_PRICE_MONTHLY` | Fillip's monthly price id on that product. Not printed. |
+| `STRIPE_PRICE_YEARLY` | Fillip's yearly price id on that product. Not printed. |
+| `RESEND_API_KEY` | Resend token used only by the delivery job. |
+| `FILLIP_FROM_EMAIL` | From address on a domain you have verified in Resend. Required. There is no default address. |
+| `FILLIP_UNSUBSCRIBE_SECRET` | HMAC secret for stop links. Required before any email is sent. |
+| `CRON_SECRET` | Bearer token for `GET` or `POST /internal/deliver`. |
+| `FILLIP_DATA_DIR` | Local schedule and support-form files when Supabase is not configured. |
+| `FILLIP_PUBLIC_ORIGIN` | Optional public origin when `APP_BASE_URL` is still a legacy host. |
+| `FILLIP_LEGACY_ORIGIN` | Optional earlier origin. Connect copy mentions it only when this is set. |
+| `OPENAI_APPS_CHALLENGE` | Optional token served at `/.well-known/openai-apps-challenge`. |
+| `FILLIP_MAX_EMAILS_PER_USER_PER_DAY` | Per-account send cap. Defaults to 20. |
+| `FILLIP_MAX_SENDS_PER_RUN` | Provider calls in one sweep. Defaults to 40. |
+| `FILLIP_RESEND_MIN_INTERVAL_MS` | Pause between provider calls. Defaults to 500, which stays under a common 2 requests per second. |
+| `FILLIP_CAP_TRIAL_EMAILS_PER_MONTH` | Reminder emails allowed during the 14-day trial. Empty uses a stand-in count so an unset variable is not unlimited. Set the real allowance before launch. |
+| `FILLIP_CAP_PRO_EMAILS_PER_MONTH` | Reminder emails allowed in a month on the monthly plan. Empty uses a stand-in count. |
+| `FILLIP_CAP_ANNUAL_EMAILS_PER_MONTH` | Reminder emails allowed in a month on the yearly plan. Empty uses a stand-in count. |
+
+Accounts can also keep at most 100 open reminders and create at most 30 in an hour.
+
+## Hosting setup
+
+Nothing in this repo creates a Vercel project, a Supabase project, a Stripe product, or a Resend domain. Do these on the accounts you host with. Fillip does not share a Stripe product with other apps.
+
+1. Create a Supabase project. Run `supabase/schema.sql`, then `supabase/oauth_resource_binding.sql`. In Authentication → Auth Hooks, set Customize Access Token Claims to `public.fillip_access_token_hook`. Set `fillip_private.settings.mcp_resource` to `APP_BASE_URL/mcp` (see `supabase/README-oauth.md`). Add redirect URLs for `APP_BASE_URL` and `APP_BASE_URL/oauth/consent`. Enable Google sign-in if you want the one-click button.
+2. In Stripe, create Fillip's own product and two prices on it, monthly and yearly. Put those ids in `STRIPE_PRODUCT_ID`, `STRIPE_PRICE_MONTHLY`, and `STRIPE_PRICE_YEARLY`. Point a webhook at `APP_BASE_URL/billing/webhook` for `checkout.session.completed` and the customer subscription events. Checkout starts a 14-day trial, then Pro, and stamps the Fillip product id on the session. The webhook applies an event only when every product id on it is `STRIPE_PRODUCT_ID` and the price is one of those two. Other products on the same Stripe account are ignored. Set `FILLIP_CAP_TRIAL_EMAILS_PER_MONTH`, `FILLIP_CAP_PRO_EMAILS_PER_MONTH`, and `FILLIP_CAP_ANNUAL_EMAILS_PER_MONTH` to the allowances those plans can afford. Until they are set, Fillip uses a stand-in count so a missing variable cannot mean unlimited mail.
+3. In Resend, verify the domain you will send from. Set `RESEND_API_KEY` and `FILLIP_FROM_EMAIL` to an address on that domain. Fillip sends one recipient, the account's verified email, with an idempotency key of `fillip/<reminder>/<occurrence>` so a retry does not send a second copy.
+4. Generate `FILLIP_UNSUBSCRIBE_SECRET` and `CRON_SECRET`. Set `APP_BASE_URL` to the public origin.
+5. Deploy the Dockerfile or `npm start`. Do not commit `.env`.
+6. Schedule delivery once a minute. On Vercel, `vercel.json` already calls `GET /internal/deliver`. Set `CRON_SECRET` on the project and Vercel sends it as a bearer token. On Supabase, the commented schedule in `supabase/cron.sql` posts to the same path with `pg_cron` and `pg_net`. One of those is enough.
+7. After the public URL exists, put it in `server.json` `remotes` and in the connect instructions you give people. Update `mcp_resource` if the host changed, then reconnect clients.
+
+`GET /health` should show the Supabase, Stripe, Resend, and sender flags as true before you rely on a ping.

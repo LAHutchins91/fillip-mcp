@@ -1,0 +1,15 @@
+{
+  "name": "fillip",
+  "displayName": "Fillip by Ouroboros",
+  "version": "1.0.0",
+  "description": "Remind me to follow up next Tuesday at 2pm, and actually ping me, even when the laptop is off.",
+  "author": {
+    "name": "Ouroboros"
+  },
+  "homepage": "https://ouroborosapps.com",
+  "repository": "https://github.com/LAHutchins91/fillip-mcp",
+  "license": "MIT",
+  "keywords": ["reminders", "follow-ups", "mcp"],
+  "logo": "icon.svg",
+  "publisher": "Ouroboros"
+}
