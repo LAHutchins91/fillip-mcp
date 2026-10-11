@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { advanceSeries, nextFire, WhenError, resolveWhen } from "../src/lib/time.js";
+import { advanceSeries, applyRepeat, nextFire, WhenError, resolveWhen } from "../src/lib/time.js";
 import { zonedParts, zonedTimeToUtc } from "../src/lib/zone.js";
 
 const zone = "America/New_York";
@@ -164,5 +164,34 @@ describe("past and wrong-year guards", () => {
     });
     expect(series.done).toBe(true);
     expect(series.recurrence.ends?.completed).toBe(2);
+  });
+});
+
+describe("repeat merged with free text", () => {
+  it("keeps a monthly rule and an end date when repeat agrees", () => {
+    const monthly = applyRepeat(resolveWhen("first Monday of every month", zone, now), undefined, zone);
+    expect(monthly.recurrence).toMatchObject({ kind: "monthly_nth", nth: 1, weekday: 1 });
+
+    const daily = applyRepeat(resolveWhen("every day until Dec", zone, now), "daily", zone);
+    expect(daily.recurrence).toMatchObject({ kind: "daily", ends: { count: null, completed: 0 } });
+    expect(daily.recurrence && "ends" in daily.recurrence ? daily.recurrence.ends?.until : null).toBeTruthy();
+
+    const weekly = applyRepeat(resolveWhen("every Monday 9am until Dec", zone, now), "weekly", zone);
+    expect(weekly.recurrence).toMatchObject({ kind: "weekly", weekday: 1 });
+    expect(weekly.recurrence && "ends" in weekly.recurrence ? weekly.recurrence.ends?.until : null).toBeTruthy();
+  });
+
+  it("still applies repeat when the words have no schedule of their own", () => {
+    const resolved = applyRepeat(resolveWhen("tomorrow 9am", zone, now), "daily", zone);
+    expect(resolved.recurrence).toEqual({ kind: "daily", hour: 9, minute: 0 });
+  });
+
+  it("rejects a repeat that would drop a monthly rule or an end date", () => {
+    expect(() => applyRepeat(resolveWhen("first Monday of every month", zone, now), "weekly", zone))
+      .toThrow(/first Monday of every month[\s\S]*conflicts with repeat "weekly"/);
+    expect(() => applyRepeat(resolveWhen("every 2 weeks until Dec", zone, now), "weekly", zone))
+      .toThrow(/every 2 weeks[\s\S]*until[\s\S]*conflicts with repeat "weekly"/);
+    expect(() => applyRepeat(resolveWhen("every Monday 9am", zone, now), "once", zone))
+      .toThrow(/conflicts with repeat "once"/);
   });
 });

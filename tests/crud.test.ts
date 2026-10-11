@@ -52,8 +52,87 @@ describe("reminder CRUD", () => {
     }, now);
     expect(follow.kind).toBe("follow_up");
     expect(follow.repeats).toMatch(/weekday/);
+    expect(follow.note).toMatch(/until you mark it done/);
     const saved = await store.getReminder(actor.id, follow.id);
     expect(saved?.recurrence).toEqual({ kind: "weekdays", hour: 9, minute: 0 });
+
+    const limited = await followUp(store, actor, {
+      topic: "Check the contract twice",
+      cadence: "every weekday 9am for 2 times",
+      timezone: "America/New_York"
+    }, now);
+    expect(limited.note).toMatch(/stops at that limit even if it is not marked done/);
+    expect(limited.repeats).toMatch(/2 times/);
+
+    const until = await followUp(store, actor, {
+      topic: "Check the contract through December",
+      cadence: "every 2 weeks until Dec",
+      timezone: "America/New_York"
+    }, now);
+    expect(until.note).toMatch(/stops at that limit even if it is not marked done/);
+    expect(until.repeats).toMatch(/until/);
+  });
+
+  it("rejects a repeat option that conflicts with the words and does not save it", async () => {
+    const store = storeWithActor();
+    await expect(setReminder(store, actor, {
+      what: "Board meeting",
+      when: "first Monday of every month",
+      timezone: "America/New_York",
+      repeat: "weekly"
+    }, now)).rejects.toThrow(/conflicts with repeat "weekly"/);
+    await expect(setReminder(store, actor, {
+      what: "Invoice",
+      when: "every 2 weeks until Dec",
+      timezone: "America/New_York",
+      repeat: "weekly"
+    }, now)).rejects.toThrow(/until/);
+    expect(store.reminders).toHaveLength(0);
+
+    const kept = await setReminder(store, actor, {
+      what: "Monday review",
+      when: "every Monday 9am until Dec",
+      timezone: "America/New_York",
+      repeat: "weekly"
+    }, now);
+    expect(kept.repeats).toMatch(/Monday/);
+    expect(kept.repeats).toMatch(/until/);
+  });
+
+  it("pauses a reminder and resumes it onto the next future occurrence", async () => {
+    const store = storeWithActor();
+    const created = await setReminder(store, actor, {
+      what: "Weekly review",
+      when: "every Monday 9am",
+      timezone: "America/New_York"
+    }, now);
+    const paused = await snoozeOrReschedule(store, actor.id, created.id, undefined, undefined, now, "pause");
+    expect(paused.status).toBe("paused");
+    expect(paused.note).toMatch(/will not send/);
+    const found = await listReminders(store, actor.id, { status: "paused" }, now);
+    expect(found.map((row) => row.id)).toEqual([created.id]);
+    expect(await listReminders(store, actor.id, { status: "active" }, now)).toHaveLength(0);
+
+    const later = new Date("2026-10-20T18:00:00.000Z");
+    const resumed = await snoozeOrReschedule(store, actor.id, created.id, undefined, "America/New_York", later, "resume");
+    expect(resumed.status).toBe("active");
+    expect(new Date(resumed.fireAt).getTime()).toBeGreaterThan(later.getTime());
+    expect(resumed.localTime).toMatch(/October 26, 2026/);
+    expect(resumed.note).toMatch(/Next ping/);
+
+    const ahead = await setReminder(store, actor, { what: "Still ahead", when: "tomorrow 9am", timezone: "America/New_York" }, now);
+    await snoozeOrReschedule(store, actor.id, ahead.id, undefined, undefined, now, "pause");
+    const same = await snoozeOrReschedule(store, actor.id, ahead.id, undefined, undefined, now, "resume");
+    expect(same.fireAt).toBe(ahead.fireAt);
+
+    const once = await setReminder(store, actor, { what: "One shot", when: "tomorrow 4pm", timezone: "America/New_York" }, now);
+    const row = await store.getReminder(actor.id, once.id);
+    if (!row) throw new Error("missing reminder");
+    await store.saveReminder({ ...row, fireAt: new Date(now.getTime() - 60_000).toISOString(), status: "paused" });
+    await expect(snoozeOrReschedule(store, actor.id, once.id, undefined, undefined, now, "resume"))
+      .rejects.toThrow(/one-time reminder is already in the past/);
+    await expect(snoozeOrReschedule(store, actor.id, created.id, undefined, undefined, now))
+      .rejects.toThrow(/Name a time to move this reminder/);
   });
 
   it("rejects a wrong year and does not save it", async () => {

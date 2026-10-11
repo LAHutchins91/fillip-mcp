@@ -617,13 +617,29 @@ export function resolveWhen(input: string, timeZone: string, now: Date): Resolve
 
 export type RepeatChoice = "once" | "daily" | "weekdays" | "weekly";
 
+function repeatAgrees(recurrence: Recurrence, repeat: RepeatChoice, timeZone: string, fireAt: Date): boolean {
+  if (repeat === "once") return false;
+  if (repeat === "daily") return recurrence.kind === "daily" || (recurrence.kind === "every_n_days" && recurrence.interval === 1);
+  if (repeat === "weekdays") return recurrence.kind === "weekdays";
+  if (recurrence.kind === "weekly") return true;
+  if (recurrence.kind === "every_n_weeks" && recurrence.interval === 1) {
+    return recurrence.weekday === zonedParts(fireAt, timeZone).weekday;
+  }
+  return false;
+}
+
 export function applyRepeat(resolved: ResolvedWhen, repeat: RepeatChoice | undefined, timeZone: string): ResolvedWhen {
   if (!repeat) return resolved;
-  if (repeat === "once") return { ...resolved, recurrence: null };
-  const parts = zonedParts(resolved.fireAt, timeZone);
-  if (repeat === "daily") return { ...resolved, recurrence: { kind: "daily", hour: parts.hour, minute: parts.minute } };
-  if (repeat === "weekdays") return { ...resolved, recurrence: { kind: "weekdays", hour: parts.hour, minute: parts.minute } };
-  return { ...resolved, recurrence: { kind: "weekly", weekday: parts.weekday, hour: parts.hour, minute: parts.minute } };
+  const existing = resolved.recurrence;
+  if (!existing) {
+    if (repeat === "once") return { ...resolved, recurrence: null };
+    const parts = zonedParts(resolved.fireAt, timeZone);
+    if (repeat === "daily") return { ...resolved, recurrence: { kind: "daily", hour: parts.hour, minute: parts.minute } };
+    if (repeat === "weekdays") return { ...resolved, recurrence: { kind: "weekdays", hour: parts.hour, minute: parts.minute } };
+    return { ...resolved, recurrence: { kind: "weekly", weekday: parts.weekday, hour: parts.hour, minute: parts.minute } };
+  }
+  if (repeatAgrees(existing, repeat, timeZone, resolved.fireAt)) return resolved;
+  throw new WhenError(`Those words already schedule this as ${describeRecurrence(existing)}, which conflicts with repeat "${repeat}". Leave repeat off when the words include the schedule.`);
 }
 
 export function recurrenceFromCadence(cadence: string, timeZone: string, now: Date): Recurrence {

@@ -12,12 +12,14 @@ const KNOWN = [
   "That reminder is already",
   "Too many reminders",
   "The free plan",
-  "This plan's reminder emails",
+  "This plan's reminder pings",
   "Telegram is not offered",
   "Telegram is not linked",
   "Choose email, Telegram, or both",
   "An end date needs",
   "That repeating reminder has already ended",
+  "That one-time reminder is already in the past",
+  "Name a time to move this reminder",
   "Choose a timezone",
   "Digest time",
   "That date is not a real calendar day",
@@ -28,7 +30,7 @@ export function publicError(error: unknown): { status: number; error: string } {
   const message = error instanceof Error ? error.message : "";
   const safe = KNOWN.find((item) => message.includes(item));
   if (safe === "Reminder not found") return { status: 404, error: safe };
-  if (safe === "Too many reminders" || safe === "The free plan" || safe === "This plan's reminder emails") return { status: 429, error: message };
+  if (safe === "Too many reminders" || safe === "The free plan" || safe === "This plan's reminder pings") return { status: 429, error: message };
   if (safe) return { status: 400, error: message };
   return { status: 500, error: "Fillip could not complete this request. Your reminder may not have been saved." };
 }

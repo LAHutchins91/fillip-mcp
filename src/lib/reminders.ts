@@ -88,10 +88,15 @@ function channelNote(channel: DeliveryChannel): string {
   return "Fillip will email the verified address on this account.";
 }
 
-function followNote(channel: DeliveryChannel, repeats: string): string {
-  if (channel === "telegram") return `Fillip will keep pinging your Telegram chat ${repeats} until you mark it done.`;
-  if (channel === "both") return `Fillip will keep emailing you and pinging Telegram ${repeats} until you mark it done.`;
-  return `Fillip will keep emailing you ${repeats} until you mark it done.`;
+function followNote(channel: DeliveryChannel, recurrence: Reminder["recurrence"]): string {
+  const repeats = describeRecurrence(recurrence);
+  const ended = Boolean(recurrence?.ends && (recurrence.ends.until || recurrence.ends.count));
+  const stop = ended
+    ? "It stops at that limit even if it is not marked done."
+    : "It keeps going until you mark it done.";
+  if (channel === "telegram") return `Fillip will keep pinging your Telegram chat ${repeats}. ${stop}`;
+  if (channel === "both") return `Fillip will keep emailing you and pinging Telegram ${repeats}. ${stop}`;
+  return `Fillip will keep emailing you ${repeats}. ${stop}`;
 }
 
 function chosenChannel(input: DeliveryChannel | undefined, fallback: DeliveryChannel | undefined, telegramEnabled: boolean): DeliveryChannel {
@@ -164,13 +169,48 @@ export async function listReminders(store: ReminderStore, ownerId: string, input
   });
 }
 
-export async function snoozeOrReschedule(store: ReminderStore, ownerId: string, id: string, until: string, timezone: string | undefined, now: Date): Promise<ReminderView> {
+export type ReminderMove = "reschedule" | "pause" | "resume";
+
+function nextOpenFire(reminder: Reminder, zone: string, now: Date): Date {
+  const current = new Date(reminder.fireAt);
+  if (current.getTime() > now.getTime()) return current;
+  if (reminder.recurrence) {
+    const upcoming = nextFire(reminder.recurrence, zone, now);
+    if (!upcoming) throw new Error("That repeating reminder has already ended.");
+    return upcoming;
+  }
+  throw new Error("That one-time reminder is already in the past. Name a new time to move it.");
+}
+
+export async function snoozeOrReschedule(store: ReminderStore, ownerId: string, id: string, until: string | undefined, timezone: string | undefined, now: Date, action: ReminderMove = "reschedule"): Promise<ReminderView> {
   const reminder = await store.getReminder(ownerId, id);
   if (!reminder) throw new Error("Reminder not found");
   if (reminder.status === "cancelled" || reminder.status === "completed") {
     throw new Error(`That reminder is already ${reminder.status}.`);
   }
   const zone = timezone || reminder.timezone;
+  if (action === "pause") {
+    const saved = await store.saveReminder({
+      ...reminder,
+      status: "paused",
+      holdUntil: null,
+      updatedAt: now.toISOString()
+    });
+    return view(saved, now, { note: "Paused. Fillip will not send this until you resume it." });
+  }
+  if (action === "resume") {
+    const fireAt = nextOpenFire(reminder, zone, now);
+    const saved = await store.saveReminder({
+      ...reminder,
+      timezone: zone,
+      fireAt: fireAt.toISOString(),
+      status: "active",
+      holdUntil: null,
+      updatedAt: now.toISOString()
+    });
+    return view(saved, now, { note: `Resumed. Next ping is ${formatWhen(fireAt, zone)}.` });
+  }
+  if (!until?.trim()) throw new Error("Name a time to move this reminder.");
   await store.setMailOptIn(ownerId, true);
   const resolved = resolveWhen(until, zone, now);
   const saved = await store.saveReminder({
@@ -233,7 +273,7 @@ export async function followUp(store: ReminderStore, actor: Actor, input: {
     };
   }
   const reminder = await store.createReminder(stamp(actor, input.topic, input.context ?? null, input.timezone, first, "follow_up", channel, now));
-  const note = [first.note, followNote(channel, describeRecurrence(reminder.recurrence))].filter(Boolean).join(" ");
+  const note = [first.note, followNote(channel, reminder.recurrence)].filter(Boolean).join(" ");
   return view(reminder, now, { corrected: first.corrected, note });
 }
 

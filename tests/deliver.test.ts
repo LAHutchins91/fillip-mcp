@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { globalEmailLimitsFromEnv, PROVIDER_BACKOFF_MS, runDueJob, type GlobalEmailLimits } from "../src/lib/deliver.js";
 import { createResendSender, ProviderQuotaError, type MailSender, type OutboundEmail } from "../src/lib/email.js";
 import { MemoryFillipStore } from "../src/lib/memory-store.js";
-import { followUp, saveDigestSettings, setReminder } from "../src/lib/reminders.js";
+import { followUp, saveDigestSettings, setReminder, snoozeOrReschedule } from "../src/lib/reminders.js";
 import { verifyStopToken } from "../src/lib/stop-token.js";
 import type { TelegramSender } from "../src/lib/telegram.js";
 import type { Actor, Delivery } from "../src/lib/types.js";
@@ -366,6 +366,7 @@ describe("due reminder job", () => {
     const sent = await job(store, sender, nextDay, { global, warn: () => undefined });
     expect(sent.digests).toBe(1);
     expect(sender.sent).toHaveLength(1);
+    expect(sender.sent[0]?.attachments).toBeUndefined();
     expect(sender.sent[0]?.idempotencyKey).toBe(`fillip/digest/${actor.id}/2026-10-13`);
     expect(store.digests.get(actor.id)?.lastSentOn).toBe("2026-10-13");
     const again = await job(store, sender, nextDay, { global, warn: () => undefined });
@@ -411,9 +412,13 @@ describe("due reminder job", () => {
     expect(file?.filename).toBe("fillip.ics");
     expect(file?.contentType).toBe("text/calendar");
     expect(file?.content).toMatch(/TZID=America\/New_York/);
-    expect(file?.content).toMatch(/DTSTART;TZID=America\/New_York:/);
+    expect(file?.content).toMatch(/DTSTART;TZID=America\/New_York:20261012T090000/);
+    expect(file?.content).toMatch(/DTEND;TZID=America\/New_York:20261012T091500/);
     expect(file?.content).toMatch(/RRULE:FREQ=WEEKLY/);
     expect(file?.content).toMatch(/BEGIN:VTIMEZONE/);
+    expect(file?.content).toMatch(/BEGIN:VALARM/);
+    expect(file?.content).toMatch(/ACTION:DISPLAY/);
+    expect(file?.content).toMatch(/TRIGGER:PT0S/);
   });
 
   it("sends Telegram while the email guard is closed and stops after unlink", async () => {
@@ -459,6 +464,59 @@ describe("due reminder job", () => {
     expect(telegram.sent).toHaveLength(1);
     expect(store.reminders.find((row) => row.what === "After unlink")?.status).toBe("active");
     expect(await store.countAllSentSince("2020-01-01T00:00:00.000Z")).toBe(0);
+  });
+
+  it("counts email and Telegram as two pings and does not send a paused reminder", async () => {
+    const store = new MemoryFillipStore();
+    const createdAt = new Date("2026-10-11T12:00:00.000Z");
+    const now = new Date("2026-10-11T16:00:00.000Z");
+    const both = await setReminder(store, actor, {
+      what: "Both channels",
+      when: "in 1 hour",
+      timezone: "UTC",
+      channel: "both"
+    }, createdAt, openCaps, true);
+    const contact = store.contacts.get(actor.id);
+    if (!contact) throw new Error("missing contact");
+    contact.telegramChatId = "4242";
+    const sender = new RecordingSender();
+    const telegram = new RecordingTelegram();
+    const report = await job(store, sender, now, { telegram: { sender: telegram } });
+    expect(sender.sent).toHaveLength(1);
+    expect(telegram.sent).toHaveLength(1);
+    expect(report.sent).toBe(2);
+    expect(store.contacts.get(actor.id)?.emailsSentInPeriod).toBe(2);
+
+    const waiting = await setReminder(store, actor, {
+      what: "Paused while due",
+      when: "in 1 hour",
+      timezone: "UTC"
+    }, createdAt);
+    await snoozeOrReschedule(store, actor.id, waiting.id, undefined, undefined, createdAt, "pause");
+    const held = await job(store, sender, now, { telegram: { sender: telegram } });
+    expect(held.sent).toBe(0);
+    expect(sender.sent).toHaveLength(1);
+    expect(store.reminders.find((row) => row.id === waiting.id)?.status).toBe("paused");
+
+    const weekly = await setReminder(store, actor, {
+      what: "Paused weekly",
+      when: "every Monday 9am",
+      timezone: "America/New_York"
+    }, createdAt);
+    await snoozeOrReschedule(store, actor.id, weekly.id, undefined, undefined, createdAt, "pause");
+
+    const later = new Date("2026-10-20T18:00:00.000Z");
+    const resumed = await snoozeOrReschedule(store, actor.id, weekly.id, undefined, "America/New_York", later, "resume");
+    expect(new Date(resumed.fireAt).getTime()).toBeGreaterThan(later.getTime());
+    const early = await job(store, sender, later);
+    expect(early.sent).toBe(0);
+    const due = new Date(new Date(resumed.fireAt).getTime() + 60_000);
+    const sent = await job(store, sender, due);
+    expect(sent.sent).toBe(1);
+    const next = store.reminders.find((row) => row.id === weekly.id);
+    expect(next?.status).toBe("active");
+    expect(new Date(next?.fireAt ?? 0).getTime()).toBeGreaterThan(due.getTime());
+    expect(both.id).toBeTruthy();
   });
 });
 

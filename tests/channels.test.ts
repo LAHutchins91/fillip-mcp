@@ -26,6 +26,9 @@ describe("private calendar feed", () => {
     expect(body).toMatch(/Still open/);
     expect(body).not.toMatch(/Already done/);
     expect(body).toMatch(/TZID=America\/New_York/);
+    expect(body).toMatch(/DTEND;TZID=America\/New_York:/);
+    expect(body).toMatch(/BEGIN:VALARM/);
+    expect(body).toMatch(/TRIGGER:PT0S/);
 
     const rotated = await calendarLink(store, actor, "rotate", "https://fillip.example/");
     expect(rotated.rotated).toBe(true);

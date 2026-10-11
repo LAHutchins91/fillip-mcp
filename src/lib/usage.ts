@@ -23,7 +23,7 @@ export const STAND_IN_CAPS: TierCaps = {
   annualEmailsPerMonth: 1000
 };
 
-export const ALLOWANCE_REACHED = "This plan's reminder emails for the month are used up. Fillip will not send more until the allowance resets.";
+export const ALLOWANCE_REACHED = "This plan's reminder pings for the month are used up. Fillip will not send more until the allowance resets. Telegram counts toward this allowance, and a reminder delivered to both channels counts as 2.";
 export const UPGRADE_PROMPT = "Upgrade to Pro for a higher allowance. The trial is 14 days, then Pro.";
 
 export type Allowance = {

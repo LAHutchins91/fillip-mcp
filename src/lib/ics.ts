@@ -112,18 +112,27 @@ function zoneBlock(timeZone: string, around: Date): string[] {
 
 function eventLines(reminder: Reminder, now: Date): string[] {
   const start = new Date(reminder.fireAt);
+  const end = new Date(start.getTime() + 15 * 60 * 1000);
   const lines = [
     "BEGIN:VEVENT",
     `UID:fillip-${reminder.id}@fillip`,
     `DTSTAMP:${icsUtc(now)}`,
     `DTSTART;TZID=${reminder.timezone}:${icsLocal(start, reminder.timezone)}`,
+    `DTEND;TZID=${reminder.timezone}:${icsLocal(end, reminder.timezone)}`,
     `SUMMARY:${escapeText(reminder.what)}`
   ];
   const description = [reminder.context, "Fillip, reminders that fire."].filter(Boolean).join("\\n");
   lines.push(`DESCRIPTION:${escapeText(description)}`);
   const rule = rruleFor(reminder.recurrence);
   if (rule) lines.push(`RRULE:${rule}`);
-  lines.push("END:VEVENT");
+  lines.push(
+    "BEGIN:VALARM",
+    "ACTION:DISPLAY",
+    "DESCRIPTION:Fillip reminder",
+    "TRIGGER:PT0S",
+    "END:VALARM",
+    "END:VEVENT"
+  );
   return lines;
 }
 
