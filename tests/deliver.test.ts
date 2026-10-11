@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { globalEmailLimitsFromEnv, PROVIDER_BACKOFF_MS, runDueJob, type GlobalEmailLimits } from "../src/lib/deliver.js";
 import { createResendSender, ProviderQuotaError, type MailSender, type OutboundEmail } from "../src/lib/email.js";
 import { MemoryFillipStore } from "../src/lib/memory-store.js";
+import { SupabaseFillipStore, type Db } from "../src/lib/supabase-store.js";
 import { followUp, saveDigestSettings, setReminder, snoozeOrReschedule } from "../src/lib/reminders.js";
 import { verifyStopToken } from "../src/lib/stop-token.js";
 import type { TelegramSender } from "../src/lib/telegram.js";
@@ -517,6 +518,141 @@ describe("due reminder job", () => {
     expect(next?.status).toBe("active");
     expect(new Date(next?.fireAt ?? 0).getTime()).toBeGreaterThan(due.getTime());
     expect(both.id).toBeTruthy();
+  });
+
+  it("releases monthly and daily ping counters when the pre-send check fails after a reserve", async () => {
+    const priorMonthly = 4;
+    const priorDaily = 2;
+    const reminderId = "33333333-3333-4333-8333-333333333333";
+    const now = new Date("2026-10-11T16:00:00.000Z");
+    const fireAt = "2026-10-11T15:00:00.000Z";
+    let monthly = priorMonthly;
+    let daily = priorDaily;
+    let reminderStatus = "active";
+    let reserved = false;
+    const deliveries: Array<Record<string, unknown>> = [];
+    const unknown: string[] = [];
+    const profile = () => ({
+      unsubscribed: false,
+      plan: "pro",
+      subscription_status: "active",
+      emails_sent_in_period: monthly,
+      email_period_start: "2026-10-01T00:00:00.000Z",
+      emails_sent_today: daily,
+      email_day_start: "2026-10-11T00:00:00.000Z",
+      default_channel: "email",
+      telegram_chat_id: null,
+      telegram_link_token: null,
+      telegram_link_expires: null,
+      calendar_token: null
+    });
+    const reminderRow = () => ({
+      id: reminderId,
+      owner_id: actor.id,
+      kind: "reminder",
+      what: "Do not send after the check",
+      context: null,
+      timezone: "UTC",
+      fire_at: fireAt,
+      recurrence: null,
+      channel: "email",
+      status: reminderStatus,
+      hold_until: null,
+      created_at: "2026-10-10T16:00:00.000Z",
+      updated_at: "2026-10-10T16:00:00.000Z",
+      completed_at: null,
+      removed_at: reminderStatus === "removed" ? now.toISOString() : null,
+      resume_status: null
+    });
+    const db: Db = async (pathname, options) => {
+      const method = options?.method ?? "GET";
+      const body = options?.body ? JSON.parse(String(options.body)) as Record<string, unknown> : null;
+      if (pathname.includes("/rpc/fillip_purge_removed")) return 0;
+      if (pathname.includes("/rpc/fillip_claim_sendable")) return reminderStatus === "active";
+      if (pathname.includes("/rpc/fillip_reserve_ping")) {
+        monthly += 1;
+        daily += 1;
+        reserved = true;
+        return monthly;
+      }
+      if (pathname.includes("/rpc/fillip_confirm_send")) {
+        const delivery = deliveries.find((row) => row.id === body?.delivery_id);
+        if (!delivery || delivery.status !== "sending") return false;
+        if (reminderStatus === "active") return true;
+        delivery.status = "skipped";
+        delivery.provider_id = null;
+        return false;
+      }
+      if (pathname.startsWith("/auth/v1/admin/users/")) {
+        return { id: actor.id, email: actor.email, email_confirmed_at: "2026-01-01T00:00:00.000Z" };
+      }
+      if (pathname.startsWith("/rest/v1/profiles")) {
+        if (method === "PATCH") {
+          const filter = pathname.match(/emails_sent_in_period=eq\.(\d+)/);
+          if (filter && Number(filter[1]) === monthly && body) {
+            monthly = Number(body.emails_sent_in_period);
+            daily = Number(body.emails_sent_today);
+          }
+          return [];
+        }
+        return [profile()];
+      }
+      if (pathname.startsWith("/rest/v1/fillip_runtime")) return [{ provider_backoff_until: null }];
+      if (pathname.startsWith("/rest/v1/digest_settings")) return [];
+      if (pathname.startsWith("/rest/v1/deliveries")) {
+        if (method === "POST" && body) {
+          deliveries.push(body);
+          return [body];
+        }
+        if (method === "PATCH" && body) {
+          const row = deliveries.find((item) => pathname.includes(`dedupe_key=eq.${encodeURIComponent(String(item.dedupe_key))}`));
+          if (row) {
+            row.status = body.status;
+            row.provider_id = body.provider_id;
+            row.sent_at = body.sent_at;
+            row.error = body.error;
+            if (typeof body.started_at === "string") row.started_at = body.started_at;
+            if (body.provider_id === "attempt") reminderStatus = "removed";
+          }
+          return [];
+        }
+        return [];
+      }
+      if (pathname.startsWith("/rest/v1/reminders")) {
+        if (pathname.includes("hold_until=gt.")) return [];
+        if (pathname.includes("fire_at=lte.")) return reminderStatus === "active" ? [reminderRow()] : [];
+        if (pathname.includes(`id=eq.${encodeURIComponent(reminderId)}`)) return [reminderRow()];
+        unknown.push(`${method} ${pathname}`);
+        return [];
+      }
+      unknown.push(`${method} ${pathname}`);
+      return [];
+    };
+    const sender = new RecordingSender();
+    const report = await runDueJob({
+      store: new SupabaseFillipStore(null, db, "service"),
+      sender,
+      now,
+      from,
+      appBaseUrl: "https://fillip.example",
+      unsubscribeSecret: secret,
+      maxEmailsPerUserPerDay: 20,
+      maxSends: 40,
+      minIntervalMs: 0,
+      caps: openCaps,
+      global: openGlobal
+    });
+    expect(unknown, unknown.join("\n")).toEqual([]);
+    expect(reserved).toBe(true);
+    expect(monthly).toBe(priorMonthly);
+    expect(daily).toBe(priorDaily);
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]?.status).toBe("skipped");
+    expect(deliveries[0]?.provider_id).toBeNull();
+    expect(sender.sent).toHaveLength(0);
+    expect(report.sent).toBe(0);
+    expect(report.skipped).toBe(1);
+    expect(report.failed).toBe(0);
   });
 });
 

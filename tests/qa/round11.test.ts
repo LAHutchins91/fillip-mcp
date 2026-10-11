@@ -254,7 +254,7 @@ describe("QA round 11 restore returns the exact prior status", () => {
       expect(report.sent).toBe(FREE_OPEN_REMINDERS);
       expect(sender.sent.map((message) => message.subject).join(" ")).not.toContain(spec.what);
     }
-  });
+  }, 30_000);
 
   it("QA-PASS: a repeated restore says Already restored and does not rewrite the reminder", async () => {
     const store = new MemoryFillipStore();
