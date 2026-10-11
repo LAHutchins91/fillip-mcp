@@ -131,7 +131,7 @@ Nothing in this repo creates a Vercel project, a Supabase project, a Stripe prod
 5. Deploy the Dockerfile or `npm start`. Do not commit `.env`.
 6. Schedule delivery once a minute. On Vercel, `vercel.json` already calls `GET /internal/deliver`. Set `CRON_SECRET` on the project and Vercel sends it as a bearer token. On Supabase, the commented schedule in `supabase/cron.sql` posts to the same path with `pg_cron` and `pg_net`. One of those is enough.
 7. After the public URL exists, put it in `server.json` `remotes` and in the connect instructions you give people. Update `mcp_resource` if the host changed, then reconnect clients.
-8. Re-run `supabase/schema.sql` so the free-plan default, reminder channel, calendar token, and Telegram columns exist. The calendar feed is `GET /calendar/<token>.ics`. `calendar_feed` returns that secret link and can rotate it. Old links stop working after a rotation.
+8. Re-run `supabase/schema.sql` so the free-plan default, reminder channel, calendar token, Telegram columns, and the owner delete policy on `deliveries` exist. Deleting reminders runs with the service role, so a missing user delete policy cannot leave delivery rows behind. The profile row stays; it holds the billing identity. Support requests are not keyed to the account. The calendar feed is `GET /calendar/<token>.ics`. `calendar_feed` returns that secret link and can rotate it. Old links stop working after a rotation.
 9. Telegram is optional and uses a webhook, not polling. In BotFather, create a bot and copy its token into `TELEGRAM_BOT_TOKEN`. Set `TELEGRAM_WEBHOOK_SECRET` to a long random string. Optionally set `TELEGRAM_BOT_USERNAME`. Then register the webhook (replace the two secrets and the public origin):
 
 ```bash

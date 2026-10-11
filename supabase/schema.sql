@@ -88,6 +88,17 @@ grant select on public.profiles to authenticated;
 grant select, insert, update, delete on public.reminders to authenticated;
 grant select, insert, update, delete on public.digest_settings to authenticated;
 
+-- Deliveries are written by the service role. Without a delete policy, a
+-- user-token DELETE matches no rows and still returns success, so delivery
+-- history survives account deletion. Owners may delete only their own rows.
+-- The app deletes with the service role, which does not depend on this policy.
+drop policy if exists deliveries_owner_delete on public.deliveries;
+create policy deliveries_owner_delete on public.deliveries
+  for delete to authenticated
+  using (owner_id = auth.uid());
+
+grant delete on public.deliveries to authenticated;
+
 -- Opt-in flips only the mail flag. It cannot change plan or Stripe ids.
 create or replace function public.fillip_set_mail_opt_in(enabled boolean)
 returns void

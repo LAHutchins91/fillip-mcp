@@ -410,13 +410,21 @@ app.get("/api/export", async (req, res) => {
 });
 
 app.delete("/api/reminders", async (req, res) => {
+  let userId = "";
+  let token = "";
   try {
-    const { user, token } = await authenticatedUser(req);
-    const store = createUserStore(user.id, token);
-    await store.deleteOwnerData(user.id);
+    const auth = await authenticatedUser(req);
+    userId = auth.user.id;
+    token = auth.token;
+  } catch {
+    return res.status(401).json({ error: "Sign in to Fillip to delete reminders." });
+  }
+  try {
+    if (envValue("SUPABASE_URL")) await createServiceStore().deleteOwnerData(userId);
+    else await createUserStore(userId, token).deleteOwnerData(userId);
     res.json({ deleted: true });
   } catch {
-    res.status(401).json({ error: "Sign in to Fillip to delete reminders." });
+    res.status(503).json({ error: "Fillip could not delete reminders just now." });
   }
 });
 

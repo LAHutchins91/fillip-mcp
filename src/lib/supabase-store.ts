@@ -232,10 +232,15 @@ export class SupabaseFillipStore implements ServiceStore {
   }
 
   async deleteOwnerData(ownerId: string): Promise<void> {
+    // Deliveries have no authenticated write policies. A user-token DELETE
+    // matches zero rows and the call still returns success, so this has to
+    // run as the service role, which bypasses row level security.
+    if (this.mode !== "service") throw new Error("Deleting account data needs the service role");
     this.owned(ownerId);
-    await this.db(`/rest/v1/reminders?owner_id=eq.${encodeURIComponent(ownerId)}`, { method: "DELETE", headers: { Prefer: "return=minimal" } });
-    await this.db(`/rest/v1/deliveries?owner_id=eq.${encodeURIComponent(ownerId)}`, { method: "DELETE", headers: { Prefer: "return=minimal" } });
-    await this.db(`/rest/v1/digest_settings?owner_id=eq.${encodeURIComponent(ownerId)}`, { method: "DELETE", headers: { Prefer: "return=minimal" } });
+    const minimal = { method: "DELETE", headers: { Prefer: "return=minimal" } };
+    await this.db(`/rest/v1/deliveries?owner_id=eq.${encodeURIComponent(ownerId)}`, minimal);
+    await this.db(`/rest/v1/reminders?owner_id=eq.${encodeURIComponent(ownerId)}`, minimal);
+    await this.db(`/rest/v1/digest_settings?owner_id=eq.${encodeURIComponent(ownerId)}`, minimal);
   }
 
   async getContact(ownerId: string): Promise<OwnerContact | null> {
