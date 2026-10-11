@@ -38,6 +38,7 @@ function job(store: MemoryFillipStore, sender: MailSender, now: Date, limits?: {
     maxSends: 50,
     minIntervalMs: 0,
     caps: limits?.caps ?? statedCaps,
+    global: { perDay: 1_000_000, perMonth: 1_000_000 },
     sleep: async () => {}
   });
 }

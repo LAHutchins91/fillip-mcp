@@ -71,6 +71,7 @@ function job(store: MemoryFillipStore, sender: MailSender, now: Date) {
     maxSends: 20,
     minIntervalMs: 0,
     caps,
+    global: { perDay: 1_000_000, perMonth: 1_000_000 },
     sleep: async () => {}
   });
 }
@@ -345,6 +346,8 @@ describe("QA Stripe and HTTP behavior", () => {
     delete process.env.FILLIP_CAP_TRIAL_EMAILS_PER_MONTH;
     delete process.env.FILLIP_CAP_PRO_EMAILS_PER_MONTH;
     delete process.env.FILLIP_CAP_ANNUAL_EMAILS_PER_MONTH;
+    process.env.FILLIP_GLOBAL_MAX_EMAILS_PER_DAY = "100000";
+    process.env.FILLIP_GLOBAL_MAX_EMAILS_PER_MONTH = "100000";
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       const method = init?.method ?? "GET";
@@ -363,8 +366,17 @@ describe("QA Stripe and HTTP behavior", () => {
       if (url.includes("/auth/v1/admin/users/")) {
         return new Response(JSON.stringify({ id: actor.id, email: "owner@example.com", email_confirmed_at: "2026-01-01T00:00:00.000Z" }), { status: 200 });
       }
+      if (url.includes("/rest/v1/fillip_runtime") && method === "GET") {
+        return new Response(JSON.stringify(providerBackoff ? [{ provider_backoff_until: providerBackoff }] : []), { status: 200 });
+      }
       if (url.includes("/rest/v1/reminders") && method === "GET") return new Response(JSON.stringify(dueRows), { status: 200 });
-      if (url.includes("/rest/v1/deliveries") && method === "GET") return new Response(JSON.stringify(sentRows), { status: 200 });
+      if (url.includes("/rest/v1/deliveries") && method === "GET") {
+        const prefer = new Headers(init?.headers).get("prefer") ?? "";
+        if (prefer.includes("count=exact")) {
+          return new Response("[]", { status: globalCountStatus, headers: { "content-range": `*/${globalCount}` } });
+        }
+        return new Response(JSON.stringify(sentRows), { status: 200 });
+      }
       if (url.includes("/rest/v1/reminders") && method === "PATCH") return new Response(JSON.stringify([{ id: "rem-1" }]), { status: 200 });
       if (url.includes("/rest/v1/deliveries") && method === "POST") return new Response(JSON.stringify([{ id: "del-1", status: "sending" }]), { status: 201 });
       if (url.includes("/rest/v1/digest_settings")) return new Response("[]", { status: 200 });
@@ -573,6 +585,71 @@ describe("QA Stripe and HTTP behavior", () => {
     expect({ dayAllows21st: claimedDaily, monthAllows61st: claimedMonthly }).toEqual({ dayAllows21st: true, monthAllows61st: true });
   });
 
+  it("QA-PASS: /health globalEmails matches the shared counts and does not return secrets or a user's mail", async () => {
+    process.env.FILLIP_GLOBAL_MAX_EMAILS_PER_DAY = "60";
+    process.env.FILLIP_GLOBAL_MAX_EMAILS_PER_MONTH = "1800";
+    process.env.STRIPE_SECRET_KEY = "sk_live_qa_secret";
+    globalCount = 59;
+    globalCountStatus = 200;
+    providerBackoff = null;
+    dueRows = [reminderRow()];
+    const response = await get("/health");
+    expect(response.status).toBe(200);
+    const body = JSON.parse(response.text) as { globalEmails: { daySent: number; monthSent: number; dayLimit: number; monthLimit: number; stopped: boolean; reason: string | null } };
+    expect(body.globalEmails).toMatchObject({ daySent: 59, monthSent: 59, dayLimit: 60, monthLimit: 1800, stopped: false, reason: null });
+    expect(response.text).not.toContain("sk_live_qa_secret");
+    expect(response.text).not.toContain("service-qa");
+    expect(response.text).not.toContain("re_qa");
+    expect(response.text).not.toContain("anon-qa");
+    expect(response.text).not.toContain("owner@example.com");
+    expect(response.text).not.toContain("ship the notes");
+    process.env.FILLIP_GLOBAL_MAX_EMAILS_PER_DAY = "100000";
+    process.env.FILLIP_GLOBAL_MAX_EMAILS_PER_MONTH = "100000";
+    delete process.env.STRIPE_SECRET_KEY;
+  });
+
+  it("QA-FAIL: an empty hosted count still reports zero and the delivery job still sends", async () => {
+    process.env.FILLIP_GLOBAL_MAX_EMAILS_PER_DAY = "60";
+    process.env.FILLIP_GLOBAL_MAX_EMAILS_PER_MONTH = "1800";
+    globalCount = 0;
+    globalCountStatus = 416;
+    providerBackoff = null;
+    dueRows = [reminderRow()];
+    sentRows = [];
+    profileUsage = { emails: 0, period: "2026-10-01T00:00:00.000Z" };
+    fetches = [];
+    const health = await get("/health");
+    const healthBody = JSON.parse(health.text) as { globalEmails: { daySent: number | null; stopped: boolean } };
+    const deliver = await authorizedGet("/internal/deliver");
+    const claimed = fetches.some((call) => call.method === "POST" && call.url.includes("/rest/v1/deliveries"));
+    expect({ healthStatus: health.status, daySent: healthBody.globalEmails.daySent, stopped: healthBody.globalEmails.stopped, deliverStatus: deliver.status, claimed }).toEqual({
+      healthStatus: 200,
+      daySent: 0,
+      stopped: false,
+      deliverStatus: 200,
+      claimed: true
+    });
+    globalCountStatus = 200;
+    process.env.FILLIP_GLOBAL_MAX_EMAILS_PER_DAY = "100000";
+    process.env.FILLIP_GLOBAL_MAX_EMAILS_PER_MONTH = "100000";
+  });
+
+  it("QA-FAIL: /health shows the provider back-off while mail is held", async () => {
+    process.env.FILLIP_GLOBAL_MAX_EMAILS_PER_DAY = "60";
+    process.env.FILLIP_GLOBAL_MAX_EMAILS_PER_MONTH = "1800";
+    globalCount = 0;
+    globalCountStatus = 200;
+    providerBackoff = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+    const response = await get("/health");
+    const body = JSON.parse(response.text) as { globalEmails: { stopped: boolean; reason: string | null; daySent: number | null } };
+    expect(body.globalEmails.stopped).toBe(true);
+    expect(body.globalEmails.reason).toBe("provider");
+    expect(response.text).not.toContain("service-qa");
+    providerBackoff = null;
+    process.env.FILLIP_GLOBAL_MAX_EMAILS_PER_DAY = "100000";
+    process.env.FILLIP_GLOBAL_MAX_EMAILS_PER_MONTH = "100000";
+  });
+
   it("QA-PASS: user-facing pages and tool text do not print a price", async () => {
     const pages = ["/", "/connect", "/terms", "/privacy", "/access", "/support", "/data"];
     for (const page of pages) {
@@ -596,6 +673,9 @@ describe("QA Stripe and HTTP behavior", () => {
 let dueRows: unknown[] = [];
 let sentRows: unknown[] = [];
 let profileUsage = { emails: 0, period: "2026-10-01T00:00:00.000Z" };
+let globalCount = 0;
+let globalCountStatus = 200;
+let providerBackoff: string | null = null;
 
 function reminderRow() {
   return {
