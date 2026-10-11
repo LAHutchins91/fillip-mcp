@@ -21,7 +21,7 @@ type Row = Record<string, string | null>;
 
 function ownerDeleteColumn(sql: string, table: string): "owner_id" | "id" | null {
   const match = sql.match(new RegExp(
-    `create policy \\w+ on public\\.${table}\\s+for (?:all|delete) to authenticated[\\s\\S]*?using \\((owner_id|id) = auth\\.uid\\(\\)\\)`,
+    `create policy \\w+ on public\\.${table}\\s+for (?:all|delete) to authenticated[\\s\\S]*?using \\((owner_id|id) = \\(select auth\\.uid\\(\\)\\)\\)`,
     "i"
   ));
   return match ? match[1] as "owner_id" | "id" : null;

@@ -1,4 +1,7 @@
 -- Fillip reminder tables. Run in the Supabase SQL editor for a hosted Fillip.
+-- Safe to re-run on a project that already has these objects: policies are
+-- dropped first, and tables, columns, indexes, functions, triggers, and grants
+-- are written so a second run does not fail.
 -- Access tokens stay OAuth bearer tokens. This file does not create API keys.
 
 create table if not exists public.profiles (
@@ -76,13 +79,24 @@ alter table public.deliveries enable row level security;
 alter table public.digest_settings enable row level security;
 alter table public.fillip_support_requests enable row level security;
 
-create policy profiles_select on public.profiles for select to authenticated using (id = auth.uid());
+-- (select auth.uid()) is evaluated once per statement. A bare auth.uid() is
+-- re-checked on every row.
+drop policy if exists profiles_select on public.profiles;
+create policy profiles_select on public.profiles
+  for select to authenticated
+  using (id = (select auth.uid()));
 
-create policy reminders_owner on public.reminders for all to authenticated
-  using (owner_id = auth.uid()) with check (owner_id = auth.uid());
+drop policy if exists reminders_owner on public.reminders;
+create policy reminders_owner on public.reminders
+  for all to authenticated
+  using (owner_id = (select auth.uid()))
+  with check (owner_id = (select auth.uid()));
 
-create policy digest_owner on public.digest_settings for all to authenticated
-  using (owner_id = auth.uid()) with check (owner_id = auth.uid());
+drop policy if exists digest_owner on public.digest_settings;
+create policy digest_owner on public.digest_settings
+  for all to authenticated
+  using (owner_id = (select auth.uid()))
+  with check (owner_id = (select auth.uid()));
 
 grant select on public.profiles to authenticated;
 grant select, insert, update, delete on public.reminders to authenticated;
@@ -96,12 +110,12 @@ grant select, insert, update, delete on public.digest_settings to authenticated;
 drop policy if exists deliveries_owner_select on public.deliveries;
 create policy deliveries_owner_select on public.deliveries
   for select to authenticated
-  using (owner_id = auth.uid());
+  using (owner_id = (select auth.uid()));
 
 drop policy if exists deliveries_owner_delete on public.deliveries;
 create policy deliveries_owner_delete on public.deliveries
   for delete to authenticated
-  using (owner_id = auth.uid());
+  using (owner_id = (select auth.uid()));
 
 grant select on public.deliveries to authenticated;
 grant delete on public.deliveries to authenticated;
@@ -263,6 +277,7 @@ grant execute on function public.fillip_set_calendar_token(text) to authenticate
 create or replace function public.fillip_enforce_open_cap()
 returns trigger
 language plpgsql
+set search_path = public
 as $$
 declare
   open_count integer;
