@@ -15,7 +15,7 @@ import { nextMonthStart, tierCapsFromEnv, usageCapsConfigured } from "./lib/usag
 import { globalEmailLimitsFromEnv, nextUtcDay, readGlobalEmailSnapshot, runDueJob, type GlobalEmailSnapshot } from "./lib/deliver.js";
 import { createResendSender } from "./lib/email.js";
 import { publicError } from "./lib/errors.js";
-import { renderCalendarFeed } from "./lib/reminders.js";
+import { REMOVE_RETAIN_MS, renderCalendarFeed } from "./lib/reminders.js";
 import { acceptTelegramUpdate, createTelegramSender, telegramConfigured } from "./lib/telegram.js";
 import { FileFillipStore } from "./lib/file-store.js";
 import { MemoryFillipStore } from "./lib/memory-store.js";
@@ -355,6 +355,7 @@ async function internalStatus(req: Request, res: Response) {
     : limits.perDay <= 0 || limits.perMonth <= 0 || countsMissing;
   const reason = globalEmails?.reason
     ?? (countsMissing ? null : limits.perMonth <= 0 ? "month" : limits.perDay <= 0 ? "day" : null);
+  const purged = await purgeRemovedNow();
   res.json({
     ok: true,
     service: "fillip",
@@ -369,6 +370,7 @@ async function internalStatus(req: Request, res: Response) {
     resendConfigured: Boolean(envValue("RESEND_API_KEY")),
     senderConfigured: Boolean(envValue("FILLIP_FROM_EMAIL")),
     telegramConfigured: telegramConfigured(),
+    purged,
     globalEmails: {
       daySent,
       dayLimit: limits.perDay,
@@ -479,12 +481,25 @@ async function stopMail(req: Request, res: Response) {
 app.get("/stop", stopMail);
 app.post("/stop", stopMail);
 
+async function purgeRemovedNow(): Promise<number | null> {
+  if (!envValue("SUPABASE_URL") || !envValue("SUPABASE_SERVICE_ROLE_KEY")) return null;
+  try {
+    const cutoff = new Date(Date.now() - REMOVE_RETAIN_MS).toISOString();
+    return await createServiceStore().purgeRemoved(cutoff);
+  } catch (error) {
+    console.warn("Fillip could not purge removed reminders");
+    console.warn(error instanceof Error ? error.message : "purge failed");
+    return null;
+  }
+}
+
 async function deliver(req: Request, res: Response) {
   const secret = envValue("CRON_SECRET");
   if (!secret) return res.status(503).json({ error: "Delivery is not configured." });
   if (!allowPublic(`deliver:${req.ip}`, 30, 60000)) return res.status(429).json({ error: "Too many delivery attempts." });
   const header = bearer(req);
   if (!header || !safeEqual(header, secret)) return res.status(401).json({ error: "Delivery authorization failed." });
+  const purged = await purgeRemovedNow();
   if (!envValue("RESEND_API_KEY")) return res.status(503).json({ error: "Email provider is not configured." });
   try {
     const report = await runDueJob({
@@ -501,7 +516,7 @@ async function deliver(req: Request, res: Response) {
       global: globalEmailLimitsFromEnv(),
       telegram: envValue("TELEGRAM_BOT_TOKEN") ? { sender: createTelegramSender(envValue("TELEGRAM_BOT_TOKEN")) } : null
     });
-    res.json(report);
+    res.json({ ...report, purged: typeof purged === "number" ? purged + report.purged : report.purged });
   } catch (error) {
     console.error("Delivery job failed");
     const message = error instanceof Error ? error.message : "";

@@ -62,7 +62,7 @@ type ReminderRow = {
   updated_at: string;
   completed_at: string | null;
   removed_at?: string | null;
-  resume_status?: "active" | "paused" | null;
+  resume_status?: "active" | "paused" | "fired" | "completed" | "cancelled" | null;
 };
 
 type DeliveryRow = {
@@ -97,7 +97,7 @@ function fromReminder(row: ReminderRow): Reminder {
     updatedAt: row.updated_at,
     completedAt: row.completed_at,
     removedAt: row.removed_at ?? null,
-    resumeStatus: row.resume_status === "paused" || row.resume_status === "active" ? row.resume_status : null
+    resumeStatus: row.resume_status === "active" || row.resume_status === "paused" || row.resume_status === "fired" || row.resume_status === "completed" || row.resume_status === "cancelled" ? row.resume_status : null
   };
 }
 

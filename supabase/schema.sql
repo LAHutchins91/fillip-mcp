@@ -81,7 +81,7 @@ alter table public.reminders add constraint reminders_status_check
   check (status in ('active', 'fired', 'completed', 'cancelled', 'paused', 'removed'));
 alter table public.reminders drop constraint if exists reminders_resume_status_check;
 alter table public.reminders add constraint reminders_resume_status_check
-  check (resume_status is null or resume_status in ('active', 'paused'));
+  check (resume_status is null or resume_status in ('active', 'paused', 'fired', 'completed', 'cancelled'));
 
 create index if not exists reminders_due on public.reminders (fire_at) where status = 'active';
 create index if not exists reminders_removed_purge on public.reminders (removed_at) where status = 'removed';

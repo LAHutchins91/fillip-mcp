@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { runDueJob } from "../src/lib/deliver.js";
 import type { MailSender, OutboundEmail } from "../src/lib/email.js";
 import { MemoryFillipStore } from "../src/lib/memory-store.js";
-import { listReminders, REMOVE_RETAIN_MS, removeReminder, renderCalendarFeed, restoreReminder, setReminder, snoozeOrReschedule } from "../src/lib/reminders.js";
+import { completeOrCancel, listReminders, REMOVE_RETAIN_MS, removeReminder, renderCalendarFeed, restoreReminder, setReminder, snoozeOrReschedule } from "../src/lib/reminders.js";
 import { OpenCapError } from "../src/lib/store.js";
 import type { Actor } from "../src/lib/types.js";
 import { blankContact, freeOpenMessage, FREE_OPEN_REMINDERS } from "../src/lib/usage.js";
@@ -214,5 +214,73 @@ describe("remove and restore", () => {
     expect(restored.status).toBe("active");
     expect(await store.countActive(actor.id)).toBe(FREE_OPEN_REMINDERS);
     expect(ids).toContain(mine.id);
+  });
+
+  it("restores each prior status, and a cancelled or completed reminder never sends", async () => {
+    const prior = ["active", "paused", "fired", "completed", "cancelled"] as const;
+    for (const status of prior) {
+      const store = new MemoryFillipStore();
+      const created = await setReminder(store, actor, { what: "Standup", when: "every day at 11am", timezone: "UTC" }, earlier);
+      if (status === "paused") await snoozeOrReschedule(store, actor.id, created.id, undefined, "UTC", now, "pause");
+      else if (status === "completed") await completeOrCancel(store, actor.id, created.id, "complete", now);
+      else if (status === "cancelled") await completeOrCancel(store, actor.id, created.id, "cancel", now);
+      else if (status === "fired") {
+        const row = await store.getReminder(actor.id, created.id);
+        if (!row) throw new Error("missing reminder");
+        await store.saveReminder({ ...row, status: "fired" });
+      }
+      const before = await store.getReminder(actor.id, created.id);
+      if (!before) throw new Error("missing reminder");
+      expect(before.status).toBe(status);
+      await removeReminder(store, actor.id, created.id, now);
+      expect((await store.getReminder(actor.id, created.id))?.resumeStatus).toBe(status);
+      const back = await restoreReminder(store, actor.id, created.id, now);
+      expect(back.id).toBe(created.id);
+      expect(back.status).toBe(status);
+      if (status === "active") expect(new Date(back.fireAt).getTime()).toBeGreaterThan(now.getTime());
+      else expect(back.fireAt).toBe(before.fireAt);
+      const again = await restoreReminder(store, actor.id, created.id, now);
+      expect(again.note).toBe("Already restored.");
+      expect(again.id).toBe(created.id);
+      expect(again.status).toBe(status);
+      await expect(restoreReminder(store, other.id, created.id, now)).rejects.toThrow(/Reminder not found/);
+      await expect(restoreReminder(store, actor.id, "33333333-3333-4333-8333-333333333333", now)).rejects.toThrow(/Reminder not found/);
+      const sender = new RecordingSender();
+      const report = await job(store, sender, new Date(now.getTime() + 2 * 86_400_000));
+      if (status === "active") expect(report.sent).toBeGreaterThan(0);
+      else expect(report.sent).toBe(0);
+    }
+  });
+
+  it("restores a cancelled reminder at the open cap without counting it", async () => {
+    const store = new MemoryFillipStore();
+    free(store, actor);
+    const cancelled = await setReminder(store, actor, { what: "Cancelled", when: "every day at 11am", timezone: "UTC" }, earlier);
+    await completeOrCancel(store, actor.id, cancelled.id, "cancel", now);
+    await removeReminder(store, actor.id, cancelled.id, now);
+    for (let index = 0; index < FREE_OPEN_REMINDERS; index += 1) {
+      await setReminder(store, actor, { what: `Open ${index}`, when: "tomorrow at 9am", timezone: "UTC" }, now);
+    }
+    expect(await store.countActive(actor.id)).toBe(FREE_OPEN_REMINDERS);
+    const back = await restoreReminder(store, actor.id, cancelled.id, now);
+    expect(back.id).toBe(cancelled.id);
+    expect(back.status).toBe("cancelled");
+    expect(await store.countActive(actor.id)).toBe(FREE_OPEN_REMINDERS);
+    const sender = new RecordingSender();
+    expect((await job(store, sender, new Date(now.getTime() + 2 * 86_400_000))).sent).toBe(FREE_OPEN_REMINDERS);
+
+    const pausedStore = new MemoryFillipStore();
+    free(pausedStore, actor);
+    const paused = await setReminder(pausedStore, actor, { what: "Paused", when: "every day at 11am", timezone: "UTC" }, earlier);
+    await snoozeOrReschedule(pausedStore, actor.id, paused.id, undefined, "UTC", now, "pause");
+    const pausedFire = (await pausedStore.getReminder(actor.id, paused.id))?.fireAt;
+    await removeReminder(pausedStore, actor.id, paused.id, now);
+    for (let index = 0; index < FREE_OPEN_REMINDERS; index += 1) {
+      await setReminder(pausedStore, actor, { what: `Paused open ${index}`, when: "tomorrow at 9am", timezone: "UTC" }, now);
+    }
+    const pausedBack = await restoreReminder(pausedStore, actor.id, paused.id, now);
+    expect(pausedBack.status).toBe("paused");
+    expect(pausedBack.fireAt).toBe(pausedFire);
+    expect(await pausedStore.countActive(actor.id)).toBe(FREE_OPEN_REMINDERS);
   });
 });

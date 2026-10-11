@@ -36,8 +36,8 @@ export type Reminder = {
   completedAt: string | null;
   /** Set while status is removed. Restore is refused after 30 days, and the cron then deletes the row. */
   removedAt?: string | null;
-  /** active or paused, remembered so restore returns the same reminder to that state. */
-  resumeStatus?: "active" | "paused" | null;
+  /** The status from before removal, so restore returns that same state. */
+  resumeStatus?: "active" | "paused" | "fired" | "completed" | "cancelled" | null;
 };
 
 export type DeliveryStatus = "sending" | "sent" | "failed" | "skipped";

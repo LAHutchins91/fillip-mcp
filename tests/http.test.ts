@@ -335,6 +335,59 @@ describe("streamable HTTP", () => {
     }
   });
 
+  it("purges removed reminders before the email provider check and reports the count", async () => {
+    const previous = {
+      SUPABASE_URL: process.env.SUPABASE_URL,
+      SUPABASE_SERVICE_ROLE_KEY: process.env.SUPABASE_SERVICE_ROLE_KEY,
+      RESEND_API_KEY: process.env.RESEND_API_KEY,
+      CRON_SECRET: process.env.CRON_SECRET
+    };
+    const calls: string[] = [];
+    const original = globalThis.fetch;
+    process.env.SUPABASE_URL = "https://purge.supabase.co";
+    process.env.SUPABASE_SERVICE_ROLE_KEY = "service-role-test";
+    process.env.CRON_SECRET = "purge-cron";
+    delete process.env.RESEND_API_KEY;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push(`${init?.method ?? "GET"} ${url}`);
+      if (url.includes("/rest/v1/rpc/fillip_purge_removed")) return new Response("4", { status: 200 });
+      return new Response("[]", { status: 200 });
+    }) as typeof fetch;
+    const ask = (pathname: string) => new Promise<{ status: number; text: string }>((resolve, reject) => {
+      const url = new URL(pathname, base);
+      const req = http.request({
+        hostname: url.hostname,
+        port: url.port,
+        path: url.pathname,
+        method: "GET",
+        headers: { authorization: "Bearer purge-cron" }
+      }, (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, text: Buffer.concat(chunks).toString("utf8") }));
+      });
+      req.on("error", reject);
+      req.end();
+    });
+    try {
+      const denied = await ask("/internal/deliver");
+      expect(denied.status).toBe(503);
+      expect(JSON.parse(denied.text)).toEqual({ error: "Email provider is not configured." });
+      expect(calls.some((call) => call.includes("/rest/v1/rpc/fillip_purge_removed"))).toBe(true);
+      expect(calls.some((call) => call.includes("api.resend.com"))).toBe(false);
+      const status = await ask("/internal/status");
+      expect(status.status).toBe(200);
+      expect((JSON.parse(status.text) as { purged: number }).purged).toBe(4);
+    } finally {
+      globalThis.fetch = original;
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
   it("rejects a browser origin that is not an assistant", async () => {
     const response = await fetch(`${base}/mcp`, {
       method: "POST",

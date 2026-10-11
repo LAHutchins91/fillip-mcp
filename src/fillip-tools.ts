@@ -169,7 +169,7 @@ export function createFillipServer(store: ReminderStore, actor: Actor, now: () =
     now()
   ), "Remove reminder");
 
-  tool("restore_reminder", "Restores a reminder removed in the last 30 days. The same id comes back, paused if it was paused, and the next time is recomputed when the old one has passed.", {
+  tool("restore_reminder", "Restores a reminder removed in the last 30 days to the status it had before. Only an active reminder gets a new next time when the old one has passed, and only that one goes through the open cap. A paused reminder stays paused. A cancelled or completed reminder stays that way, does not send, and does not count toward the cap. Restoring one that is already back succeeds.", {
     id: z.string().uuid()
   }, { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }, async (args) => restoreReminder(
     store,

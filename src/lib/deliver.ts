@@ -29,6 +29,7 @@ export type JobReport = {
   failed: number;
   deferred: number;
   digests: number;
+  purged: number;
   global: GlobalEmailSnapshot;
 };
 
@@ -320,10 +321,10 @@ export async function runDueJob(options: {
   warn?: (message: string) => void;
   sleep?: (ms: number) => Promise<void>;
 }): Promise<JobReport> {
+  const purged = await options.store.purgeRemoved(new Date(options.now.getTime() - REMOVE_RETAIN_MS).toISOString());
   if (!options.from.trim()) throw new Error("Sender identity is not configured");
   if (!options.unsubscribeSecret.trim()) throw new Error("Unsubscribe secret is not configured");
   const nowIso = options.now.toISOString();
-  await options.store.purgeRemoved(new Date(options.now.getTime() - REMOVE_RETAIN_MS).toISOString());
   const since = new Date(options.now.getTime() - DAY_MS).toISOString();
   const staleBefore = new Date(options.now.getTime() - STALE_MS).toISOString();
   const global = await readGlobalEmailSnapshot(options.store, options.now, options.global);
@@ -332,7 +333,7 @@ export async function runDueJob(options: {
     await releaseAllowanceHolds(options.store, options.now, options.caps, nowIso);
   }
   const due = await options.store.listDue(nowIso, Math.max(options.maxSends, 1) * 3);
-  const report: JobReport = { sent: 0, skipped: 0, failed: 0, deferred: 0, digests: 0, global };
+  const report: JobReport = { sent: 0, skipped: 0, failed: 0, deferred: 0, digests: 0, purged, global };
   let providerCalls = 0;
   let warned = false;
   let providerHold: string | null = null;

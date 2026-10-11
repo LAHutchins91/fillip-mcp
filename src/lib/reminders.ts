@@ -383,7 +383,7 @@ export async function removeReminder(store: ReminderStore, ownerId: string, id: 
   const saved = await store.saveReminder({
     ...reminder,
     status: "removed",
-    resumeStatus: reminder.status === "paused" ? "paused" : "active",
+    resumeStatus: reminder.status,
     removedAt: now.toISOString(),
     holdUntil: null,
     updatedAt: now.toISOString()
@@ -391,26 +391,31 @@ export async function removeReminder(store: ReminderStore, ownerId: string, id: 
   return { id: saved.id, what: saved.what, status: "removed", note: REMOVED_NOTE };
 }
 
-function restoredFireAt(reminder: Reminder, now: Date, prior: "active" | "paused"): string {
+function restoredFireAt(reminder: Reminder, now: Date): string {
   if (new Date(reminder.fireAt).getTime() > now.getTime()) return reminder.fireAt;
   if (reminder.recurrence) {
     const upcoming = nextFire(reminder.recurrence, reminder.timezone, now);
     if (!upcoming) throw new Error("That repeating reminder has already ended.");
     return upcoming.toISOString();
   }
-  if (prior === "paused") return reminder.fireAt;
   throw new Error("That one-time reminder is already in the past. Name a new time to move it.");
 }
 
+const ALREADY_RESTORED = "Already restored.";
+
 export async function restoreReminder(store: ReminderStore, ownerId: string, id: string, now: Date): Promise<ReminderView> {
   const reminder = await store.getReminder(ownerId, id);
-  if (!reminder || reminder.status !== "removed") throw new Error("Reminder not found");
+  if (!reminder) throw new Error("Reminder not found");
+  if (reminder.status !== "removed") return { ...view(reminder, now), note: ALREADY_RESTORED };
   const removedAt = Date.parse(reminder.removedAt ?? "");
   if (!Number.isFinite(removedAt) || now.getTime() - removedAt > REMOVE_RETAIN_MS) {
     throw new Error("That reminder can no longer be restored.");
   }
-  const prior = reminder.resumeStatus === "paused" ? "paused" : "active";
-  const fireAt = restoredFireAt(reminder, now, prior);
+  const prior = reminder.resumeStatus;
+  if (prior !== "active" && prior !== "paused" && prior !== "fired" && prior !== "completed" && prior !== "cancelled") {
+    throw new Error("That reminder can no longer be restored.");
+  }
+  const fireAt = prior === "active" ? restoredFireAt(reminder, now) : reminder.fireAt;
   if (prior === "active") {
     const usage = await store.getUsage(ownerId);
     const open = openCapFor(usage, STAND_IN_CAPS);
@@ -424,7 +429,7 @@ export async function restoreReminder(store: ReminderStore, ownerId: string, id:
       fireAt,
       removedAt: null,
       resumeStatus: null,
-      holdUntil: null,
+      holdUntil: prior === "active" ? null : reminder.holdUntil,
       updatedAt: now.toISOString()
     });
   } catch (error) {
@@ -434,7 +439,9 @@ export async function restoreReminder(store: ReminderStore, ownerId: string, id:
   }
   const note = prior === "paused"
     ? "Restored. It stays paused until you resume it."
-    : `Restored. Next ping is ${formatWhen(new Date(saved.fireAt), saved.timezone)}.`;
+    : prior === "active"
+      ? `Restored. Next ping is ${formatWhen(new Date(saved.fireAt), saved.timezone)}.`
+      : "Restored. It will not send.";
   return view(saved, now, { note });
 }
 

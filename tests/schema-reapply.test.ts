@@ -150,6 +150,13 @@ describe("schema re-run", () => {
         where conname = 'reminders_status_check'
       `);
       expect(statusCheck.rows[0]?.def ?? "").toContain("removed");
+      const resumeCheck = await db.query<{ def: string }>(`
+        select pg_get_constraintdef(oid) as def
+        from pg_constraint
+        where conname = 'reminders_resume_status_check'
+      `);
+      expect(resumeCheck.rows[0]?.def ?? "").toContain("cancelled");
+      expect(resumeCheck.rows[0]?.def ?? "").toContain("completed");
       const purgeIndex = await db.query<{ indexname: string }>(
         "select indexname from pg_indexes where schemaname = 'public' and indexname = 'reminders_removed_purge'"
       );
