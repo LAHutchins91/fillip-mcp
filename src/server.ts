@@ -25,7 +25,7 @@ import { FILLIP_EMPTY_REPRESENTATION, SupabaseFillipStore, type Db } from "./lib
 import type { Actor } from "./lib/types.js";
 import { validateMcpClaims } from "./mcp-claims.js";
 import { MCP_CORS_HEADERS, ensureStreamableHttpAccept, mcpBrowserOriginAllowed } from "./mcp-clients.js";
-import { installCodeAuth } from "./code-auth.js";
+import { installCodeAuth, lockoutSecretProblem } from "./code-auth.js";
 import { installPluginAuth } from "./plugin-auth.js";
 import { installPublicPages } from "./public-pages.js";
 import { useStdioTransport } from "./transport.js";
@@ -661,6 +661,11 @@ app.use((error: unknown, _req: Request, res: Response, _next: express.NextFuncti
 
 const port = Number(envValue("PORT") || 3000);
 if (process.env.NODE_ENV !== "test") {
+  const lockoutProblem = lockoutSecretProblem();
+  if (lockoutProblem) {
+    console.error(lockoutProblem);
+    process.exit(1);
+  }
   const stdio = useStdioTransport();
   app.listen(port, () => {
     const line = `Fillip listening on ${port}`;

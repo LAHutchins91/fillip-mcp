@@ -1,6 +1,6 @@
 import http, { type IncomingMessage, type Server } from "node:http";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { CODE_LOCKED, CODE_SENT, CODE_WRONG, SIGNED_OUT_EVERYWHERE, lockoutAddressKey } from "../src/code-auth.js";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { CODE_LOCKED, CODE_SENT, CODE_WRONG, SIGNED_OUT_EVERYWHERE, lockoutAddressKey, lockoutSecretProblem } from "../src/code-auth.js";
 import { app } from "../src/server.js";
 
 const saved = {
@@ -57,7 +57,15 @@ function request(base: string, method: string, pathname: string, body: string, h
 }
 
 describe("emailed-code lockout address", () => {
-  it("ignores a spoofed X-Forwarded-For and keys IPv6 on its /64", () => {
+  const previousVercel = process.env.VERCEL;
+
+  afterEach(() => {
+    if (previousVercel === undefined) delete process.env.VERCEL;
+    else process.env.VERCEL = previousVercel;
+  });
+
+  it("ignores client address headers off Vercel and keys IPv6 on its /64", () => {
+    delete process.env.VERCEL;
     const header = (map: Record<string, string>) => (name: string) => map[name.toLowerCase()];
     const left = lockoutAddressKey(header({ "x-forwarded-for": "203.0.113.10" }), "127.0.0.1");
     const right = lockoutAddressKey(header({ "x-forwarded-for": "203.0.113.99" }), "127.0.0.1");
@@ -67,15 +75,38 @@ describe("emailed-code lockout address", () => {
       "x-vercel-forwarded-for": "198.51.100.8, 10.0.0.1",
       "x-forwarded-for": "203.0.113.10",
       "x-real-ip": "198.51.100.9"
-    }), "127.0.0.1")).toBe("198.51.100.8");
+    }), "127.0.0.1")).toBe("127.0.0.1");
     expect(lockoutAddressKey(header({
       "x-real-ip": "198.51.100.9",
       "x-forwarded-for": "203.0.113.10"
-    }), "127.0.0.1")).toBe("198.51.100.9");
+    }), "127.0.0.1")).toBe("127.0.0.1");
+    process.env.VERCEL = "1";
+    expect(lockoutAddressKey(header({
+      "x-vercel-forwarded-for": "198.51.100.8, 10.0.0.1",
+      "x-forwarded-for": "203.0.113.10",
+      "x-real-ip": "198.51.100.9"
+    }), "127.0.0.1")).toBe("198.51.100.8");
     const same = lockoutAddressKey(() => undefined, "2001:db8:1:2::abcd");
     expect(lockoutAddressKey(() => undefined, "2001:db8:1:2:ffff::1")).toBe(same);
     expect(lockoutAddressKey(() => undefined, "2001:db8:1:3::1")).not.toBe(same);
     expect(lockoutAddressKey(() => undefined, "::ffff:203.0.113.10")).toBe("203.0.113.10");
+    const previousNodeEnv = process.env.NODE_ENV;
+    const previousSecret = process.env.FILLIP_LOCKOUT_SECRET;
+    const secret = "x".repeat(31);
+    try {
+      process.env.NODE_ENV = "production";
+      process.env.FILLIP_LOCKOUT_SECRET = secret;
+      const problem = lockoutSecretProblem();
+      expect(problem).toMatch(/FILLIP_LOCKOUT_SECRET/);
+      expect(problem ?? "").not.toContain(secret);
+      process.env.FILLIP_LOCKOUT_SECRET = "y".repeat(32);
+      expect(lockoutSecretProblem()).toBeNull();
+    } finally {
+      if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previousNodeEnv;
+      if (previousSecret === undefined) delete process.env.FILLIP_LOCKOUT_SECRET;
+      else process.env.FILLIP_LOCKOUT_SECRET = previousSecret;
+    }
   });
 });
 

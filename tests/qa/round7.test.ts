@@ -631,6 +631,10 @@ describe("QA round 7 HTTP catalog, lockout, and sign-out", () => {
     const shifted = await post("/auth/code/verify", { email: "fresh@example.com", code: "123456" }, { "x-forwarded-for": "203.0.113.99" });
     if (shifted.status !== 429) holes.push(`X-Forwarded-For changed the verify lock to ${shifted.status}`);
 
+    for (let index = attempts.length - 1; index >= 0; index -= 1) {
+      if (attempts[index]?.subject_kind === "ip") attempts.splice(index, 1);
+    }
+
     const lockedIp = { "x-forwarded-for": "198.51.100.20" };
     await post("/auth/code/send", { email: "locked@example.com" }, lockedIp);
     for (let index = 0; index < 5; index += 1) {

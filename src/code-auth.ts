@@ -34,11 +34,27 @@ type AttemptRow = {
 
 const memoryRows = new Map<string, AttemptRow>();
 let memoryChain: Promise<unknown> = Promise.resolve();
+const DEV_LOCKOUT_SECRET = "fillip-dev-lockout";
+
+function productionLockout(): boolean {
+  return process.env.NODE_ENV === "production" || process.env.VERCEL_ENV === "production";
+}
+
+/** Production must set this itself. The message never includes the secret. */
+export function lockoutSecretProblem(): string | null {
+  if (!productionLockout()) return null;
+  const secret = (process.env.FILLIP_LOCKOUT_SECRET || "").trim();
+  if (secret.length >= 32) return null;
+  return "FILLIP_LOCKOUT_SECRET must be set to at least 32 characters before Fillip starts in production.";
+}
 
 function pepper(): string {
-  const dedicated = (process.env.FILLIP_LOCKOUT_SECRET || "").trim();
-  if (dedicated) return dedicated;
-  return process.env.FILLIP_UNSUBSCRIBE_SECRET || process.env.CRON_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || "fillip-pkce";
+  const secret = (process.env.FILLIP_LOCKOUT_SECRET || "").trim();
+  if (secret.length >= 32) return secret;
+  if (productionLockout()) {
+    throw new Error("FILLIP_LOCKOUT_SECRET must be set to at least 32 characters before Fillip starts in production.");
+  }
+  return DEV_LOCKOUT_SECRET;
 }
 
 export function codeSubjectHash(kind: AttemptKind, value: string): string {
@@ -145,20 +161,6 @@ async function clearEmailWrong(hash: string): Promise<void> {
   });
 }
 
-async function resetIpVerify(hash: string): Promise<void> {
-  if (supabaseBase() && serviceKey()) {
-    await serviceRest("/rest/v1/rpc/fillip_reset_ip_verify", {
-      method: "POST",
-      body: JSON.stringify({ p_hash: hash })
-    });
-    return;
-  }
-  await memoryExclusive(() => {
-    const row = memoryRows.get(`ip:${hash}`);
-    if (row) memoryRows.set(`ip:${hash}`, { ...row, verify_count: 0 });
-  });
-}
-
 function firstHop(value: string | undefined): string {
   if (!value) return "";
   return value.split(",")[0]?.trim() ?? "";
@@ -182,11 +184,10 @@ function ipv6Slash64(address: string): string {
   return hextets.slice(0, 4).map((part) => part.padStart(4, "0")).join(":");
 }
 
-/** Vercel sets x-vercel-forwarded-for. A client-supplied X-Forwarded-For chain is not the key. */
+/** On Vercel, only the platform header. Elsewhere, only the socket. Client X-Real-IP and X-Forwarded-For are ignored. */
 export function lockoutAddressKey(header: (name: string) => string | undefined, remoteAddress?: string | null): string {
-  const vercel = firstHop(header("x-vercel-forwarded-for"));
-  const real = firstHop(header("x-real-ip"));
-  let value = vercel || real || (remoteAddress ?? "").trim() || "unknown";
+  const vercel = process.env.VERCEL ? firstHop(header("x-vercel-forwarded-for")) : "";
+  let value = vercel || (remoteAddress ?? "").trim() || "unknown";
   if (value.toLowerCase().startsWith("::ffff:")) value = value.slice(7);
   const v4port = value.match(/^(\d{1,3}(?:\.\d{1,3}){3}):\d+$/);
   if (v4port?.[1]) return v4port[1];
@@ -299,13 +300,6 @@ async function sendCode(req: Request, res: Response): Promise<void> {
     await pad(started);
     res.set("Cache-Control", "no-store").status(429).json({ ok: false, message: SEND_WAIT });
     return;
-  }
-  if (counted && sendCount <= IP_SEND_LIMIT) {
-    try {
-      await resetIpVerify(ipHash);
-    } catch {
-      // A failed verify-window reset still answers like every other send.
-    }
   }
   await pad(started);
   res.set("Cache-Control", "no-store").status(200).json({ ok: true, message: CODE_SENT });

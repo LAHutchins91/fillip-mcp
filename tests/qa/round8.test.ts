@@ -519,7 +519,7 @@ describe("QA round 8 address key", () => {
     expect(lockoutAddressKey(() => undefined, "2001:0db8:0001:0002:0000:0000:0000:0001")).toBe(compressed);
     expect(lockoutAddressKey(() => undefined, "2001:DB8:1:2::1%eth0")).toBe(compressed);
     expect(lockoutAddressKey(() => undefined, "2001:db8:1:3::1")).not.toBe(compressed);
-    expect(lockoutAddressKey(header({ "x-real-ip": "198.51.100.9:4321" }), "127.0.0.1")).toBe("198.51.100.9");
+    expect(lockoutAddressKey(header({ "x-real-ip": "198.51.100.9:4321" }), "127.0.0.1")).toBe("127.0.0.1");
   });
 });
 
@@ -600,6 +600,8 @@ describe("QA round 8 emailed-code lock over HTTP", () => {
 
   beforeEach(() => {
     verifyCalls.length = 0;
+    attempts.length = 0;
+    delete process.env.VERCEL;
   });
 
   function post(pathname: string, body: unknown, headers: Record<string, string> = {}) {
@@ -645,6 +647,7 @@ describe("QA round 8 emailed-code lock over HTTP", () => {
   });
 
   it("QA-PASS: the same IPv6 /64 shares a verify budget, including a zone id", async () => {
+    process.env.VERCEL = "1";
     const emailAt = (index: number) => `v6-${index}@example.com`;
     for (let index = 0; index < 10; index += 1) {
       const wrong = await post("/auth/code/verify", { email: emailAt(index), code: "000000" }, {
@@ -666,7 +669,7 @@ describe("QA round 8 emailed-code lock over HTTP", () => {
     expect(other.status).toBe(400);
   });
 
-  it("an allowed send resets that IP verify count; rotating emails then reaches 600 provider tries an hour", async () => {
+  it("an allowed send leaves the IP verify count until its window expires", async () => {
     const ip = { "x-real-ip": "203.0.113.41" };
     let through = 0;
     for (let index = 0; index < 10; index += 1) {
@@ -679,16 +682,13 @@ describe("QA round 8 emailed-code lock over HTTP", () => {
     expect(through).toBe(10);
     const owned = await post("/auth/code/send", { email: "attacker-owned@example.com" }, ip);
     expect(JSON.parse(owned.text).message).toBe(CODE_SENT);
-    let afterReset = 0;
-    for (let index = 0; index < 10; index += 1) {
-      const wrong = await post("/auth/code/verify", { email: `grind-after-${index}@example.com`, code: "000000" }, ip);
-      expect(wrong.status).toBe(400);
-      afterReset += 1;
-    }
-    const blockedAgain = await post("/auth/code/verify", { email: "grind-after-blocked@example.com", code: "000000" }, ip);
-    expect(blockedAgain.status).toBe(429);
-    expect(afterReset).toBe(10);
+    const afterSend = await post("/auth/code/verify", { email: "grind-after@example.com", code: "000000" }, ip);
+    expect(afterSend.status).toBe(429);
+    expect(verifyCalls).toHaveLength(10);
 
+    for (let index = attempts.length - 1; index >= 0; index -= 1) {
+      if (attempts[index]?.subject_kind === "ip") attempts.splice(index, 1);
+    }
     const sendIp = { "x-real-ip": "203.0.113.70" };
     let sends = 0;
     for (let index = 0; index < 6; index += 1) {
@@ -700,8 +700,6 @@ describe("QA round 8 emailed-code lock over HTTP", () => {
       }
     }
     expect(sends).toBe(5);
-    const perHour = sends * through * (60 / 5);
-    expect(perHour).toBe(600);
     expect(5 * (60 / 15)).toBe(20);
   }, 20_000);
 
@@ -788,7 +786,7 @@ describe("QA round 8 lockout secret at startup", () => {
     const result = await boot({
       NODE_ENV: "production",
       VERCEL_ENV: "",
-      FILLIP_LOCKOUT_SECRET: "round8-dedicated-secret"
+      FILLIP_LOCKOUT_SECRET: "round8-dedicated-secret-32-characters"
     });
     expect(result.listened).toBe(true);
   }, 30_000);
