@@ -1,4 +1,4 @@
-import { assertSingleRecipient, type MailSender, type OutboundEmail } from "./email.js";
+import { assertSingleRecipient, ProviderQuotaError, type MailSender, type OutboundEmail } from "./email.js";
 import type { ServiceStore } from "./store.js";
 import { signStopToken } from "./stop-token.js";
 import { nextFire } from "./time.js";
@@ -6,13 +6,76 @@ import type { DigestSettings, OwnerContact, Reminder } from "./types.js";
 import { allowanceFor, monthStart, nextMonthStart, type TierCaps } from "./usage.js";
 import { formatClock, formatWhen, localDateKey, zonedParts } from "./zone.js";
 
+export type GlobalEmailLimits = { perDay: number; perMonth: number };
+
+export type GlobalEmailSnapshot = {
+  daySent: number;
+  dayLimit: number;
+  monthSent: number;
+  monthLimit: number;
+  dayResetsAt: string;
+  monthResetsAt: string;
+  stopped: boolean;
+  close: boolean;
+  reason: "day" | "month" | "provider" | null;
+};
+
 export type JobReport = {
   sent: number;
   skipped: number;
   failed: number;
   deferred: number;
   digests: number;
+  global: GlobalEmailSnapshot;
 };
+
+/** How long to wait after Resend returns 429 or a quota error before trying again. */
+export const PROVIDER_BACKOFF_MS = 15 * 60 * 1000;
+
+export function globalEmailLimitsFromEnv(env: NodeJS.ProcessEnv = process.env): GlobalEmailLimits {
+  const read = (name: string) => {
+    const raw = env[name];
+    if (raw === undefined || raw.trim() === "") return 0;
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value < 0) return 0;
+    return Math.floor(value);
+  };
+  return {
+    perDay: read("FILLIP_GLOBAL_MAX_EMAILS_PER_DAY"),
+    perMonth: read("FILLIP_GLOBAL_MAX_EMAILS_PER_MONTH")
+  };
+}
+
+export function utcDayStart(now: Date): Date {
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+}
+
+export function nextUtcDay(now: Date): Date {
+  return new Date(utcDayStart(now).getTime() + 24 * 60 * 60 * 1000);
+}
+
+function globalClose(sent: number, limit: number): boolean {
+  if (limit <= 0) return true;
+  return limit - sent <= Math.max(1, Math.ceil(limit * 0.1));
+}
+
+export async function readGlobalEmailSnapshot(store: ServiceStore, now: Date, limits: GlobalEmailLimits): Promise<GlobalEmailSnapshot> {
+  const daySent = await store.countAllSentSince(utcDayStart(now).toISOString());
+  const monthSent = await store.countAllSentSince(monthStart(now).toISOString());
+  const dayHit = daySent >= limits.perDay;
+  const monthHit = monthSent >= limits.perMonth;
+  return {
+    daySent,
+    dayLimit: limits.perDay,
+    monthSent,
+    monthLimit: limits.perMonth,
+    dayResetsAt: nextUtcDay(now).toISOString(),
+    monthResetsAt: nextMonthStart(now).toISOString(),
+    stopped: dayHit || monthHit,
+    close: globalClose(daySent, limits.perDay) || globalClose(monthSent, limits.perMonth),
+    reason: monthHit ? "month" : dayHit ? "day" : null
+  };
+}
 
 const STALE_MS = 2 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -92,16 +155,77 @@ export async function runDueJob(options: {
   maxSends: number;
   minIntervalMs: number;
   caps: TierCaps;
+  global: GlobalEmailLimits;
+  warn?: (message: string) => void;
   sleep?: (ms: number) => Promise<void>;
 }): Promise<JobReport> {
   if (!options.from.trim()) throw new Error("Sender identity is not configured");
   if (!options.unsubscribeSecret.trim()) throw new Error("Unsubscribe secret is not configured");
-  const report: JobReport = { sent: 0, skipped: 0, failed: 0, deferred: 0, digests: 0 };
   const nowIso = options.now.toISOString();
   const since = new Date(options.now.getTime() - DAY_MS).toISOString();
   const staleBefore = new Date(options.now.getTime() - STALE_MS).toISOString();
   const due = await options.store.listDue(nowIso, Math.max(options.maxSends, 1) * 3);
+  const global = await readGlobalEmailSnapshot(options.store, options.now, options.global);
+  const report: JobReport = { sent: 0, skipped: 0, failed: 0, deferred: 0, digests: 0, global };
   let providerCalls = 0;
+  let warned = false;
+  let providerHold: string | null = null;
+  const warn = options.warn ?? ((message: string) => console.warn(message));
+  const note = (message: string) => {
+    if (warned) return;
+    warned = true;
+    warn(message);
+  };
+  const guardText = () => `Fillip global email guard: ${global.daySent} of ${global.dayLimit} emails sent today, ${global.monthSent} of ${global.monthLimit} this month. Due reminders stay queued until the window resets.`;
+
+  const refreshStop = () => {
+    const monthHit = global.monthSent >= global.monthLimit;
+    const dayHit = global.daySent >= global.dayLimit;
+    global.stopped = monthHit || dayHit;
+    global.close = globalClose(global.daySent, global.dayLimit) || globalClose(global.monthSent, global.monthLimit);
+    global.reason = providerHold ? "provider" : monthHit ? "month" : dayHit ? "day" : null;
+  };
+
+  const holdActive = async (until: string) => {
+    for (const reminder of due) {
+      const current = await options.store.getReminder(reminder.ownerId, reminder.id);
+      if (!current || current.status !== "active") continue;
+      const holdUntil = current.holdUntil && current.holdUntil > until ? current.holdUntil : until;
+      if (current.holdUntil === holdUntil) continue;
+      await options.store.saveReminder({ ...current, status: "active", holdUntil, updatedAt: nowIso });
+    }
+  };
+
+  const beginProviderBackoff = async () => {
+    providerHold = new Date(options.now.getTime() + PROVIDER_BACKOFF_MS).toISOString();
+    await options.store.setProviderBackoffUntil(providerHold);
+    refreshStop();
+    note(`Fillip email provider returned a quota or rate limit. Backing off until ${providerHold}. Due reminders stay queued and were not marked sent. ${guardText()}`);
+    await holdActive(providerHold);
+  };
+
+  if (global.dayLimit <= 0 || global.monthLimit <= 0) {
+    note("Fillip global email guard is closed because FILLIP_GLOBAL_MAX_EMAILS_PER_DAY or FILLIP_GLOBAL_MAX_EMAILS_PER_MONTH is not set. Due reminders stay queued.");
+  } else if (global.stopped) {
+    note(guardText());
+  } else if (global.close) {
+    note(`Fillip global email guard is close. ${guardText()}`);
+  }
+
+  const existingBackoff = await options.store.getProviderBackoffUntil();
+  if (existingBackoff && existingBackoff > nowIso) {
+    providerHold = existingBackoff;
+    refreshStop();
+    note(`Fillip email provider asked for a backoff until ${existingBackoff}. Due reminders stay queued and were not marked sent. ${guardText()}`);
+    await holdActive(existingBackoff);
+    return report;
+  }
+
+  if (global.stopped) {
+    const until = global.reason === "month" ? global.monthResetsAt : global.dayResetsAt;
+    await holdActive(until);
+    return report;
+  }
 
   const pause = async () => {
     if (providerCalls > 0 && options.minIntervalMs > 0) {
@@ -153,6 +277,13 @@ export async function runDueJob(options: {
       report.deferred += 1;
       continue;
     }
+    refreshStop();
+    if (global.stopped) {
+      note(guardText());
+      const until = global.reason === "month" ? global.monthResetsAt : global.dayResetsAt;
+      await holdActive(until);
+      break;
+    }
     const to = assertSingleRecipient(contact.email);
     const idempotencyKey = `fillip/${reminder.id}/${reminder.fireAt}`;
     const claim = await options.store.claimDelivery({
@@ -186,9 +317,25 @@ export async function runDueJob(options: {
         error: null
       });
       await noteSent(options.store, contact, options.now);
+      global.daySent += 1;
+      global.monthSent += 1;
+      refreshStop();
       await advanceIfSent(options.store, reminder, reminder.fireAt, options.now);
       report.sent += 1;
-    } catch {
+    } catch (error) {
+      if (error instanceof ProviderQuotaError) {
+        await options.store.saveDelivery({
+          ...claim.delivery,
+          status: "failed",
+          error: "provider backoff",
+          providerId: null,
+          sentAt: null,
+          startedAt: nowIso
+        });
+        await beginProviderBackoff();
+        report.deferred += 1;
+        break;
+      }
       await options.store.saveDelivery({
         ...claim.delivery,
         status: "failed",
@@ -199,14 +346,23 @@ export async function runDueJob(options: {
     }
   }
 
-  if (providerCalls < options.maxSends) {
+  if (!providerHold && !global.stopped && providerCalls < options.maxSends) {
     const digests = await options.store.listEnabledDigests();
     for (const digest of digests) {
-      if (providerCalls >= options.maxSends) break;
+      if (providerCalls >= options.maxSends || providerHold || global.stopped) break;
       let outcome: "sent" | "skipped" | "failed" | "deferred" = "failed";
       try {
-        outcome = await sendDigest(options, digest, since, staleBefore, nowIso, takeSlot);
-      } catch {
+        outcome = await sendDigest(options, digest, since, staleBefore, nowIso, takeSlot, () => {
+          global.daySent += 1;
+          global.monthSent += 1;
+          refreshStop();
+        });
+      } catch (error) {
+        if (error instanceof ProviderQuotaError) {
+          await beginProviderBackoff();
+          report.deferred += 1;
+          break;
+        }
         outcome = "failed";
       }
       if (outcome === "sent") {
@@ -230,12 +386,14 @@ async function sendDigest(
     unsubscribeSecret: string;
     maxEmailsPerUserPerDay: number;
     caps: TierCaps;
+    global: GlobalEmailLimits;
   },
   digest: DigestSettings,
   since: string,
   staleBefore: string,
   nowIso: string,
-  beginSend: () => Promise<void>
+  beginSend: () => Promise<void>,
+  onSent: () => void
 ): Promise<"sent" | "skipped" | "failed" | "deferred"> {
   const parts = zonedParts(options.now, digest.timezone);
   const minutesNow = parts.hour * 60 + parts.minute;
@@ -244,6 +402,7 @@ async function sendDigest(
   if (minutesNow < minutesDue || digest.lastSentOn === today) return "skipped";
   const contact = await options.store.getContact(digest.ownerId);
   if (!contact || contact.unsubscribed || !contact.emailVerified || !contact.email) return "skipped";
+  if (options.global.perDay <= 0 || options.global.perMonth <= 0) return "deferred";
   if (allowanceFor(contact, options.now, options.caps).reached) return "deferred";
   const sentToday = await options.store.countSentSince(digest.ownerId, since);
   if (sentToday >= options.maxEmailsPerUserPerDay) return "deferred";
@@ -298,10 +457,18 @@ async function sendDigest(
     });
     await options.store.saveDelivery({ ...claim.delivery, status: "sent", providerId: result.id, sentAt: nowIso, error: null });
     await noteSent(options.store, contact, options.now);
+    onSent();
     await options.store.saveDigest({ ...digest, lastSentOn: today, updatedAt: nowIso });
     return "sent";
-  } catch {
-    await options.store.saveDelivery({ ...claim.delivery, status: "failed", error: "send failed", startedAt: nowIso });
+  } catch (error) {
+    await options.store.saveDelivery({
+      ...claim.delivery,
+      status: "failed",
+      error: error instanceof ProviderQuotaError ? "provider backoff" : "send failed",
+      sentAt: null,
+      startedAt: nowIso
+    });
+    if (error instanceof ProviderQuotaError) throw error;
     return "failed";
   }
 }

@@ -123,3 +123,14 @@ drop trigger if exists on_auth_user_created_fillip on auth.users;
 create trigger on_auth_user_created_fillip
   after insert on auth.users
   for each row execute function public.handle_new_fillip_user();
+
+-- One row for the shared provider backoff. Service role only. No user can read it.
+create table if not exists public.fillip_runtime (
+  id integer primary key check (id = 1),
+  provider_backoff_until timestamptz,
+  updated_at timestamptz not null default now()
+);
+
+insert into public.fillip_runtime (id) values (1) on conflict (id) do nothing;
+
+alter table public.fillip_runtime enable row level security;

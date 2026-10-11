@@ -374,4 +374,30 @@ export class SupabaseFillipStore implements ServiceStore {
     const value = await this.db(`/rest/v1/deliveries?owner_id=eq.${encodeURIComponent(ownerId)}&status=eq.sent&sent_at=gte.${encodeURIComponent(sinceIso)}&select=id&limit=100`);
     return rows<{ id: string }>(value).length;
   }
+
+  async countAllSentSince(sinceIso: string): Promise<number> {
+    if (this.mode !== "service") throw new Error("Reminder not found");
+    const value = await this.db(
+      `/rest/v1/deliveries?status=eq.sent&sent_at=gte.${encodeURIComponent(sinceIso)}&select=id`,
+      { method: "GET", headers: { Prefer: "count=exact", Range: "0-0" } }
+    );
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    return rows<{ id: string }>(value).length;
+  }
+
+  async getProviderBackoffUntil(): Promise<string | null> {
+    if (this.mode !== "service") throw new Error("Reminder not found");
+    const value = await this.db("/rest/v1/fillip_runtime?id=eq.1&select=provider_backoff_until");
+    const row = rows<{ provider_backoff_until?: string | null }>(value)[0];
+    return typeof row?.provider_backoff_until === "string" ? row.provider_backoff_until : null;
+  }
+
+  async setProviderBackoffUntil(untilIso: string): Promise<void> {
+    if (this.mode !== "service") throw new Error("Reminder not found");
+    await this.db("/rest/v1/fillip_runtime?on_conflict=id", {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify({ id: 1, provider_backoff_until: untilIso, updated_at: new Date().toISOString() })
+    });
+  }
 }

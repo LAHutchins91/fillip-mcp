@@ -90,8 +90,32 @@ describe("streamable HTTP", () => {
   it("serves connect, health, and OAuth metadata", async () => {
     const health = await fetch(`${base}/health`);
     expect(health.status).toBe(200);
-    const healthBody = await health.json() as { service: string };
+    const healthBody = await health.json() as {
+      service: string;
+      globalEmails: {
+        daySent: number | null;
+        monthSent: number | null;
+        dayLimit: number;
+        monthLimit: number;
+        stopped: boolean;
+        close: boolean;
+        reason: string | null;
+        dayResetsAt: string;
+        monthResetsAt: string;
+      };
+    };
     expect(healthBody.service).toBe("fillip");
+    expect(healthBody.globalEmails).toMatchObject({
+      daySent: null,
+      monthSent: null,
+      dayLimit: 0,
+      monthLimit: 0,
+      stopped: true,
+      close: true,
+      reason: "month"
+    });
+    expect(healthBody.globalEmails.dayResetsAt).toMatch(/T00:00:00.000Z$/);
+    expect(healthBody.globalEmails.monthResetsAt).toMatch(/T00:00:00.000Z$/);
 
     const connect = await fetch(`${base}/connect`);
     const html = await connect.text();

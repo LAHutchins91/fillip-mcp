@@ -8,6 +8,7 @@ type Snapshot = {
   deliveries: Delivery[];
   digests: DigestSettings[];
   contacts: OwnerContact[];
+  providerBackoffUntil?: string | null;
 };
 
 /** Local schedule for one operator. Mail still requires a verified hosted account. */
@@ -24,6 +25,7 @@ export class FileFillipStore extends MemoryFillipStore {
       this.deliveries = parsed.deliveries ?? [];
       this.digests = new Map((parsed.digests ?? []).map((row) => [row.ownerId, row]));
       this.contacts = new Map((parsed.contacts ?? []).map((row) => [row.id, row]));
+      this.providerBackoffUntil = parsed.providerBackoffUntil ?? null;
     } catch {
       this.reminders = [];
     }
@@ -34,7 +36,8 @@ export class FileFillipStore extends MemoryFillipStore {
       reminders: this.reminders,
       deliveries: this.deliveries,
       digests: [...this.digests.values()],
-      contacts: [...this.contacts.values()]
+      contacts: [...this.contacts.values()],
+      providerBackoffUntil: this.providerBackoffUntil
     };
     mkdirSync(path.dirname(this.filePath), { recursive: true });
     writeFileSync(this.filePath, JSON.stringify(snapshot));
@@ -85,6 +88,11 @@ export class FileFillipStore extends MemoryFillipStore {
 
   override async saveUsage(ownerId: string, usage: { emailsSentInPeriod: number; emailPeriodStart: string }): Promise<void> {
     await super.saveUsage(ownerId, usage);
+    this.persist();
+  }
+
+  override async setProviderBackoffUntil(untilIso: string): Promise<void> {
+    await super.setProviderBackoffUntil(untilIso);
     this.persist();
   }
 }

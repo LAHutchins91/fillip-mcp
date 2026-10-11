@@ -12,6 +12,21 @@ export interface MailSender {
   send(message: OutboundEmail): Promise<{ id: string }>;
 }
 
+/** Resend rate limit or quota. The delivery job backs off and retries with the same idempotency key. */
+export class ProviderQuotaError extends Error {
+  readonly status: number;
+  constructor(status: number) {
+    super("Email provider asked Fillip to back off");
+    this.name = "ProviderQuotaError";
+    this.status = status;
+  }
+}
+
+export function isProviderQuota(status: number, body: string): boolean {
+  if (status === 429) return true;
+  return /quota|rate limit|too many requests|sending limit/i.test(body);
+}
+
 export function assertSingleRecipient(to: string) {
   const address = to.trim();
   if (!address || address.includes(",") || address.includes(";") || address.split(/\s+/).length !== 1 || !address.includes("@")) {
@@ -42,8 +57,12 @@ export function createResendSender(apiKey: string, fetchImpl: typeof fetch = fet
         }),
         signal: AbortSignal.timeout(20000)
       });
-      if (!response.ok) throw new Error("Email provider rejected the reminder");
-      const body = await response.json() as { id?: string };
+      const raw = await response.text();
+      if (!response.ok) {
+        if (isProviderQuota(response.status, raw)) throw new ProviderQuotaError(response.status);
+        throw new Error("Email provider rejected the reminder");
+      }
+      const body = (raw ? JSON.parse(raw) : {}) as { id?: string };
       if (!body.id) throw new Error("Email provider rejected the reminder");
       return { id: body.id };
     }

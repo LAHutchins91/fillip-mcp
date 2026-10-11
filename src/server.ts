@@ -11,8 +11,8 @@ import { createFillipServer } from "./fillip-tools.js";
 import { landingConnectLead } from "./connect-page.js";
 import { renderLanding } from "./landing-page.js";
 import { billingConfigFromEnv, checkoutParams, decideBillingAction, verifyStripeSignature, type JsonObject } from "./lib/billing.js";
-import { tierCapsFromEnv, usageCapsConfigured } from "./lib/usage.js";
-import { runDueJob } from "./lib/deliver.js";
+import { nextMonthStart, tierCapsFromEnv, usageCapsConfigured } from "./lib/usage.js";
+import { globalEmailLimitsFromEnv, nextUtcDay, readGlobalEmailSnapshot, runDueJob, type GlobalEmailSnapshot } from "./lib/deliver.js";
 import { createResendSender } from "./lib/email.js";
 import { publicError } from "./lib/errors.js";
 import { FileFillipStore } from "./lib/file-store.js";
@@ -83,6 +83,32 @@ function requireEnv(name: string, value: string) {
   return value;
 }
 
+function contentRangeTotal(header: string | null): number {
+  const match = header?.match(/\/(\d+)$/);
+  if (!match) throw new Error("Supabase count missing");
+  return Number(match[1]);
+}
+
+async function supabaseCount(pathname: string, serviceRole: boolean): Promise<number> {
+  const base = requireEnv("SUPABASE_URL", envValue("SUPABASE_URL").replace(/\/+$/, ""));
+  const key = serviceRole ? requireEnv("SUPABASE_SERVICE_ROLE_KEY", envValue("SUPABASE_SERVICE_ROLE_KEY")) : requireEnv("SUPABASE_ANON_KEY", envValue("SUPABASE_ANON_KEY"));
+  const response = await fetch(`${base}${pathname}`, {
+    method: "GET",
+    headers: {
+      apikey: key,
+      Authorization: `Bearer ${key}`,
+      Prefer: "count=exact",
+      Range: "0-0"
+    },
+    signal: AbortSignal.timeout(20000)
+  });
+  if (!response.ok && response.status !== 206) {
+    const text = await response.text();
+    throw new Error(`Supabase ${response.status}: ${text || response.statusText}`);
+  }
+  return contentRangeTotal(response.headers.get("content-range"));
+}
+
 async function supabaseRequest<T>(pathname: string, options: RequestInit = {}, accessToken?: string, serviceRole = false): Promise<T> {
   const base = requireEnv("SUPABASE_URL", envValue("SUPABASE_URL").replace(/\/+$/, ""));
   const key = serviceRole ? requireEnv("SUPABASE_SERVICE_ROLE_KEY", envValue("SUPABASE_SERVICE_ROLE_KEY")) : requireEnv("SUPABASE_ANON_KEY", envValue("SUPABASE_ANON_KEY"));
@@ -151,7 +177,11 @@ function userDb(token: string): Db {
 }
 
 function serviceDb(): Db {
-  return (pathname, options) => supabaseRequest(pathname, options ?? {}, undefined, true);
+  return (pathname, options) => {
+    const prefer = new Headers(options?.headers).get("prefer") ?? "";
+    if (prefer.includes("count=exact")) return supabaseCount(pathname, true);
+    return supabaseRequest(pathname, options ?? {}, undefined, true);
+  };
 }
 
 function createUserStore(userId: string, token: string): ReminderStore {
@@ -228,20 +258,52 @@ app.get("/", (_req, res) => {
   }));
 });
 
-app.get("/health", (_req, res) => res.json({
-  ok: true,
-  service: "fillip",
-  version: FILLIP_VERSION,
-  supabaseConfigured: Boolean(envValue("SUPABASE_URL") && envValue("SUPABASE_ANON_KEY")),
-  stripeSecretConfigured: Boolean(envValue("STRIPE_SECRET_KEY")),
-  stripeProductConfigured: Boolean(envValue("STRIPE_PRODUCT_ID")),
-  stripeMonthlyConfigured: Boolean(envValue("STRIPE_PRICE_MONTHLY")),
-  stripeYearlyConfigured: Boolean(envValue("STRIPE_PRICE_YEARLY")),
-  billingConfigured: Boolean(envValue("STRIPE_SECRET_KEY") && envValue("STRIPE_PRODUCT_ID") && envValue("STRIPE_PRICE_MONTHLY") && envValue("STRIPE_PRICE_YEARLY")),
-  usageCapsConfigured: usageCapsConfigured(),
-  resendConfigured: Boolean(envValue("RESEND_API_KEY")),
-  senderConfigured: Boolean(envValue("FILLIP_FROM_EMAIL"))
-}));
+app.get("/health", async (_req, res) => {
+  const now = new Date();
+  const limits = globalEmailLimitsFromEnv();
+  let globalEmails: GlobalEmailSnapshot | null = null;
+  if (envValue("SUPABASE_URL") && envValue("SUPABASE_SERVICE_ROLE_KEY")) {
+    try {
+      globalEmails = await readGlobalEmailSnapshot(createServiceStore(), now, limits);
+    } catch (error) {
+      console.warn("Fillip global email guard: counts are unavailable");
+      console.warn(error instanceof Error ? error.message : "count failed");
+    }
+  }
+  const daySent = globalEmails?.daySent ?? null;
+  const monthSent = globalEmails?.monthSent ?? null;
+  const countsMissing = Boolean(envValue("SUPABASE_URL") && envValue("SUPABASE_SERVICE_ROLE_KEY")) && !globalEmails;
+  const stopped = globalEmails
+    ? globalEmails.stopped
+    : limits.perDay <= 0 || limits.perMonth <= 0 || countsMissing;
+  const reason = globalEmails?.reason
+    ?? (countsMissing ? null : limits.perMonth <= 0 ? "month" : limits.perDay <= 0 ? "day" : null);
+  res.json({
+    ok: true,
+    service: "fillip",
+    version: FILLIP_VERSION,
+    supabaseConfigured: Boolean(envValue("SUPABASE_URL") && envValue("SUPABASE_ANON_KEY")),
+    stripeSecretConfigured: Boolean(envValue("STRIPE_SECRET_KEY")),
+    stripeProductConfigured: Boolean(envValue("STRIPE_PRODUCT_ID")),
+    stripeMonthlyConfigured: Boolean(envValue("STRIPE_PRICE_MONTHLY")),
+    stripeYearlyConfigured: Boolean(envValue("STRIPE_PRICE_YEARLY")),
+    billingConfigured: Boolean(envValue("STRIPE_SECRET_KEY") && envValue("STRIPE_PRODUCT_ID") && envValue("STRIPE_PRICE_MONTHLY") && envValue("STRIPE_PRICE_YEARLY")),
+    usageCapsConfigured: usageCapsConfigured(),
+    resendConfigured: Boolean(envValue("RESEND_API_KEY")),
+    senderConfigured: Boolean(envValue("FILLIP_FROM_EMAIL")),
+    globalEmails: {
+      daySent,
+      dayLimit: limits.perDay,
+      monthSent,
+      monthLimit: limits.perMonth,
+      dayResetsAt: nextUtcDay(now).toISOString(),
+      monthResetsAt: nextMonthStart(now).toISOString(),
+      stopped,
+      close: globalEmails?.close ?? (stopped || limits.perDay <= 0 || limits.perMonth <= 0),
+      reason
+    }
+  });
+});
 
 app.post("/billing/checkout", async (req, res) => {
   try {
@@ -344,7 +406,8 @@ async function deliver(req: Request, res: Response) {
       maxEmailsPerUserPerDay: intEnv("FILLIP_MAX_EMAILS_PER_USER_PER_DAY", 20),
       maxSends: intEnv("FILLIP_MAX_SENDS_PER_RUN", 40),
       minIntervalMs: intEnv("FILLIP_RESEND_MIN_INTERVAL_MS", 500),
-      caps: tierCapsFromEnv()
+      caps: tierCapsFromEnv(),
+      global: globalEmailLimitsFromEnv()
     });
     res.json(report);
   } catch (error) {

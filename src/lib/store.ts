@@ -33,6 +33,9 @@ export interface ServiceStore extends ReminderStore {
   }): Promise<ClaimResult>;
   saveDelivery(delivery: Delivery): Promise<void>;
   countSentSince(ownerId: string, sinceIso: string): Promise<number>;
+  countAllSentSince(sinceIso: string): Promise<number>;
+  getProviderBackoffUntil(): Promise<string | null>;
+  setProviderBackoffUntil(untilIso: string): Promise<void>;
   saveUsage(ownerId: string, usage: { emailsSentInPeriod: number; emailPeriodStart: string }): Promise<void>;
 }
 
