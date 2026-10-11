@@ -1,34 +1,42 @@
-# Fillip QA round 9
+# Fillip QA round 11
 
-Head: `02e7373` (`02e73734f9cedf57e0ca90e077cd578717fa7df8`) on `cursor/fillip-reminders-55db`.
-Product code was not changed. New tests and this report are the only additions.
+Head: `19c625b` (`19c625b643abc29c1b4a94125981928fa8009eed`) on `cursor/fillip-reminders-55db`.
+Product code was not changed. The round-10 tests, the round-11 tests, and this report are the only additions.
 
-The author said 311 tests pass, PR #9's tests are unchanged, and there is no SQL change. Before `tests/qa/round9.test.ts`, this head is **311 passed, 0 failed**. `npx tsc -p tsconfig.json --noEmit` exits 0. With the new file the suite is **318 passed, 0 failed**. Postgres is 16.15. `supabase/schema.sql` and `supabase/oauth_resource_binding.sql` are unchanged from `qa/bellion-fillip-8`.
+The author said 326 tests pass. On Postgres 16.15, with `supabase/schema.sql` applied, that tree is **326 passed, 0 failed**. `npx tsc -p tsconfig.json --noEmit` exits 0. With `tests/qa/round10.test.ts` and `tests/qa/round11.test.ts` the suite is **349 passed, 1 failed (350)**. The failure is the unchanged round-10 QA-FAIL.
 
-Severity: **0 blockers, 0 majors, 0 minors**.
+Severity: **0 blockers, 1 major, 0 minors**.
 
-Fillip passes code QA.
+Fillip does not pass code QA.
 
 ## Assertion diff
 
-Compared test files from `1d6a344` (`qa/bellion-fillip-8`) to `02e7373`. Three test files changed. No `it.skip`, `describe.skip`, `test.skip`, `xit`, or `xdescribe`. No SQL file changed.
+Compared test files from `dda2ed4` to `19c625b`. Three test files changed: `tests/remove-restore.test.ts`, `tests/http.test.ts`, and `tests/schema-reapply.test.ts`. No `it.skip`, `describe.skip`, or `test.skip`. No test file was deleted.
 
 Not weakened:
 
-- The three round-7 `QA-FAIL` bodies are still there. Between the `X-Forwarded-For` check and the email-lock check, the stand-in drops IP rows. The IP key is now the socket, so those first ten verifies would otherwise spend the same bucket the email lock uses. The email-lock expects are the same, and that test passes.
-- The two round-8 `QA-FAIL` bodies are still there and now pass. The address-key unit expect for `X-Real-IP` is the socket address. The IPv6 HTTP case sets `VERCEL=1` so it still keys the platform header. The send case now requires the verify cap to stay spent. The production boot control uses a 32-character secret, which is what a valid secret is.
-- `tests/code-auth.test.ts` expects the socket when `VERCEL` is unset, including when `x-vercel-forwarded-for` and `X-Real-IP` are present. With `VERCEL=1` it still expects the platform header. A 31-character secret is rejected and a 32-character secret is accepted.
+- The new remove/restore cases add the five prior statuses, `Already restored.`, another user's id, and a job that sends only for an active restore. They do not replace an older expect with a looser one.
+- `tests/http.test.ts` adds the purge-before-provider case. The provider-missing response is still 503 `Email provider is not configured.` and Resend is still not called.
+- `tests/schema-reapply.test.ts` now also requires `cancelled` and `completed` in `reminders_resume_status_check`.
+- The round-10 QA-FAIL bodies are unchanged. The status and cap QA-FAILs now pass. The in-flight send QA-FAIL still fails the same way (`sent` is 1).
+- Two round-10 QA-PASS strings were retargeted because this commit replaced them. The restore tool sentence now names the exact prior status, the open cap, and no send for a cancelled or completed reminder. The README sentence now says `fillip_purge_removed` runs before the email provider check and still deletes removed reminders older than 30 days. The immediate account-deletion sentence is unchanged.
+
+## Major
+
+A claim that has already returned `send` still emails the reminder after it is removed.
+
+Repro: a due reminder, `claimDelivery` returns `send`, the row is set to `removed` before the provider call, and `runDueJob` sends 1 email. `src/lib/deliver.ts` reads the row only to build the message (`getReminder` at line 675) and calls `sender.send` at line 678 without checking that the row is still active. A later claim is withheld, and `fillip_claim_sendable` is false for a removed row. This commit moved the purge to the start of `runDueJob` and added `purged` to the report. It did not change the send path.
 
 ## What was checked
 
-With `VERCEL=1`, ten wrong verifies that vary `X-Real-IP` and `X-Forwarded-For` but keep `x-vercel-forwarded-for: 198.51.100.8` share one budget. The eleventh, with a new `X-Real-IP` and `X-Forwarded-For` and the same platform address, is 429. A different first hop (`203.0.113.50`) is a new budget. The second hop is not the key. An IPv4 address with a port, an IPv4-mapped address, and an IPv6 /64 including a zone id follow that header. When the platform header is absent, different `X-Real-IP` and `X-Forwarded-For` values still share the socket.
+Restore returns each prior status:
 
-With `VERCEL` unset or empty, the socket is the key. `X-Real-IP`, `X-Forwarded-For`, and `x-vercel-forwarded-for` do not move it. After ten wrong verifies, each of those headers is 429.
+- Active: a daily series removed after five missed days comes back as the next future time, one row, not a burst. A job at the restore instant sends 0. A job at that next time sends exactly 1. A past one-time stays removed and keeps its `removedAt` and `fireAt`. At 10 open reminders the active restore throws the free-plan cap error and does not write. On Postgres, an update back to `active` at that cap rolls back.
+- Paused: stays paused, keeps the old `fireAt` and `holdUntil`, skips the cap, stays off the calendar, and is not emailed when the fillers send.
+- Cancelled, completed, and fired: same id, same `fireAt`, same `completedAt`, note `Restored. It will not send.` Cancelled and completed stay off the default list. Fired stays on that list, which is the existing rule for a fired row. None of the three is on the calendar. A job at a due time emails only the 10 open fillers. On Postgres the check constraint accepts `fired`, `completed`, and `cancelled`, those updates succeed while 10 rows are active, the open count stays 10, and `fillip_claim_sendable` is false for each.
 
-`src/code-auth.ts` does not read `x-real-ip` or `x-forwarded-for`, and it does not call `resetIpVerify` or `fillip_reset_ip_verify`.
+A second restore, including one a minute later and one that was never removed, returns `Already restored.` and does not change status, `fireAt`, or `updatedAt`. Another user's id and an unknown id throw `Reminder not found` and leave the row removed. A cancelled or fired row removed for 30 days plus 1ms throws `That reminder can no longer be restored.` and is not written. A cancelled row removed for exactly 30 days comes back cancelled. A null `resumeStatus` is refused and stays removed.
 
-Production startup (`NODE_ENV=production`, and `VERCEL_ENV=production` with `NODE_ENV=development`) exits 1 when `FILLIP_LOCKOUT_SECRET` is missing, 31 characters, or only whitespace. The process does not listen. The message names `FILLIP_LOCKOUT_SECRET` and does not include the secret. Unsubscribe, cron, service-role, and anon values are set in those runs and are not used. A 32-character secret, including one with surrounding whitespace, boots. `VERCEL_ENV=preview` does not refuse. `codeSubjectHash` throws in production instead of hashing with another secret. The only `||` chain that still ends at `fillip-pkce` is `pkceSecret()` in `src/plugin-auth.ts`, which signs the authorize cookie. It is not the lockout pepper, and this diff does not change it.
+Purge runs before the provider check. `runDueJob` deletes a row removed more than 30 days ago before it throws on a blank sender, and before `sender.send` on a normal run. A row removed at exactly 30 days is kept. The expired row is not emailed. `GET /internal/deliver` with a bad bearer is 401 and does not call the purge. A missing `CRON_SECRET` is 503 `Delivery is not configured.` and does not call the purge. When the purge call throws, the response is still 503 `Email provider is not configured.` and the error text is not in the body.
 
-An allowed send does not reset the IP verify count. After the cap is spent, a send to `attacker-owned@example.com` still returns `If that email can sign in, a code is on its way.` The next verify, including a correct code on a new email, stays 429 and is not sent to GoTrue. The stand-in records no `fillip_reset_ip_verify` call. That holds both for the platform header and for the socket.
-
-Plain PKCE is still `invalid_request`. Copy walk of `README.md`, `src`, `public`, `glama.json`, `server.json`, and `supabase/README-oauth.md` found no `$` prices, `USD`, `dollars`, `SMS`, Slack notification, push notification, WhatsApp, or iMessage. The full suite, including the earlier Postgres hook, cap, and lockout cases, passed.
+Copy walk of `README.md`, `src`, `public`, `glama.json`, `server.json`, and `supabase/README-oauth.md` found no `$` prices, `USD`, `dollars`, `SMS`, Slack notification, push notification, WhatsApp, or iMessage. Privacy still says the 30-day keep is followed by deletion, and that export, delete, and account deletion remove rows immediately. No test file is skipped. The earlier Postgres claim, purge, cap, RLS, sign-out, lockout, and PKCE cases passed on this head.
