@@ -529,12 +529,14 @@ export class SupabaseFillipStore implements ServiceStore {
       });
       if (typeof value === "boolean") return value;
     } catch {
-      // The status filter below is the same predicate when the function is not installed.
+      // The status read below is the same predicate when the function is not installed.
     }
-    const found = rows<{ id: string }>(await this.db(
-      `/rest/v1/reminders?id=eq.${encodeURIComponent(reminderId)}&owner_id=eq.${encodeURIComponent(ownerId)}&status=eq.active&select=id&limit=1`
+    const found = rows<{ status?: string }>(await this.db(
+      `/rest/v1/reminders?id=eq.${encodeURIComponent(reminderId)}&owner_id=eq.${encodeURIComponent(ownerId)}&select=status&limit=1`
     ));
-    return found.length > 0;
+    const status = found[0]?.status;
+    if (!status) return true;
+    return status === "active";
   }
 
   private async withheldClaim(input: {
