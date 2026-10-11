@@ -1,6 +1,6 @@
 # Fillip QA round 9
 
-Head: `02e7373` (`02e7373` on `cursor/fillip-reminders-55db`).
+Head: `02e7373` (`02e73734f9cedf57e0ca90e077cd578717fa7df8`) on `cursor/fillip-reminders-55db`.
 Product code was not changed. New tests and this report are the only additions.
 
 The author said 311 tests pass, PR #9's tests are unchanged, and there is no SQL change. Before `tests/qa/round9.test.ts`, this head is **311 passed, 0 failed**. `npx tsc -p tsconfig.json --noEmit` exits 0. With the new file the suite is **318 passed, 0 failed**. Postgres is 16.15. `supabase/schema.sql` and `supabase/oauth_resource_binding.sql` are unchanged from `qa/bellion-fillip-8`.
