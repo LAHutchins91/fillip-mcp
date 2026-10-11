@@ -50,8 +50,8 @@ export class FileFillipStore extends MemoryFillipStore {
     return saved;
   }
 
-  override async saveReminder(reminder: Reminder): Promise<Reminder> {
-    const saved = await super.saveReminder(reminder);
+  override async saveReminder(reminder: Reminder, expectedUpdatedAt?: string): Promise<Reminder> {
+    const saved = await super.saveReminder(reminder, expectedUpdatedAt);
     this.persist();
     return saved;
   }

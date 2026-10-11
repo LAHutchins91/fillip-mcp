@@ -1,5 +1,5 @@
 import type { ClaimResult, Delivery, DeliveryChannel, DigestSettings, OwnerContact, OwnerIdentity, Reminder, ReminderStatus } from "./types.js";
-import { OpenCapError, type ListQuery, type OpenCap, type SendReserve, type SendReserveResult, type ServiceStore } from "./store.js";
+import { OpenCapError, ReminderConflictError, type ListQuery, type OpenCap, type SendReserve, type SendReserveResult, type ServiceStore } from "./store.js";
 import { blankContact, sentThisMonth } from "./usage.js";
 import { randomUUID } from "node:crypto";
 
@@ -40,11 +40,24 @@ export class MemoryFillipStore implements ServiceStore {
     });
   }
 
-  async saveReminder(reminder: Reminder): Promise<Reminder> {
+  async saveReminder(reminder: Reminder, expectedUpdatedAt?: string): Promise<Reminder> {
     const index = this.reminders.findIndex((row) => row.id === reminder.id && row.ownerId === reminder.ownerId);
     if (index < 0) throw new Error("Reminder not found");
+    if (expectedUpdatedAt !== undefined && this.reminders[index]?.updatedAt !== expectedUpdatedAt) {
+      throw new ReminderConflictError();
+    }
     this.reminders[index] = reminder;
     return reminder;
+  }
+
+  async reminderSendInFlight(ownerId: string, reminderId: string, now: Date): Promise<boolean> {
+    const staleBefore = now.getTime() - 2 * 60 * 1000;
+    return this.deliveries.some((row) =>
+      row.ownerId === ownerId
+      && row.reminderId === reminderId
+      && row.status === "sending"
+      && Date.parse(row.startedAt) > staleBefore
+    );
   }
 
   async deleteReminder(ownerId: string, id: string): Promise<void> {

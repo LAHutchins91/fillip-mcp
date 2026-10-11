@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ClaimResult, Delivery, DeliveryChannel, DigestSettings, OwnerContact, OwnerIdentity, PlanName, Recurrence, Reminder, ReminderStatus } from "./types.js";
 import { openCapMessage } from "./errors.js";
-import { OpenCapError, type ListQuery, type OpenCap, type SendReserve, type SendReserveResult, type ServiceStore } from "./store.js";
+import { OpenCapError, ReminderConflictError, type ListQuery, type OpenCap, type SendReserve, type SendReserveResult, type ServiceStore } from "./store.js";
 import { sentThisMonth, UPGRADE_PROMPT, usagePeriodCurrent } from "./usage.js";
 import { zonedParts, zonedTimeToUtc } from "./zone.js";
 
@@ -250,16 +250,30 @@ export class SupabaseFillipStore implements ServiceStore {
     await write(`/rest/v1/reminders?id=eq.${encodeURIComponent(id)}&owner_id=eq.${encodeURIComponent(ownerId)}`, minimal);
   }
 
-  async saveReminder(reminder: Reminder): Promise<Reminder> {
+  async saveReminder(reminder: Reminder, expectedUpdatedAt?: string): Promise<Reminder> {
     this.owned(reminder.ownerId);
-    const value = await this.persist()(`/rest/v1/reminders?id=eq.${encodeURIComponent(reminder.id)}&owner_id=eq.${encodeURIComponent(reminder.ownerId)}`, {
+    const version = expectedUpdatedAt !== undefined ? `&updated_at=eq.${encodeURIComponent(expectedUpdatedAt)}` : "";
+    const value = await this.persist()(`/rest/v1/reminders?id=eq.${encodeURIComponent(reminder.id)}&owner_id=eq.${encodeURIComponent(reminder.ownerId)}${version}`, {
       method: "PATCH",
       headers: { Prefer: "return=representation" },
       body: JSON.stringify(toReminder(reminder))
     });
+    if (isAcknowledgedWrite(value)) return reminder;
     const row = rows<ReminderRow>(value)[0];
-    if (!row) throw new Error("Reminder not found");
+    if (!row) {
+      if (expectedUpdatedAt !== undefined) throw new ReminderConflictError();
+      throw new Error("Reminder not found");
+    }
     return fromReminder(row);
+  }
+
+  async reminderSendInFlight(ownerId: string, reminderId: string, now: Date): Promise<boolean> {
+    this.owned(ownerId);
+    const staleBefore = new Date(now.getTime() - 2 * 60 * 1000).toISOString();
+    const value = await this.db(
+      `/rest/v1/deliveries?owner_id=eq.${encodeURIComponent(ownerId)}&reminder_id=eq.${encodeURIComponent(reminderId)}&status=eq.sending&started_at=gt.${encodeURIComponent(staleBefore)}&select=id&limit=1`
+    );
+    return rows<{ id: string }>(value).length > 0;
   }
 
   async listDeliveryMarks(ownerId: string) {

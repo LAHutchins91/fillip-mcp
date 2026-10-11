@@ -59,7 +59,7 @@ describe("streamable HTTP", () => {
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} })
     });
     expect(response.status).toBe(200);
-    const body = await response.json() as { result?: { tools?: Array<{ name: string; description?: string; inputSchema?: { properties?: Record<string, unknown> } }> } };
+    const body = await response.json() as { result?: { tools?: Array<{ name: string; title?: string; description?: string; annotations?: { destructiveHint?: boolean }; inputSchema?: { properties?: Record<string, unknown>; required?: string[] } }> } };
     const tools = body.result?.tools ?? [];
     const names = tools.map((tool) => tool.name);
     expect(names).toEqual(["set_reminder", "list_reminders", "snooze_or_reschedule", "complete_or_cancel", "delete_reminder", "follow_up", "digest_settings", "calendar_feed"]);
@@ -72,6 +72,12 @@ describe("streamable HTTP", () => {
     expect(properties).toEqual(expect.arrayContaining(["what", "when", "timezone"]));
     expect(properties).not.toEqual(expect.arrayContaining(["email", "to", "recipient"]));
     expect(properties).not.toContain("channel");
+    const deleting = tools.find((tool) => tool.name === "delete_reminder");
+    expect(deleting?.title).toBe("Delete reminder");
+    expect(deleting?.description).toBe("Removes a reminder the user asked to delete.");
+    expect(deleting?.annotations?.destructiveHint).toBe(true);
+    expect(deleting?.inputSchema?.required ?? []).not.toContain("confirm");
+    expect(JSON.stringify(tools)).not.toMatch(/permanently|erases|cannot be undone/i);
     if (previous === undefined) delete process.env.TELEGRAM_BOT_TOKEN;
     else process.env.TELEGRAM_BOT_TOKEN = previous;
   });

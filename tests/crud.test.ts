@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { MemoryFillipStore } from "../src/lib/memory-store.js";
 import { completeOrCancel, followUp, listReminders, saveDigestSettings, setReminder, snoozeOrReschedule } from "../src/lib/reminders.js";
+import { ReminderConflictError } from "../src/lib/store.js";
 import { WhenError } from "../src/lib/time.js";
-import { MAX_ACTIVE_REMINDERS, type Actor, type Reminder } from "../src/lib/types.js";
+import { MAX_ACTIVE_REMINDERS, type Actor, type Delivery, type Reminder } from "../src/lib/types.js";
 import { ALLOWANCE_REACHED, freeEmailsPerMonth, freeOpenMessage, freeOpenReminders, monthStart, tierCapsFromEnv, UPGRADE_PROMPT } from "../src/lib/usage.js";
 
 const now = new Date("2026-10-11T18:00:00.000Z");
@@ -319,5 +320,120 @@ describe("reminder CRUD", () => {
     expect(saved.fireAt).toBe("2027-03-14T07:30:00.000Z");
     expect(saved.note).toMatch(/does not exist/);
     expect(saved.note).toMatch(/3:30/);
+  });
+
+  it("updates a repeating reminder in place and keeps the id", async () => {
+    const store = storeWithActor();
+    const created = await setReminder(store, actor, {
+      what: "QA two",
+      when: "every weekday at 9am until March 31, 2027",
+      timezone: "America/New_York"
+    }, now);
+    const before = store.reminders.length;
+    const until = store.reminders[0]?.recurrence?.ends?.until;
+    const edited = await snoozeOrReschedule(store, actor.id, created.id, "tomorrow at 10am", "America/New_York", now, "reschedule", {
+      repeat: "daily",
+      what: "QA two revised"
+    });
+    expect(edited.id).toBe(created.id);
+    expect(store.reminders).toHaveLength(before);
+    expect(store.reminders.map((row) => row.id)).toEqual([created.id]);
+    expect(store.reminders.some((row) => row.what.includes("older copy") || row.status === "cancelled")).toBe(false);
+    expect(store.reminders[0]?.what).toBe("QA two revised");
+    expect(store.reminders[0]?.recurrence?.ends?.until).toBe(until);
+    expect(store.reminders[0]?.fireAt).not.toBe(created.fireAt);
+    expect(edited.repeats).toMatch(/March 31, 2027/);
+  });
+
+  it("uses the reminder version when a delivery is in flight so the edit does not add a row", async () => {
+    const store = storeWithActor();
+    const created = await setReminder(store, actor, {
+      what: "QA two",
+      when: "every weekday at 9am until March 31, 2027",
+      timezone: "America/New_York"
+    }, now);
+    const row = store.reminders[0];
+    if (!row) throw new Error("missing reminder");
+    const delivery: Delivery = {
+      id: "lease-1",
+      ownerId: actor.id,
+      reminderId: created.id,
+      dedupeKey: `reminder:${created.id}:${row.fireAt}`,
+      occurrenceAt: row.fireAt,
+      status: "sending",
+      idempotencyKey: `fillip/${created.id}/${row.fireAt}`,
+      channel: "email",
+      providerId: null,
+      startedAt: now.toISOString(),
+      sentAt: null,
+      error: null
+    };
+    store.deliveries.push(delivery);
+    const version = row.updatedAt;
+    const seen: Array<string | undefined> = [];
+    const original = store.saveReminder.bind(store);
+    store.saveReminder = async (reminder, expectedUpdatedAt) => {
+      seen.push(expectedUpdatedAt);
+      row.updatedAt = new Date(now.getTime() + 1000).toISOString();
+      return original(reminder, expectedUpdatedAt);
+    };
+    await expect(snoozeOrReschedule(store, actor.id, created.id, undefined, "America/New_York", now, "reschedule", {
+      what: "QA two revised"
+    })).rejects.toBeInstanceOf(ReminderConflictError);
+    expect(seen).toEqual([version]);
+    expect(store.reminders).toHaveLength(1);
+    expect(store.reminders[0]?.id).toBe(created.id);
+    expect(store.reminders[0]?.what).toBe("QA two");
+    expect(store.reminders.some((item) => item.what.includes("older copy"))).toBe(false);
+  });
+
+  it("writes nothing when a create is rejected", async () => {
+    const store = storeWithActor();
+    const before = store.reminders.length;
+    let creates = 0;
+    const original = store.createReminder.bind(store);
+    store.createReminder = async (reminder, open) => {
+      creates += 1;
+      return original(reminder, open);
+    };
+    const at = new Date("2027-03-01T15:00:00.000Z");
+    await expect(setReminder(store, actor, {
+      what: "DST check",
+      when: "March 14, 2027 at 2:30am",
+      timezone: "America/New_York"
+    }, at)).rejects.toBeInstanceOf(WhenError);
+    await expect(setReminder(store, actor, {
+      what: "DST check",
+      when: "yesterday at 3pm",
+      timezone: "UTC"
+    }, now)).rejects.toThrow(/past/);
+    await expect(setReminder(store, actor, {
+      what: "DST check",
+      when: "not a real time",
+      timezone: "UTC"
+    }, now)).rejects.toThrow(/could not read that time/);
+    expect(creates).toBe(0);
+    expect(store.reminders).toHaveLength(before);
+    expect(store.reminders.filter((row) => row.status === "cancelled")).toHaveLength(0);
+
+    store.createReminder = async (reminder) => {
+      store.reminders.push({ ...reminder, status: "cancelled" });
+      throw new WhenError("2:30 AM does not exist that day because of daylight saving.");
+    };
+    await expect(setReminder(store, actor, {
+      what: "DST check",
+      when: "tomorrow at 9am",
+      timezone: "UTC"
+    }, now)).rejects.toThrow(/does not exist/);
+    expect(store.reminders).toHaveLength(before);
+    expect(store.reminders.filter((row) => row.status === "cancelled" || row.what === "DST check")).toHaveLength(0);
+  });
+
+  it("says Deleted when a reminder is removed", async () => {
+    const store = storeWithActor();
+    const created = await setReminder(store, actor, { what: "QA two", when: "tomorrow at 9am", timezone: "UTC" }, now);
+    const removed = await completeOrCancel(store, actor.id, created.id, "delete", now);
+    expect(removed).toEqual({ id: created.id, what: "QA two", status: "deleted", note: "Deleted." });
+    expect(store.reminders).toHaveLength(0);
   });
 });

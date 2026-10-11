@@ -20,11 +20,25 @@ export class OpenCapError extends Error {
   }
 }
 
+/** The reminder's updated_at changed between read and write, so this save lost to another writer. */
+export class ReminderConflictError extends Error {
+  constructor() {
+    super("That reminder changed while a ping was going out. Try the edit again.");
+    this.name = "ReminderConflictError";
+  }
+}
+
 export interface ReminderStore {
   listReminders(ownerId: string, query: ListQuery): Promise<Reminder[]>;
   getReminder(ownerId: string, id: string): Promise<Reminder | null>;
   createReminder(reminder: Reminder, open?: OpenCap): Promise<Reminder>;
-  saveReminder(reminder: Reminder): Promise<Reminder>;
+  /**
+   * Replace one reminder. When `expectedUpdatedAt` is set, the write matches that
+   * `updated_at` and fails with ReminderConflictError if a send already changed the row.
+   */
+  saveReminder(reminder: Reminder, expectedUpdatedAt?: string): Promise<Reminder>;
+  /** True when a delivery for this reminder is still sending inside the claim lease. */
+  reminderSendInFlight?(ownerId: string, reminderId: string, now: Date): Promise<boolean>;
   deleteReminder(ownerId: string, id: string): Promise<void>;
   countCreatedSince(ownerId: string, sinceIso: string): Promise<number>;
   countActive(ownerId: string): Promise<number>;

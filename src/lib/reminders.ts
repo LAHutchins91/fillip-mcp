@@ -179,13 +179,13 @@ export async function setReminder(store: ReminderStore, actor: Actor, input: {
   channel?: DeliveryChannel;
   acceptShiftedTime?: boolean;
 }, now: Date, caps: TierCaps = STAND_IN_CAPS, telegramEnabled = false): Promise<ReminderView> {
+  let resolved = applyRepeat(resolveWhen(input.when, input.timezone, now), input.repeat, input.timezone);
+  if (input.until?.trim()) resolved = attachEndDate(resolved, input.until, input.timezone, now);
+  refuseSilentShift(resolved, input.acceptShiftedTime, input.timezone);
   await gate(store, actor, now, caps);
   await assertWithinAllowance(store, actor.id, now, caps);
   const usage = await store.getUsage(actor.id);
   const channel = chosenChannel(input.channel, usage?.defaultChannel, telegramEnabled);
-  let resolved = applyRepeat(resolveWhen(input.when, input.timezone, now), input.repeat, input.timezone);
-  if (input.until?.trim()) resolved = attachEndDate(resolved, input.until, input.timezone, now);
-  refuseSilentShift(resolved, input.acceptShiftedTime, input.timezone);
   const draft = stamp(actor, input.what, input.context ?? null, input.timezone, resolved, "reminder", channel, now);
   const note = [resolved.note, channelNote(channel)].filter(Boolean).join(" ");
   return createOrRefuse(store, draft, openCapFor(usage, caps), now, { corrected: resolved.corrected, note });
@@ -297,7 +297,7 @@ function applyScheduleEdit(reminder: Reminder, zone: string, now: Date, repeat: 
   return { recurrence, fireAt, notes, corrected };
 }
 
-export async function snoozeOrReschedule(store: ReminderStore, ownerId: string, id: string, until: string | undefined, timezone: string | undefined, now: Date, action: ReminderMove = "reschedule", schedule?: { repeat?: string; end?: string }, acceptShiftedTime = false): Promise<ReminderView> {
+export async function snoozeOrReschedule(store: ReminderStore, ownerId: string, id: string, until: string | undefined, timezone: string | undefined, now: Date, action: ReminderMove = "reschedule", schedule?: { repeat?: string; end?: string; what?: string }, acceptShiftedTime = false): Promise<ReminderView> {
   const reminder = await store.getReminder(ownerId, id);
   if (!reminder) throw new Error("Reminder not found");
   if (reminder.status === "cancelled" || reminder.status === "completed") {
@@ -306,25 +306,29 @@ export async function snoozeOrReschedule(store: ReminderStore, ownerId: string, 
   const zone = timezone || reminder.timezone;
   const repeat = schedule?.repeat?.trim();
   const end = schedule?.end?.trim();
+  const text = schedule?.what?.trim();
   const moving = action === "reschedule" && Boolean(until?.trim());
-  if (action === "reschedule" && !moving && !repeat && !end) throw new Error("Name a time to move this reminder, or a repeat or end date to change.");
-  if (moving || repeat || end) await store.setMailOptIn(ownerId, true);
+  if (action === "reschedule" && !moving && !repeat && !end && !text) throw new Error("Name a time to move this reminder, or a repeat or end date to change.");
   const moved = moving ? resolveWhen(until ?? "", zone, now) : null;
   const edited = moving || repeat || end
     ? applyScheduleEdit(reminder, zone, now, repeat, end, moved)
     : { recurrence: reminder.recurrence, fireAt: reminder.fireAt, notes: [] as string[], corrected: false };
   let draft: Reminder = {
     ...reminder,
+    what: text || reminder.what,
     timezone: zone,
     fireAt: edited.fireAt,
     recurrence: edited.recurrence,
     updatedAt: now.toISOString()
   };
   const notes = [...edited.notes];
+  if (text && text !== reminder.what) notes.push("Text updated.");
   if (!acceptShiftedTime && notes.some((note) => /does not exist/i.test(note))) {
     const shifted = moved?.fireAt ?? new Date(edited.fireAt);
     refuseSilentShift({ note: notes.find((note) => /does not exist/i.test(note)) ?? "", fireAt: shifted }, false, zone);
   }
+  if (moving || repeat || end || text) await store.setMailOptIn(ownerId, true);
+  const inFlight = await sendInFlight(store, ownerId, reminder.id, now);
   if (action === "pause") {
     draft = { ...draft, status: "paused", holdUntil: null };
     notes.push("Paused. Fillip will not send this until you resume it.");
@@ -340,11 +344,26 @@ export async function snoozeOrReschedule(store: ReminderStore, ownerId: string, 
   } else if (reminder.status === "paused") {
     draft = { ...draft, status: "paused" };
   } else {
+    draft = recomputeNextFire(draft, zone, now, inFlight);
     draft = { ...draft, status: "active", holdUntil: null };
-    if (moving && moved) notes.push(`Moved to ${formatWhen(moved.fireAt, zone)}.`);
+    if (moving && moved) notes.push(`Moved to ${formatWhen(new Date(draft.fireAt), zone)}.`);
   }
-  const saved = await store.saveReminder(draft);
+  const saved = await store.saveReminder(draft, inFlight ? reminder.updatedAt : undefined);
   return view(saved, now, { corrected: edited.corrected, note: notes.filter(Boolean).join(" ") || null });
+}
+
+function recomputeNextFire(reminder: Reminder, zone: string, now: Date, inFlight: boolean): Reminder {
+  if (!reminder.recurrence) return reminder;
+  const basis = new Date(reminder.fireAt);
+  if (!(inFlight && basis.getTime() <= now.getTime())) return reminder;
+  const upcoming = nextFire(reminder.recurrence, zone, now);
+  if (!upcoming) throw new Error("That repeating reminder has already ended.");
+  return { ...reminder, fireAt: upcoming.toISOString() };
+}
+
+async function sendInFlight(store: ReminderStore, ownerId: string, id: string, now: Date): Promise<boolean> {
+  if (!store.reminderSendInFlight) return false;
+  return store.reminderSendInFlight(ownerId, id, now);
 }
 
 export type DeleteResult = { id: string; what: string; status: "deleted"; note: string };
@@ -354,7 +373,7 @@ export async function completeOrCancel(store: ReminderStore, ownerId: string, id
   if (!reminder) throw new Error("Reminder not found");
   if (action === "delete") {
     await store.deleteReminder(ownerId, id);
-    return { id: reminder.id, what: reminder.what, status: "deleted", note: "Deleted. The reminder and its delivery history are gone." };
+    return { id: reminder.id, what: reminder.what, status: "deleted", note: "Deleted." };
   }
   const status: ReminderStatus = action === "complete" ? "completed" : "cancelled";
   const saved = await store.saveReminder({
@@ -380,11 +399,7 @@ export async function followUp(store: ReminderStore, actor: Actor, input: {
   channel?: DeliveryChannel;
   acceptShiftedTime?: boolean;
 }, now: Date, caps: TierCaps = STAND_IN_CAPS, telegramEnabled = false): Promise<ReminderView> {
-  await gate(store, actor, now, caps);
-  await assertWithinAllowance(store, actor.id, now, caps);
   if (!input.after && !input.cadence) throw new Error("Follow-ups need a first time or a cadence, such as next Tuesday at 2pm.");
-  const usage = await store.getUsage(actor.id);
-  const channel = chosenChannel(input.channel, usage?.defaultChannel, telegramEnabled);
   let first: ResolvedWhen;
   if (input.after) {
     first = resolveWhen(input.after, input.timezone, now);
@@ -404,6 +419,10 @@ export async function followUp(store: ReminderStore, actor: Actor, input: {
   }
   if (input.until?.trim()) first = attachEndDate(first, input.until, input.timezone, now);
   refuseSilentShift(first, input.acceptShiftedTime, input.timezone);
+  await gate(store, actor, now, caps);
+  await assertWithinAllowance(store, actor.id, now, caps);
+  const usage = await store.getUsage(actor.id);
+  const channel = chosenChannel(input.channel, usage?.defaultChannel, telegramEnabled);
   const draft = stamp(actor, input.topic, input.context ?? null, input.timezone, first, "follow_up", channel, now);
   const note = [first.note, followNote(channel, draft.recurrence, input.timezone)].filter(Boolean).join(" ");
   return createOrRefuse(store, draft, openCapFor(usage, caps), now, { corrected: first.corrected, note });
@@ -418,6 +437,12 @@ function openCapFor(usage: { plan?: string | null; subscriptionStatus?: string |
   };
 }
 
+async function dropCancelledLeftover(store: ReminderStore, ownerId: string, id: string): Promise<void> {
+  const leftover = await store.getReminder(ownerId, id).catch(() => null);
+  if (leftover?.status !== "cancelled") return;
+  await store.deleteReminder(ownerId, id).catch(() => undefined);
+}
+
 async function createOrRefuse(
   store: ReminderStore,
   reminder: Reminder,
@@ -425,7 +450,17 @@ async function createOrRefuse(
   now: Date,
   extra: { corrected?: boolean; note?: string | null }
 ): Promise<ReminderView> {
-  const saved = await store.createReminder(reminder, open);
+  let saved: Reminder;
+  try {
+    saved = await store.createReminder(reminder, open);
+  } catch (error) {
+    await dropCancelledLeftover(store, reminder.ownerId, reminder.id);
+    throw error;
+  }
+  if (saved.status === "cancelled") {
+    await dropCancelledLeftover(store, saved.ownerId, saved.id);
+    throw new Error("Fillip could not complete this request. Your reminder may not have been saved.");
+  }
   return view(saved, now, extra);
 }
 

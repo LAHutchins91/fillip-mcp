@@ -1,7 +1,7 @@
 import { assertSingleRecipient, ProviderQuotaError, type MailSender, type OutboundEmail } from "./email.js";
 import { reminderCalendar } from "./ics.js";
 import { delayLength, NOT_DELIVERED_NOTE } from "./reminders.js";
-import type { ServiceStore } from "./store.js";
+import { ReminderConflictError, type ServiceStore } from "./store.js";
 import { signStopToken } from "./stop-token.js";
 import { isTelegramBackoff, type TelegramSender } from "./telegram.js";
 import { advanceSeries, nextFire } from "./time.js";
@@ -255,12 +255,20 @@ function wants(reminder: Reminder, contact: OwnerContact, telegramEnabled: boole
 
 async function advanceIfSent(store: ServiceStore, reminder: Reminder, occurrenceAt: string, now: Date) {
   if (reminder.fireAt !== occurrenceAt || reminder.status !== "active") return;
+  const commit = async (next: Reminder) => {
+    try {
+      await store.saveReminder(next, reminder.updatedAt);
+    } catch (error) {
+      if (error instanceof ReminderConflictError) return;
+      throw error;
+    }
+  };
   if (reminder.recurrence) {
     const series = advanceSeries(reminder.recurrence);
     const after = new Date(Math.max(new Date(occurrenceAt).getTime(), now.getTime()));
     const next = series.done ? null : nextFire(series.recurrence, reminder.timezone, after);
     if (!next) {
-      await store.saveReminder({
+      await commit({
         ...reminder,
         recurrence: series.recurrence,
         status: "completed",
@@ -270,7 +278,7 @@ async function advanceIfSent(store: ServiceStore, reminder: Reminder, occurrence
       });
       return;
     }
-    await store.saveReminder({
+    await commit({
       ...reminder,
       recurrence: series.recurrence,
       fireAt: next.toISOString(),
@@ -279,7 +287,7 @@ async function advanceIfSent(store: ServiceStore, reminder: Reminder, occurrence
     });
     return;
   }
-  await store.saveReminder({ ...reminder, status: "fired", holdUntil: null, updatedAt: now.toISOString() });
+  await commit({ ...reminder, status: "fired", holdUntil: null, updatedAt: now.toISOString() });
 }
 
 /** A hold that reaches the next local month was the free (or plan) allowance. A higher plan should send it. */
