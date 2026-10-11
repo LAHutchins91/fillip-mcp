@@ -437,10 +437,11 @@ describe("QA both-channel caps", () => {
       await setReminder(store, actor, { what: `Open ${i}`, when: "tomorrow 9am", timezone: "UTC" }, now, caps);
     }
     usePlan(store, 0, "free", "canceled");
-    await Promise.all([
+    const raced = await Promise.allSettled([
       setReminder(store, actor, { what: "Race A", when: "tomorrow 9am", timezone: "UTC" }, now, caps),
       setReminder(store, actor, { what: "Race B", when: "tomorrow 9am", timezone: "UTC" }, now, caps)
     ]);
+    expect(raced.filter((item) => item.status === "rejected")).toHaveLength(1);
     expect(store.reminders.filter((row) => row.status === "active")).toHaveLength(10);
   });
 });
@@ -594,7 +595,8 @@ describe("QA hosted claim and crash", () => {
     const second = new CountingSender();
     const later = new Date(now.getTime() + 3 * 60 * 1000);
     await job(recovered, second, later);
-    expect(second.sent, "the occurrence was already accepted").toHaveLength(0);
+    expect(second.sent, "Resend dedupes this key for 24 hours, so the email is retried").toHaveLength(1);
+    expect(second.sent[0]?.idempotencyKey).toBe(sender.sent[0]?.idempotencyKey);
     release(new Error("process killed"));
     await hanging.catch(() => undefined);
   });

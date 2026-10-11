@@ -62,6 +62,17 @@ export class MemoryFillipStore implements ServiceStore {
     return this.reminders.filter((row) => row.ownerId === ownerId && row.status === "active").length;
   }
 
+  async listDeliveryMarks(ownerId: string) {
+    return this.deliveries
+      .filter((row) => row.ownerId === ownerId)
+      .map((row) => ({
+        reminderId: row.reminderId,
+        occurrenceAt: row.occurrenceAt,
+        status: row.status,
+        error: row.error
+      }));
+  }
+
   async rememberOwner(contact: OwnerIdentity): Promise<void> {
     const existing = this.contacts.get(contact.id) ?? blankContact(contact.id);
     this.contacts.set(contact.id, {
@@ -186,12 +197,18 @@ export class MemoryFillipStore implements ServiceStore {
     }
     const attempt = existing.providerId === "attempt";
     const accepted = Boolean(existing.providerId) && !attempt;
+    if (typeof existing.error === "string" && /not delivered/i.test(existing.error)) return { delivery: existing, outcome: "already-sent" };
     if (existing.status === "sent" || accepted) return { delivery: existing, outcome: "already-sent" };
     // Inside the claim lease, "attempt" means the provider may never have been
-    // called, so retry it. After the lease, do not submit again: the process
-    // that wrote the mark may already have been accepted and died before the
-    // sent row was saved.
+    // called, so retry it. Email stays retryable for 24 hours after the lease
+    // because Resend dedupes that idempotency key. Telegram cannot dedupe, so
+    // a stale attempt is not submitted again.
     if (attempt && existing.startedAt <= input.staleBeforeIso) {
+      const age = Date.parse(input.nowIso) - Date.parse(existing.startedAt);
+      if (existing.channel === "email" && Number.isFinite(age) && age <= 24 * 60 * 60 * 1000) {
+        existing.idempotencyKey = input.idempotencyKey;
+        return { delivery: existing, outcome: "send" };
+      }
       return { delivery: existing, outcome: "already-sent" };
     }
     if (existing.status === "sending" && !attempt && existing.startedAt > input.staleBeforeIso) {

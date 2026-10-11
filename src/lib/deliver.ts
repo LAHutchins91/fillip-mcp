@@ -1,6 +1,6 @@
 import { assertSingleRecipient, ProviderQuotaError, type MailSender, type OutboundEmail } from "./email.js";
 import { reminderCalendar } from "./ics.js";
-import { delayLength } from "./reminders.js";
+import { delayLength, NOT_DELIVERED_NOTE } from "./reminders.js";
 import type { ServiceStore } from "./store.js";
 import { signStopToken } from "./stop-token.js";
 import { isTelegramBackoff, type TelegramSender } from "./telegram.js";
@@ -93,13 +93,65 @@ function localMonthStartIso(now: Date, timeZone: string): string {
 /**
  * Written on the delivery row before the provider call.
  * It is not a provider message id. While the row is inside the claim lease, a
- * later run retries it with the same idempotency key and leaves the reminder
- * due. After the lease, the occurrence is not submitted again: the process
- * that wrote the mark may already have been accepted and died before the sent
- * row was saved. Telegram cannot dedupe, so a retry inside the lease after
- * Telegram has accepted and before the message id is stored can deliver twice.
+ * later run retries it with the same idempotency key and leaves a one-time
+ * reminder due. After the lease, email is retried for 24 hours on
+ * fillip/<id>/<fireAt> because Resend dedupes that key. A repeating email is
+ * closed as not delivered instead, so the series can move on. Telegram cannot
+ * dedupe, so a stale attempt is not submitted again.
  */
 const ATTEMPT_MARK = "attempt";
+const DELAYED_RETRY_NOTE = "This ping was delayed and could not be sent on the first try, so Fillip retried it.";
+
+function missedAttempt(delivery: Delivery, staleBefore: string): boolean {
+  return delivery.providerId === ATTEMPT_MARK && delivery.startedAt <= staleBefore;
+}
+
+async function recordUndelivered(store: ServiceStore, delivery: Delivery): Promise<void> {
+  if (typeof delivery.error === "string" && /not delivered/i.test(delivery.error)) return;
+  await store.saveDelivery({
+    ...delivery,
+    status: "failed",
+    providerId: null,
+    sentAt: null,
+    error: NOT_DELIVERED_NOTE
+  });
+}
+
+async function sendUndeliveredNotice(input: {
+  store: ServiceStore;
+  sender: MailSender;
+  reminder: Reminder;
+  contact: OwnerContact;
+  from: string;
+  appBaseUrl: string;
+  unsubscribeSecret: string;
+  now: Date;
+}): Promise<void> {
+  if (!input.contact.emailVerified || !input.contact.email || input.contact.unsubscribed) return;
+  const key = `fillip/${input.reminder.id}/${input.reminder.fireAt}/not-delivered`;
+  if (!input.store.beginSend(key)) return;
+  try {
+    const to = assertSingleRecipient(input.contact.email);
+    const when = formatWhen(new Date(input.reminder.fireAt), input.reminder.timezone);
+    const stopUrl = stopLink(input.appBaseUrl, input.reminder.ownerId, input.unsubscribeSecret, input.now);
+    await input.sender.send({
+      from: input.from,
+      to,
+      subject: "Fillip: a ping was not delivered".slice(0, 140),
+      text: `${NOT_DELIVERED_NOTE}\n\n${input.reminder.what}\n\nDue ${when}.\n\n${stopUrl}`,
+      html: `<p>${escapeHtml(NOT_DELIVERED_NOTE)}</p><p>${escapeHtml(input.reminder.what)}</p><p>Due ${escapeHtml(when)}.</p>`,
+      idempotencyKey: key,
+      headers: {
+        "List-Unsubscribe": `<${stopUrl}>`,
+        "List-Unsubscribe-Post": "List-Unsubscribe=One-Click"
+      }
+    });
+  } catch {
+    // The occurrence is already marked. A notice that cannot leave is not a second Telegram send.
+  } finally {
+    input.store.finishSend(key);
+  }
+}
 
 async function markAttempt(store: ServiceStore, delivery: Delivery): Promise<Delivery> {
   const marked: Delivery = { ...delivery, status: "sending", providerId: ATTEMPT_MARK, error: null };
@@ -437,9 +489,23 @@ export async function runDueJob(options: {
               nowIso,
               staleBeforeIso: staleBefore
             });
-            if (claim.outcome === "already-sent") telegramDone = true;
-            else if (claim.outcome === "send" && options.store.beginSend(idempotencyKey)) {
-              if (claim.delivery.providerId === ATTEMPT_MARK) retryingAttempt = true;
+            if (claim.outcome === "already-sent") {
+              telegramDone = true;
+              if (missedAttempt(claim.delivery, staleBefore)) {
+                await recordUndelivered(options.store, claim.delivery);
+                await sendUndeliveredNotice({
+                  store: options.store,
+                  sender: options.sender,
+                  reminder,
+                  contact,
+                  from: options.from,
+                  appBaseUrl: options.appBaseUrl,
+                  unsubscribeSecret: options.unsubscribeSecret,
+                  now: options.now
+                });
+              }
+            } else if (claim.outcome === "send" && options.store.beginSend(idempotencyKey)) {
+              if (claim.delivery.providerId === ATTEMPT_MARK && !missedAttempt(claim.delivery, staleBefore)) retryingAttempt = true;
               const marked = await markAttempt(options.store, claim.delivery);
               try {
                 const result = await options.telegram.sender.send(contact.telegramChatId, telegramText(reminder, options.now), idempotencyKey);
@@ -557,12 +623,18 @@ export async function runDueJob(options: {
             nowIso,
             staleBeforeIso: staleBefore
           });
-          if (claim.outcome === "already-sent") emailDone = true;
-          else if (claim.outcome === "in-progress") report.skipped += 1;
-          else if (!options.store.beginSend(idempotencyKey)) report.skipped += 1;
+          const outsideAttempt = missedAttempt(claim.delivery, staleBefore);
+          if (claim.outcome === "already-sent") {
+            if (outsideAttempt) await recordUndelivered(options.store, claim.delivery);
+            emailDone = true;
+          } else if (claim.outcome === "in-progress") report.skipped += 1;
+          else if (outsideAttempt && reminder.recurrence) {
+            await recordUndelivered(options.store, claim.delivery);
+            emailDone = true;
+          } else if (!options.store.beginSend(idempotencyKey)) report.skipped += 1;
           else {
             release = false;
-            if (claim.delivery.providerId === ATTEMPT_MARK) retryingAttempt = true;
+            if (claim.delivery.providerId === ATTEMPT_MARK && !outsideAttempt) retryingAttempt = true;
             let accepted = false;
             let marked = claim.delivery;
             try {
@@ -578,7 +650,7 @@ export async function runDueJob(options: {
                 status: "sent",
                 providerId: result.id,
                 sentAt: nowIso,
-                error: null
+                error: outsideAttempt ? DELAYED_RETRY_NOTE : null
               });
               try {
                 await noteSent(options.store, contact, options.now, reminder.timezone);

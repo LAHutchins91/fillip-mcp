@@ -211,6 +211,37 @@ describe("schema re-run", () => {
       await right.end();
     }
   });
+
+  it("folds the daily cap into the same profile update as the monthly counter", async () => {
+    const owner = "15151515-1515-4151-8151-151515151515";
+    const db = client(database);
+    await db.connect();
+    try {
+      await db.query("insert into auth.users (id) values ($1) on conflict do nothing", [owner]);
+      const period = "2026-10-01T00:00:00.000Z";
+      const day = "2026-10-11T00:00:00.000Z";
+      const call = (dailyMax: number) => db.query<{ n: number | null }>(
+        "select public.fillip_reserve_ping($1::uuid, 30, $2::timestamptz, $3::integer, $4::timestamptz) as n",
+        [owner, period, dailyMax, day]
+      );
+      const first = await call(1);
+      expect(first.rows[0]?.n).toBe(1);
+      const second = await call(1);
+      expect(second.rows[0]?.n).toBe(-1);
+      const stored = await db.query<{ emails_sent_in_period: number; emails_sent_today: number }>(
+        "select emails_sent_in_period, emails_sent_today from public.profiles where id = $1",
+        [owner]
+      );
+      expect(stored.rows[0]).toEqual({ emails_sent_in_period: 1, emails_sent_today: 1 });
+      const third = await db.query<{ n: number | null }>(
+        "select public.fillip_reserve_ping($1::uuid, 30, $2::timestamptz) as n",
+        [owner, period]
+      );
+      expect(third.rows[0]?.n).toBe(2);
+    } finally {
+      await db.end();
+    }
+  });
 });
 
 afterAll(async () => {

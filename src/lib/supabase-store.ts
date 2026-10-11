@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ClaimResult, Delivery, DeliveryChannel, DigestSettings, OwnerContact, OwnerIdentity, PlanName, Recurrence, Reminder, ReminderStatus } from "./types.js";
+import { openCapMessage } from "./errors.js";
 import { OpenCapError, type ListQuery, type OpenCap, type SendReserve, type SendReserveResult, type ServiceStore } from "./store.js";
 import { sentThisMonth, usagePeriodCurrent } from "./usage.js";
 import { zonedParts, zonedTimeToUtc } from "./zone.js";
@@ -195,40 +196,39 @@ export class SupabaseFillipStore implements ServiceStore {
   async createReminder(reminder: Reminder, open?: OpenCap): Promise<Reminder> {
     this.owned(reminder.ownerId);
     const forced = this.mode === "user" && this.ownerId ? { ...reminder, ownerId: this.ownerId } : reminder;
-    const value = await this.persist()("/rest/v1/reminders", {
-      method: "POST",
-      headers: { Prefer: "return=representation" },
-      body: JSON.stringify(toReminder(forced))
-    });
+    let value: unknown;
+    try {
+      value = await this.persist()("/rest/v1/reminders", {
+        method: "POST",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify(toReminder(forced))
+      });
+    } catch (error) {
+      const cap = openCapMessage(error);
+      if (cap) throw new OpenCapError(cap);
+      throw error;
+    }
     const row = rows<ReminderRow>(value)[0];
     if (!row) throw new Error("Fillip could not complete this request. Your reminder may not have been saved.");
     const saved = fromReminder(row);
-    if (open && saved.status === "active") await this.reconcileOpenCap(saved, open);
+    if (open && saved.status === "active") await this.dropInsertedIfOverCap(saved, open);
     return saved;
   }
 
   /**
-   * The count that gate() saw can be stale. After the insert, drop this row
-   * when a stable order of active reminders already fills the cap.
-   * select=id,created_at is a different read from the stalled id-only count.
+   * The insert trigger is what enforces the cap. This pass never deletes a
+   * different row. If a read still shows more open reminders than the cap,
+   * the only row removed is the one this call just inserted.
    */
-  private async reconcileOpenCap(saved: Reminder, open: OpenCap): Promise<void> {
-    const listed = rows<{ id: string; created_at: string }>(await this.persist()(
-      `/rest/v1/reminders?owner_id=eq.${encodeURIComponent(saved.ownerId)}&status=eq.active&select=id,created_at&order=created_at.asc,id.asc&limit=500`
+  private async dropInsertedIfOverCap(saved: Reminder, open: OpenCap): Promise<void> {
+    const listed = rows<{ id: string }>(await this.persist()(
+      `/rest/v1/reminders?owner_id=eq.${encodeURIComponent(saved.ownerId)}&status=eq.active&select=id&limit=500`
     ));
     if (listed.length <= open.cap) return;
-    const ranked = [...listed].sort((left, right) => {
-      const created = String(left.created_at).localeCompare(String(right.created_at));
-      return created !== 0 ? created : String(left.id).localeCompare(String(right.id));
+    await this.persist()(`/rest/v1/reminders?id=eq.${encodeURIComponent(saved.id)}&owner_id=eq.${encodeURIComponent(saved.ownerId)}`, {
+      method: "DELETE",
+      headers: { Prefer: "return=minimal" }
     });
-    const keep = new Set(ranked.slice(0, open.cap).map((item) => item.id));
-    for (const item of ranked.slice(open.cap)) {
-      await this.persist()(`/rest/v1/reminders?id=eq.${encodeURIComponent(item.id)}&owner_id=eq.${encodeURIComponent(saved.ownerId)}`, {
-        method: "DELETE",
-        headers: { Prefer: "return=minimal" }
-      });
-    }
-    if (!keep.has(saved.id)) throw new OpenCapError(open.message);
   }
 
   async deleteReminder(ownerId: string, id: string): Promise<void> {
@@ -249,6 +249,17 @@ export class SupabaseFillipStore implements ServiceStore {
     const row = rows<ReminderRow>(value)[0];
     if (!row) throw new Error("Reminder not found");
     return fromReminder(row);
+  }
+
+  async listDeliveryMarks(ownerId: string) {
+    this.owned(ownerId);
+    const value = await this.db(`/rest/v1/deliveries?owner_id=eq.${encodeURIComponent(ownerId)}&select=reminder_id,occurrence_at,status,error&limit=500`);
+    return rows<{ reminder_id: string | null; occurrence_at: string; status: Delivery["status"]; error: string | null }>(value).map((row) => ({
+      reminderId: row.reminder_id,
+      occurrenceAt: row.occurrence_at,
+      status: row.status,
+      error: row.error
+    }));
   }
 
   async countCreatedSince(ownerId: string, sinceIso: string): Promise<number> {
@@ -352,19 +363,21 @@ export class SupabaseFillipStore implements ServiceStore {
     };
   }
 
-  private async readUsage(ownerId: string): Promise<Pick<OwnerContact, "unsubscribed" | "plan" | "subscriptionStatus" | "emailsSentInPeriod" | "emailPeriodStart" | "defaultChannel" | "telegramChatId" | "telegramLinkToken" | "telegramLinkExpires" | "calendarToken">> {
+  private async readUsage(ownerId: string): Promise<Pick<OwnerContact, "unsubscribed" | "plan" | "subscriptionStatus" | "emailsSentInPeriod" | "emailPeriodStart" | "defaultChannel" | "telegramChatId" | "telegramLinkToken" | "telegramLinkExpires" | "calendarToken"> & { emailsSentToday: number }> {
     const profiles = rows<{
       unsubscribed?: boolean;
       plan?: string;
       subscription_status?: string;
       emails_sent_in_period?: number;
       email_period_start?: string | null;
+      emails_sent_today?: number;
+      email_day_start?: string | null;
       default_channel?: string | null;
       telegram_chat_id?: string | null;
       telegram_link_token?: string | null;
       telegram_link_expires?: string | null;
       calendar_token?: string | null;
-    }>(await this.db(`/rest/v1/profiles?id=eq.${encodeURIComponent(ownerId)}&select=unsubscribed,plan,subscription_status,emails_sent_in_period,email_period_start,default_channel,telegram_chat_id,telegram_link_token,telegram_link_expires,calendar_token`));
+    }>(await this.db(`/rest/v1/profiles?id=eq.${encodeURIComponent(ownerId)}&select=unsubscribed,plan,subscription_status,emails_sent_in_period,email_period_start,emails_sent_today,email_day_start,default_channel,telegram_chat_id,telegram_link_token,telegram_link_expires,calendar_token`));
     const row = profiles[0];
     const plan: PlanName = row?.plan === "pro" || row?.plan === "annual" || row?.plan === "free" ? row.plan : "free";
     const channel: DeliveryChannel = row?.default_channel === "telegram" || row?.default_channel === "both" ? row.default_channel : "email";
@@ -374,6 +387,7 @@ export class SupabaseFillipStore implements ServiceStore {
       subscriptionStatus: typeof row?.subscription_status === "string" ? row.subscription_status : "none",
       emailsSentInPeriod: typeof row?.emails_sent_in_period === "number" ? row.emails_sent_in_period : 0,
       emailPeriodStart: typeof row?.email_period_start === "string" ? row.email_period_start : null,
+      emailsSentToday: typeof row?.emails_sent_today === "number" ? row.emails_sent_today : 0,
       defaultChannel: channel,
       telegramChatId: typeof row?.telegram_chat_id === "string" ? row.telegram_chat_id : null,
       telegramLinkToken: typeof row?.telegram_link_token === "string" ? row.telegram_link_token : null,
@@ -454,10 +468,19 @@ export class SupabaseFillipStore implements ServiceStore {
     if (!existing) throw new Error("Fillip could not complete this request. Your reminder may not have been saved.");
     const attempt = existing.provider_id === "attempt";
     const accepted = Boolean(existing.provider_id) && !attempt;
+    if (typeof existing.error === "string" && /not delivered/i.test(existing.error)) return { delivery: fromDelivery(existing), outcome: "already-sent" };
     if (existing.status === "sent" || accepted) return { delivery: fromDelivery(existing), outcome: "already-sent" };
-    // A fresh attempt is retried. An attempt older than the lease is not
-    // submitted again; the writer may already have been accepted.
+    // A fresh attempt is retried. Email is retried for 24 hours after the
+    // lease, on the same idempotency key. Telegram is not submitted again.
     if (attempt && existing.started_at <= input.staleBeforeIso) {
+      const age = Date.parse(input.nowIso) - Date.parse(existing.started_at);
+      const channel = existing.channel === "telegram" ? "telegram" : "email";
+      if (channel === "email" && Number.isFinite(age) && age <= 24 * 60 * 60 * 1000) {
+        return {
+          delivery: fromDelivery({ ...existing, idempotency_key: input.idempotencyKey }),
+          outcome: "send"
+        };
+      }
       return { delivery: fromDelivery(existing), outcome: "already-sent" };
     }
     if (existing.status === "sending" && !attempt && existing.started_at > input.staleBeforeIso) {
@@ -618,17 +641,24 @@ export class SupabaseFillipStore implements ServiceStore {
    * An array is a client that does not implement the RPC, so the caller
    * falls back to a compare-and-swap patch. Null must not fall back.
    */
-  private async reservePing(ownerId: string, maxCount: number, periodStart: string): Promise<"reserved" | "capped" | "fallback"> {
+  private async reservePing(ownerId: string, maxCount: number, periodStart: string, dailyMax: number, dayStart: string): Promise<"reserved" | "capped" | "day" | "fallback"> {
     let value: unknown;
     try {
       value = await this.db("/rest/v1/rpc/fillip_reserve_ping", {
         method: "POST",
-        body: JSON.stringify({ owner: ownerId, max_count: maxCount, period_start: periodStart })
+        body: JSON.stringify({
+          owner: ownerId,
+          max_count: maxCount,
+          period_start: periodStart,
+          daily_max: dailyMax,
+          day_start: dayStart
+        })
       });
     } catch {
       return "fallback";
     }
     if (Array.isArray(value)) return "fallback";
+    if (value === -1) return "day";
     if (typeof value === "number" && Number.isFinite(value)) return "reserved";
     if (value === null) return "capped";
     return "fallback";
@@ -643,15 +673,15 @@ export class SupabaseFillipStore implements ServiceStore {
       input.timeZone
     );
     if (previewUsed >= input.monthlyLimit) return { ok: false, reason: "month" };
-    if ((await this.countSentSince(input.ownerId, input.sinceIso)) >= input.dailyLimit) return { ok: false, reason: "day" };
     if (input.countGlobal) {
       if ((await this.countAllSentSince(input.globalDayStartIso)) >= input.globalDayLimit) return { ok: false, reason: "global-day" };
       if ((await this.countAllSentSince(input.globalMonthStartIso)) >= input.globalMonthLimit) return { ok: false, reason: "global-month" };
     }
     const periodCurrent = Boolean(preview.emailPeriodStart) && usagePeriodCurrent(preview.emailPeriodStart ?? "", input.now, input.timeZone, preview.subscriptionStatus);
     const periodStart = periodCurrent && preview.emailPeriodStart ? preview.emailPeriodStart : localMonthStartIso(input.now, input.timeZone);
-    const rpc = await this.reservePing(input.ownerId, input.monthlyLimit, periodStart);
+    const rpc = await this.reservePing(input.ownerId, input.monthlyLimit, periodStart, input.dailyLimit, input.sinceIso);
     if (rpc === "reserved") return this.rememberHold(input.ownerId);
+    if (rpc === "day") return { ok: false, reason: "day" };
     if (rpc === "capped") return { ok: false, reason: "month" };
     for (let attempt = 0; attempt < 8; attempt += 1) {
       const usage = await this.readUsage(input.ownerId);
@@ -698,12 +728,17 @@ export class SupabaseFillipStore implements ServiceStore {
     if (!ownerId || keep || this.mode !== "service") return;
     const usage = await this.readUsage(ownerId);
     const next = Math.max(0, usage.emailsSentInPeriod - 1);
+    const nextDay = Math.max(0, usage.emailsSentToday - 1);
     await this.db(
       `/rest/v1/profiles?id=eq.${encodeURIComponent(ownerId)}&emails_sent_in_period=eq.${usage.emailsSentInPeriod}`,
       {
         method: "PATCH",
         headers: { Prefer: "return=minimal" },
-        body: JSON.stringify({ emails_sent_in_period: next, updated_at: new Date().toISOString() })
+        body: JSON.stringify({
+          emails_sent_in_period: next,
+          emails_sent_today: nextDay,
+          updated_at: new Date().toISOString()
+        })
       }
     );
   }

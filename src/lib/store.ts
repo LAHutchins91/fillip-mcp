@@ -1,5 +1,12 @@
 import { randomUUID } from "node:crypto";
-import type { ClaimResult, Delivery, DeliveryChannel, DigestSettings, OwnerContact, OwnerIdentity, Reminder, ReminderStatus } from "./types.js";
+import type { ClaimResult, Delivery, DeliveryChannel, DeliveryStatus, DigestSettings, OwnerContact, OwnerIdentity, Reminder, ReminderStatus } from "./types.js";
+
+export type DeliveryMark = {
+  reminderId: string | null;
+  occurrenceAt: string;
+  status: DeliveryStatus;
+  error: string | null;
+};
 
 export type ListQuery = { status?: ReminderStatus | "all" };
 
@@ -21,6 +28,7 @@ export interface ReminderStore {
   deleteReminder(ownerId: string, id: string): Promise<void>;
   countCreatedSince(ownerId: string, sinceIso: string): Promise<number>;
   countActive(ownerId: string): Promise<number>;
+  listDeliveryMarks(ownerId: string): Promise<DeliveryMark[]>;
   rememberOwner(contact: OwnerIdentity): Promise<void>;
   setMailOptIn(ownerId: string, enabled: boolean): Promise<void>;
   getDigest(ownerId: string): Promise<DigestSettings | null>;

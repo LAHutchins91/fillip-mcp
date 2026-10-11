@@ -125,20 +125,26 @@ export function createFillipServer(store: ReminderStore, actor: Actor, now: () =
     repeat: z.string().trim().min(1).max(200).optional().describe("daily, weekdays, weekly, every 2 weeks, first Monday of every month, or once to remove the repeat."),
     end: z.string().trim().min(1).max(120).optional().describe("End date such as March 31, 2027, Dec 15, tomorrow, or 2027-03-31. none removes it."),
     accept_shifted_time: z.boolean().optional().describe("Set true only after the user agrees to the shifted time Fillip named for a clock that does not exist that day.")
-  }, write, async (args) => snoozeOrReschedule(
-    store,
-    actor.id,
-    String(args.id),
-    typeof args.until === "string" ? args.until : undefined,
-    typeof args.timezone === "string" ? args.timezone : undefined,
-    now(),
-    args.action === "pause" || args.action === "resume" ? args.action : "reschedule",
-    {
-      repeat: typeof args.repeat === "string" ? args.repeat : undefined,
-      end: typeof args.end === "string" ? args.end : undefined
-    },
-    args.accept_shifted_time === true
-  ));
+  }, write, async (args) => {
+    const result = await snoozeOrReschedule(
+      store,
+      actor.id,
+      String(args.id),
+      typeof args.until === "string" ? args.until : undefined,
+      typeof args.timezone === "string" ? args.timezone : undefined,
+      now(),
+      args.action === "pause" || args.action === "resume" ? args.action : "reschedule",
+      {
+        repeat: typeof args.repeat === "string" ? args.repeat : undefined,
+        end: typeof args.end === "string" ? args.end : undefined
+      },
+      args.accept_shifted_time === true
+    );
+    if (args.action === "resume" && result.status !== "active" && result.note && /The free plan allows |Too many reminders are still open/.test(result.note)) {
+      throw new Error(result.note);
+    }
+    return result;
+  });
 
   tool("complete_or_cancel", "Mark a reminder done, which stops a follow-up from nudging again, or cancel it so Fillip will not email them about it. This does not delete the reminder. To permanently delete a reminder and its delivery history, use delete_reminder.", {
     id: z.string().uuid(),

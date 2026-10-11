@@ -1,5 +1,5 @@
 import { calendarFeed } from "./ics.js";
-import { OpenCapError, newId, type OpenCap, type ReminderStore, type ServiceStore } from "./store.js";
+import { newId, type DeliveryMark, type OpenCap, type ReminderStore, type ServiceStore } from "./store.js";
 import { newSecretToken, telegramDeepLink, telegramUsername } from "./telegram.js";
 import { applyRepeat, attachEndDate, describeRecurrence, nextFire, parseClock, recurrenceFromCadence, resolveWhen, WhenError, type RepeatChoice, type ResolvedWhen } from "./time.js";
 import { MAX_ACTIVE_REMINDERS, MAX_CREATES_PER_HOUR, type Actor, type DeliveryChannel, type DigestSettings, type Reminder, type ReminderStatus } from "./types.js";
@@ -11,13 +11,14 @@ export type ReminderView = {
   what: string;
   context: string | null;
   kind: Reminder["kind"];
-  status: ReminderStatus;
+  status: ReminderStatus | "delayed";
   timezone: string;
   fireAt: string;
   localTime: string;
   repeats: string;
   channel: DeliveryChannel;
   state: ReminderStatus | "delayed";
+  /** Stored status, or "delayed" when a due ping was not delivered. */
   delayed: boolean;
   delay: string | null;
   overdue: boolean;
@@ -51,16 +52,27 @@ function wouldNextSend(reminder: Reminder, now: Date): string | null {
   return `paused (would next send ${formatShortWhen(when, reminder.timezone)})`;
 }
 
-function view(reminder: Reminder, now: Date, extra?: { corrected?: boolean; note?: string | null }): ReminderView {
+export const NOT_DELIVERED_NOTE = "This ping was not delivered. It was delayed and could not be sent.";
+
+function recoveryPresentation(reminder: Reminder, marks: DeliveryMark[]): { note: string | null; status?: "delayed" } {
+  const mine = marks.filter((mark) => mark.reminderId === reminder.id);
+  const missed = mine.filter((mark) => typeof mark.error === "string" && /not delivered|could not|delayed|not sent|\bfail/i.test(mark.error));
+  const open = missed.filter((miss) => !mine.some((mark) => mark.status === "sent" && mark.occurrenceAt > miss.occurrenceAt));
+  if (!open.length) return { note: null };
+  return { note: open.map((mark) => mark.error).filter(Boolean).join(" "), status: "delayed" };
+}
+
+function view(reminder: Reminder, now: Date, extra?: { corrected?: boolean; note?: string | null; status?: ReminderView["status"] }): ReminderView {
   const delay = delayLength(reminder, now);
-  const delayed = delay !== null;
+  const delayed = delay !== null || extra?.status === "delayed";
   const note = [extra?.note, wouldNextSend(reminder, now)].filter(Boolean).join(" ") || null;
+  const status = extra?.status ?? reminder.status;
   return {
     id: reminder.id,
     what: reminder.what,
     context: reminder.context,
     kind: reminder.kind,
-    status: reminder.status,
+    status,
     timezone: reminder.timezone,
     fireAt: reminder.fireAt,
     localTime: formatWhen(new Date(reminder.fireAt), reminder.timezone),
@@ -181,6 +193,7 @@ export async function listReminders(store: ReminderStore, ownerId: string, input
     ? rows
     : rows.filter((row) => row.status !== "completed" && row.status !== "cancelled");
   const usage = await store.getUsage(ownerId);
+  const marks = await store.listDeliveryMarks(ownerId);
   const weekEnd = now.getTime() + 7 * 86_400_000;
   const filtered = visible.filter((row) => {
     const fire = new Date(row.fireAt).getTime();
@@ -191,7 +204,9 @@ export async function listReminders(store: ReminderStore, ownerId: string, input
   });
   return filtered.map((row) => {
     const allowance = allowanceFor(usage, now, caps, input.timezone || row.timezone);
-    return view(row, now, { note: holdExplanation(row, allowance) });
+    const recovery = recoveryPresentation(row, marks);
+    const note = [holdExplanation(row, allowance), recovery.note].filter(Boolean).join(" ") || null;
+    return view(row, now, { note, status: recovery.status });
   });
 }
 
@@ -299,6 +314,11 @@ export async function snoozeOrReschedule(store: ReminderStore, ownerId: string, 
     draft = { ...draft, status: "paused", holdUntil: null };
     notes.push("Paused. Fillip will not send this until you resume it.");
   } else if (action === "resume") {
+    const usage = await store.getUsage(ownerId);
+    const open = openCapFor(usage, STAND_IN_CAPS);
+    if ((await store.countActive(ownerId)) >= open.cap) {
+      return view(reminder, now, { note: open.message });
+    }
     const fireAt = nextOpenFire(draft, zone, now);
     draft = { ...draft, fireAt: fireAt.toISOString(), status: "active", holdUntil: null };
     notes.push(`Resumed. Next ping is ${formatWhen(fireAt, zone)}.`);
@@ -390,15 +410,8 @@ async function createOrRefuse(
   now: Date,
   extra: { corrected?: boolean; note?: string | null }
 ): Promise<ReminderView> {
-  try {
-    const saved = await store.createReminder(reminder, open);
-    return view(saved, now, extra);
-  } catch (error) {
-    if (error instanceof OpenCapError && (await store.countActive(reminder.ownerId)) >= open.cap) {
-      return view(reminder, now, { corrected: extra.corrected ?? false, note: error.message });
-    }
-    throw error;
-  }
+  const saved = await store.createReminder(reminder, open);
+  return view(saved, now, extra);
 }
 
 export async function saveDigestSettings(store: ReminderStore, actor: Actor, input: {

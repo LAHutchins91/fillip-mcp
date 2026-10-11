@@ -1,4 +1,5 @@
-import type { Express } from "express";
+import { createHmac, timingSafeEqual } from "node:crypto";
+import type { Express, Request } from "express";
 import { canonicalPublicOrigin } from "./public-url.js";
 
 /** OAuth resource stays on the configured base. Documentation prefers the public connect URL. */
@@ -50,6 +51,52 @@ export function otpFailure(message: string): string {
   return "Fillip could not finish sign-in. Send a new code and try again.";
 }
 
+function pkceSecret(): string {
+  return process.env.FILLIP_UNSUBSCRIBE_SECRET || process.env.CRON_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || "fillip-pkce";
+}
+
+export function signPkceProof(method: string, challenge: string, nowMs = Date.now()): string {
+  const payload = Buffer.from(JSON.stringify({ m: method, c: challenge, e: nowMs + 600_000 })).toString("base64url");
+  const sig = createHmac("sha256", pkceSecret()).update(payload).digest("base64url");
+  return `${payload}.${sig}`;
+}
+
+export function readPkceProof(token: string | undefined, nowMs = Date.now()): { method: string; challenge: string } | null {
+  if (!token) return null;
+  const dot = token.indexOf(".");
+  if (dot <= 0) return null;
+  const payload = token.slice(0, dot);
+  const sig = token.slice(dot + 1);
+  const expected = createHmac("sha256", pkceSecret()).update(payload).digest("base64url");
+  const left = Buffer.from(sig);
+  const right = Buffer.from(expected);
+  if (left.length !== right.length || !timingSafeEqual(left, right)) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { m?: unknown; c?: unknown; e?: unknown };
+    if (parsed.m !== "S256" || typeof parsed.c !== "string" || !parsed.c || typeof parsed.e !== "number" || parsed.e < nowMs) return null;
+    return { method: "S256", challenge: parsed.c };
+  } catch {
+    return null;
+  }
+}
+
+function pkceCookie(req: Request): string | undefined {
+  const header = req.headers.cookie;
+  if (!header) return undefined;
+  for (const part of header.split(";")) {
+    const trimmed = part.trim();
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) continue;
+    if (trimmed.slice(0, eq) === "fillip_pkce") return decodeURIComponent(trimmed.slice(eq + 1));
+  }
+  return undefined;
+}
+
+function setPkceCookie(req: Request, challenge: string): string {
+  const secure = req.secure || req.headers["x-forwarded-proto"] === "https";
+  return `fillip_pkce=${encodeURIComponent(signPkceProof("S256", challenge))}; HttpOnly; SameSite=Lax; Path=/oauth; Max-Age=600${secure ? "; Secure" : ""}`;
+}
+
 export function installPluginAuth(app: Express, fallbackBase: string, fallbackSupabase: string, fallbackAnon: string) {
   app.get(["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"], (_req, res) => {
     const base = (process.env.APP_BASE_URL || fallbackBase).replace(/\/$/, "");
@@ -76,7 +123,12 @@ export function installPluginAuth(app: Express, fallbackBase: string, fallbackSu
     for (const [key, value] of Object.entries(req.query)) {
       if (typeof value === "string") target.searchParams.set(key, value);
     }
+    res.setHeader("Set-Cookie", setPkceCookie(req, challenge));
     res.redirect(target.toString());
+  });
+  app.get("/oauth/pkce-proof", (req, res) => {
+    const proof = readPkceProof(pkceCookie(req));
+    res.set("Cache-Control", "no-store").json(proof ?? {});
   });
   app.get(["/oauth/consent", "//oauth/consent", "/connections"], (_req, res) => {
     const supabaseUrl = (process.env.SUPABASE_URL || fallbackSupabase).trim().replace(/\/+$/, "");
@@ -153,9 +205,11 @@ try{
  var details=await client.auth.oauth.getAuthorizationDetails(id);if(details.error)throw details.error;
  var query=new URLSearchParams(location.search);
  var nested=details.data&&details.data.authorization?details.data.authorization:{};
- var method=(details.data&&details.data.code_challenge_method)||nested.code_challenge_method||query.get('code_challenge_method')||'';
- var challenge=(details.data&&details.data.code_challenge)||nested.code_challenge||query.get('code_challenge')||'';
- var rejection=rejectPkce(method, challenge);
+ var proof={};
+ try{var proofResponse=await fetch('/oauth/pkce-proof',{credentials:'same-origin'});proof=await proofResponse.json()}catch(e){proof={}}
+ var method=(details.data&&details.data.code_challenge_method)||nested.code_challenge_method||query.get('code_challenge_method')||proof.method||'';
+ var challenge=(details.data&&details.data.code_challenge)||nested.code_challenge||query.get('code_challenge')||proof.challenge||'';
+ var rejection=(method||challenge)?rejectPkce(method,challenge):null;
  if(rejection){
    var denied=await client.auth.oauth.denyAuthorization(id,{skipBrowserRedirect:true});
    var back=(denied.data&&denied.data.redirect_url)||details.data.redirect_uri||'';

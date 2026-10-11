@@ -32,7 +32,8 @@ create table if not exists auth.oauth_authorizations (
   status text,
   expires_at timestamptz,
   resource text,
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  approved_at timestamptz
 );
 do $$
 begin
@@ -67,7 +68,7 @@ async function recreate() {
 function event(sessionId: string, clientId: string) {
   return {
     user_id: user,
-    authentication_method: "oauth",
+    authentication_method: "oauth_provider/authorization_code",
     claims: {
       sub: user,
       client_id: clientId,
@@ -116,8 +117,8 @@ describe("OAuth resource audience", () => {
   async function setLatest(clientId: string, id: string, resource: string | null) {
     await db.query("delete from auth.oauth_authorizations where client_id = $1", [clientId]);
     await db.query(
-      `insert into auth.oauth_authorizations (id, client_id, user_id, status, expires_at, resource, created_at)
-       values ($1, $2, $3, 'approved', now() + interval '1 hour', $4, now())`,
+      `insert into auth.oauth_authorizations (id, client_id, user_id, status, expires_at, resource, created_at, approved_at)
+       values ($1, $2, $3, 'approved', now() + interval '1 hour', $4, now(), now())`,
       [id, clientId, user, resource]
     );
   }
@@ -152,5 +153,41 @@ describe("OAuth resource audience", () => {
 
     await setLatest(clientB, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa5", expected);
     expect(await audience(crossed, clientA)).toBe("authenticated");
+  });
+
+  it("does not bind a code when another unexpired authorization names a different resource", async () => {
+    const session = "66666666-6666-4666-8666-666666666661";
+    const expired = "66666666-6666-4666-8666-666666666662";
+    const blank = "66666666-6666-4666-8666-666666666663";
+    await db.query("delete from auth.oauth_authorizations where client_id = $1", [clientA]);
+    await db.query(
+      `insert into auth.oauth_authorizations (id, client_id, user_id, status, expires_at, resource, created_at, approved_at)
+       values
+         ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1', $1, $2, 'approved', now() + interval '1 hour', 'https://evil.example/mcp', now() - interval '2 minutes', now() - interval '2 minutes'),
+         ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2', $1, $2, 'approved', now() + interval '1 hour', $3, now(), now())`,
+      [clientA, user, expected]
+    );
+    expect(await audience(session, clientA)).toBe("authenticated");
+
+    await db.query("delete from auth.oauth_authorizations where client_id = $1", [clientA]);
+    await db.query(
+      `insert into auth.oauth_authorizations (id, client_id, user_id, status, expires_at, resource, created_at, approved_at)
+       values
+         ('cccccccc-cccc-4ccc-8ccc-ccccccccccc1', $1, $2, 'approved', now() - interval '1 minute', 'https://evil.example/mcp', now() - interval '2 minutes', now() - interval '2 minutes'),
+         ('cccccccc-cccc-4ccc-8ccc-ccccccccccc2', $1, $2, 'approved', now() + interval '1 hour', $3, now(), now())`,
+      [clientA, user, expected]
+    );
+    expect(await audience(expired, clientA)).toEqual(["authenticated", expected]);
+
+    await db.query("delete from auth.oauth_authorizations where client_id = $1", [clientA]);
+    await db.query("delete from fillip_private.oauth_resources where session_id = $1", [blank]);
+    await db.query(
+      `insert into auth.oauth_authorizations (id, client_id, user_id, status, expires_at, resource, created_at, approved_at)
+       values
+         ('dddddddd-dddd-4ddd-8ddd-ddddddddddd1', $1, $2, 'approved', now() + interval '1 hour', null, now() - interval '1 minute', now() - interval '1 minute'),
+         ('dddddddd-dddd-4ddd-8ddd-ddddddddddd2', $1, $2, 'approved', now() + interval '1 hour', $3, now(), now())`,
+      [clientA, user, expected]
+    );
+    expect(await audience(blank, clientA)).toEqual(["authenticated", expected]);
   });
 });

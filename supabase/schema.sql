@@ -21,6 +21,8 @@ create table if not exists public.profiles (
 
 alter table public.profiles add column if not exists emails_sent_in_period integer not null default 0;
 alter table public.profiles add column if not exists email_period_start timestamptz;
+alter table public.profiles add column if not exists emails_sent_today integer not null default 0;
+alter table public.profiles add column if not exists email_day_start timestamptz;
 alter table public.profiles add column if not exists billing_event_created bigint not null default 0;
 
 create table if not exists public.reminders (
@@ -134,7 +136,7 @@ create policy deliveries_owner_delete on public.deliveries
   for delete to authenticated
   using (owner_id = (select auth.uid()));
 
-revoke insert, update on table public.deliveries from public, anon, authenticated;
+revoke all on table public.deliveries from public, anon, authenticated;
 grant select on public.deliveries to authenticated;
 grant delete on public.deliveries to authenticated;
 
@@ -155,7 +157,7 @@ begin
 end;
 $$;
 
-revoke all on function public.fillip_set_mail_opt_in(boolean) from public, anon;
+revoke all on function public.fillip_set_mail_opt_in(boolean) from public, anon, authenticated;
 grant execute on function public.fillip_set_mail_opt_in(boolean) to authenticated;
 
 create or replace function public.handle_new_fillip_user()
@@ -168,6 +170,15 @@ begin
   insert into public.profiles (id) values (new.id) on conflict (id) do nothing;
   return new;
 end;
+$$;
+
+revoke all on function public.handle_new_fillip_user() from public, anon, authenticated;
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'supabase_auth_admin') then
+    grant execute on function public.handle_new_fillip_user() to supabase_auth_admin;
+  end if;
+end
 $$;
 
 drop trigger if exists on_auth_user_created_fillip on auth.users;
@@ -282,10 +293,10 @@ begin
 end;
 $$;
 
-revoke all on function public.fillip_set_default_channel(text) from public, anon;
-revoke all on function public.fillip_set_telegram_link(text, timestamptz) from public, anon;
-revoke all on function public.fillip_clear_telegram() from public, anon;
-revoke all on function public.fillip_set_calendar_token(text) from public, anon;
+revoke all on function public.fillip_set_default_channel(text) from public, anon, authenticated;
+revoke all on function public.fillip_set_telegram_link(text, timestamptz) from public, anon, authenticated;
+revoke all on function public.fillip_clear_telegram() from public, anon, authenticated;
+revoke all on function public.fillip_set_calendar_token(text) from public, anon, authenticated;
 grant execute on function public.fillip_set_default_channel(text) to authenticated;
 grant execute on function public.fillip_set_telegram_link(text, timestamptz) to authenticated;
 grant execute on function public.fillip_clear_telegram() to authenticated;
@@ -332,8 +343,69 @@ begin
 end
 $$;
 
--- Parallel creates must not pass the free open cap. The advisory lock and the
--- profile row lock are per owner, so two transactions cannot both count 9 and insert.
+-- Same profile lock as the monthly counter. -1 means the daily cap held.
+-- Null means the monthly cap held. A positive integer is the new monthly count.
+create or replace function public.fillip_reserve_ping(owner uuid, max_count integer, period_start timestamptz, daily_max integer, day_start timestamptz)
+returns integer
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  monthly integer;
+  daily integer;
+  period timestamptz;
+  day timestamptz;
+begin
+  select p.emails_sent_in_period, p.email_period_start, p.emails_sent_today, p.email_day_start
+    into monthly, period, daily, day
+  from public.profiles p
+  where p.id = owner
+  for update;
+  if not found then
+    return null;
+  end if;
+  if period is not null and period >= period_start and monthly >= max_count then
+    return null;
+  end if;
+  if daily_max is not null and day_start is not null and day is not null and day >= day_start and daily >= daily_max then
+    return -1;
+  end if;
+  if period is null or period < period_start then
+    monthly := 1;
+    period := period_start;
+  else
+    monthly := monthly + 1;
+  end if;
+  if day_start is not null and (day is null or day < day_start) then
+    daily := 1;
+    day := day_start;
+  elsif day_start is not null then
+    daily := coalesce(daily, 0) + 1;
+  end if;
+  update public.profiles
+  set emails_sent_in_period = monthly,
+      email_period_start = period,
+      emails_sent_today = coalesce(daily, emails_sent_today),
+      email_day_start = coalesce(day, email_day_start),
+      updated_at = now()
+  where id = owner;
+  return monthly;
+end;
+$$;
+
+revoke all on function public.fillip_reserve_ping(uuid, integer, timestamptz, integer, timestamptz) from public, anon, authenticated;
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    grant execute on function public.fillip_reserve_ping(uuid, integer, timestamptz, integer, timestamptz) to service_role;
+  end if;
+end
+$$;
+
+-- Parallel creates and resumes must not pass the free open cap. The advisory
+-- lock and the profile row lock are per owner. An update counts only when the
+-- row is newly becoming active, and that check returns before the lock.
 create or replace function public.fillip_enforce_open_cap()
 returns trigger
 language plpgsql
@@ -345,7 +417,15 @@ declare
   sub_status text;
   cap integer;
 begin
-  if new.status is distinct from 'active' then
+  if tg_op = 'INSERT' then
+    if new.status is distinct from 'active' then
+      return new;
+    end if;
+  elsif tg_op = 'UPDATE' then
+    if new.status is distinct from 'active' or old.status is not distinct from 'active' then
+      return new;
+    end if;
+  else
     return new;
   end if;
   perform pg_advisory_xact_lock(hashtext(new.owner_id::text));
@@ -371,7 +451,16 @@ begin
 end;
 $$;
 
+revoke all on function public.fillip_enforce_open_cap() from public, anon, authenticated;
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    grant execute on function public.fillip_enforce_open_cap() to service_role;
+  end if;
+end
+$$;
+
 drop trigger if exists reminders_open_cap on public.reminders;
 create trigger reminders_open_cap
-  before insert on public.reminders
+  before insert or update on public.reminders
   for each row execute function public.fillip_enforce_open_cap();

@@ -55,27 +55,46 @@ begin
     select r.resource into resource from fillip_private.oauth_resources r where r.session_id = sid;
   end if;
 
-  -- A stored session covers refresh. The audience is added only when that
-  -- stored value still equals mcp_resource exactly. A missing session row
-  -- uses the latest approved authorization for this client and user, and
-  -- only when its resource string-equals mcp_resource. Another client's
-  -- authorization does not count. Trailing slashes are not trimmed.
-  if resource is null and sid is not null then
+  -- Refresh uses only the stored session row, and only when it still equals
+  -- mcp_resource. A later approval does not change that stored value.
+  -- A new authorization code is bound only when the latest unexpired approval
+  -- equals mcp_resource and no other unexpired approval for this client and
+  -- user names a different resource. Null resources do not block. Expired
+  -- rows do not block. Another client does not count. Trailing slashes are
+  -- not trimmed. The lookup runs only for authorization-code grants.
+  if resource is not null then
+    if resource <> expected then
+      resource := null;
+    end if;
+  elsif coalesce(event->>'authentication_method', '') = 'oauth_provider/authorization_code' and sid is not null then
     select a.resource into resource
       from auth.oauth_authorizations a
-     where a.client_id = cid::uuid
+     where a.client_id::text = cid
        and a.user_id = (claims->>'sub')::uuid
        and a.status::text = 'approved'
        and a.expires_at > now()
-     order by a.created_at desc
+     order by a.approved_at desc nulls last, a.created_at desc
      limit 1;
-    if resource is not null and resource = expected then
+    if resource is not null and resource = expected
+       and not exists (
+         select 1
+           from auth.oauth_authorizations other
+          where other.client_id::text = cid
+            and other.user_id = (claims->>'sub')::uuid
+            and other.status::text = 'approved'
+            and other.expires_at > now()
+            and other.resource is not null
+            and other.resource <> expected
+       )
+    then
       insert into fillip_private.oauth_resources (session_id, resource)
       values (sid, resource)
       on conflict do nothing;
     else
       resource := null;
     end if;
+  else
+    resource := null;
   end if;
 
   if resource is not null and resource = expected then
@@ -87,4 +106,11 @@ end
 $fn$;
 
 revoke all on function public.fillip_access_token_hook(jsonb) from public, anon, authenticated;
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    revoke all on function public.fillip_access_token_hook(jsonb) from service_role;
+  end if;
+end
+$$;
 grant execute on function public.fillip_access_token_hook(jsonb) to supabase_auth_admin;
