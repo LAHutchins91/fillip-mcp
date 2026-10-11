@@ -7,6 +7,7 @@ export class MemoryFillipStore implements ServiceStore {
   deliveries: Delivery[] = [];
   digests = new Map<string, DigestSettings>();
   contacts = new Map<string, OwnerContact>();
+  providerBackoffUntil: string | null = null;
 
   async listReminders(ownerId: string, query: ListQuery): Promise<Reminder[]> {
     return this.reminders
@@ -143,6 +144,18 @@ export class MemoryFillipStore implements ServiceStore {
 
   async countSentSince(ownerId: string, sinceIso: string): Promise<number> {
     return this.deliveries.filter((row) => row.ownerId === ownerId && row.status === "sent" && (row.sentAt ?? "") >= sinceIso).length;
+  }
+
+  async countAllSentSince(sinceIso: string): Promise<number> {
+    return this.deliveries.filter((row) => row.status === "sent" && (row.sentAt ?? "") >= sinceIso).length;
+  }
+
+  async getProviderBackoffUntil(): Promise<string | null> {
+    return this.providerBackoffUntil;
+  }
+
+  async setProviderBackoffUntil(untilIso: string): Promise<void> {
+    this.providerBackoffUntil = untilIso;
   }
 }
 
