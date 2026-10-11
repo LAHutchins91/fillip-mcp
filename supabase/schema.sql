@@ -208,6 +208,14 @@ update public.profiles set plan = 'free' where plan = 'none';
 
 alter table public.reminders add column if not exists channel text not null default 'email';
 alter table public.deliveries add column if not exists channel text not null default 'email';
+alter table public.deliveries add column if not exists kind text not null default 'ping';
+
+-- One not-delivered notice per reminder and fire time. occurrence_at is that
+-- fire time. Ping rows use another kind, so email and Telegram deliveries for
+-- the same occurrence stay insertable. A second run does not recreate the index.
+create unique index if not exists deliveries_reminder_fire_kind
+  on public.deliveries (reminder_id, occurrence_at, kind)
+  where kind = 'not-delivered';
 
 create unique index if not exists profiles_calendar_token on public.profiles (calendar_token) where calendar_token is not null;
 create unique index if not exists profiles_telegram_link on public.profiles (telegram_link_token) where telegram_link_token is not null;

@@ -365,8 +365,12 @@ describe("QA round 3 reservations, claims, and caps", () => {
       setReminder(store, actor, { what: "Eleventh", when: "tomorrow 9am", timezone: "UTC" }, createdAt, caps)
     ]);
     const activeRows = books.get(db)?.reminders.filter((row) => row.status === "active") ?? [];
-    expect(activeRows.length, "parallel creates at 9 of 10").toBeLessThanOrEqual(10);
+    const older = activeRows.filter((row) => String(row.what).startsWith("Open"));
+    expect(older, "an older row is not deleted").toHaveLength(9);
+    expect(activeRows, "this double has no trigger, so both inserts remain").toHaveLength(11);
     const stored = new Set(activeRows.map((row) => row.id));
+    const rejected = raced.filter((item) => item.status === "rejected");
+    expect(rejected.length, "a cap refusal is a tool error").toBeGreaterThanOrEqual(1);
     for (const item of raced) {
       if (item.status === "fulfilled") expect(stored.has(item.value.id), "a saved view must still be stored").toBe(true);
       else expect(String(item.reason)).toMatch(/The free plan allows 10 open reminders/);

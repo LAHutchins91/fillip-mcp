@@ -92,6 +92,12 @@ export class FileFillipStore extends MemoryFillipStore {
     this.persist();
   }
 
+  override claimNotice(input: Parameters<MemoryFillipStore["claimNotice"]>[0]): boolean {
+    const claimed = super.claimNotice(input);
+    if (claimed) this.persist();
+    return claimed;
+  }
+
   override async saveUsage(ownerId: string, usage: { emailsSentInPeriod: number; emailPeriodStart: string }): Promise<void> {
     await super.saveUsage(ownerId, usage);
     this.persist();

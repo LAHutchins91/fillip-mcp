@@ -211,26 +211,20 @@ export class SupabaseFillipStore implements ServiceStore {
     const row = rows<ReminderRow>(value)[0];
     if (!row) throw new Error("Fillip could not complete this request. Your reminder may not have been saved.");
     const saved = fromReminder(row);
-    if (open && saved.status === "active") await this.dropInsertedIfOverCap(saved, open);
+    if (open && saved.status === "active") await this.refuseIfReadOverCap(saved, open);
     return saved;
   }
 
   /**
-   * The insert trigger is what enforces the cap. If a read still shows more
-   * open reminders than the cap, delete only the row this call just inserted
-   * and throw. An older row is never removed, and the deleted row is not
-   * returned as saved.
+   * The BEFORE INSERT OR UPDATE trigger is what holds the cap. This read does
+   * not delete. When a lagging active list is already longer than the cap, the
+   * call throws so a row is never handed back as saved.
    */
-  private async dropInsertedIfOverCap(saved: Reminder, open: OpenCap): Promise<void> {
+  private async refuseIfReadOverCap(saved: Reminder, open: OpenCap): Promise<void> {
     const listed = rows<{ id: string }>(await this.persist()(
       `/rest/v1/reminders?owner_id=eq.${encodeURIComponent(saved.ownerId)}&status=eq.active&select=id&limit=500`
     ));
-    if (listed.length <= open.cap) return;
-    await this.persist()(`/rest/v1/reminders?id=eq.${encodeURIComponent(saved.id)}&owner_id=eq.${encodeURIComponent(saved.ownerId)}`, {
-      method: "DELETE",
-      headers: { Prefer: "return=minimal" }
-    });
-    throw new OpenCapError(open.message);
+    if (listed.length > open.cap) throw new OpenCapError(open.message);
   }
 
   async deleteReminder(ownerId: string, id: string): Promise<void> {
@@ -541,6 +535,36 @@ export class SupabaseFillipStore implements ServiceStore {
         started_at: delivery.startedAt
       })
     });
+  }
+
+  async claimNotice(input: { ownerId: string; reminderId: string; fireAt: string; nowIso: string }): Promise<boolean> {
+    if (this.mode !== "service") throw new Error("Reminder not found");
+    const key = `fillip/${input.reminderId}/${input.fireAt}/not-delivered`;
+    try {
+      await this.db("/rest/v1/deliveries", {
+        method: "POST",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({
+          id: randomUUID(),
+          owner_id: input.ownerId,
+          reminder_id: input.reminderId,
+          dedupe_key: `reminder:${input.reminderId}:${input.fireAt}:not-delivered`,
+          occurrence_at: input.fireAt,
+          status: "sending",
+          idempotency_key: key,
+          channel: "email",
+          kind: "not-delivered",
+          provider_id: null,
+          started_at: input.nowIso,
+          sent_at: null,
+          error: null
+        })
+      });
+      return true;
+    } catch (error) {
+      if (isDuplicate(error)) return false;
+      throw error;
+    }
   }
 
   async countSentSince(ownerId: string, sinceIso: string): Promise<number> {

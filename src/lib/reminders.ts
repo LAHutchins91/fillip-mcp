@@ -4,7 +4,7 @@ import { newSecretToken, telegramDeepLink, telegramUsername } from "./telegram.j
 import { applyRepeat, attachEndDate, describeRecurrence, nextFire, parseClock, recurrenceFromCadence, resolveWhen, WhenError, type RepeatChoice, type ResolvedWhen } from "./time.js";
 import { MAX_ACTIVE_REMINDERS, MAX_CREATES_PER_HOUR, type Actor, type DeliveryChannel, type DigestSettings, type Reminder, type ReminderStatus } from "./types.js";
 import { allowanceFor, assertWithinAllowance, freeOpenMessage, freeOpenReminders, STAND_IN_CAPS, tierFor, type Allowance, type TierCaps } from "./usage.js";
-import { assertTimeZone, formatShortWhen, formatWhen, localDateKey, zonedParts } from "./zone.js";
+import { assertTimeZone, formatClock, formatShortWhen, formatWhen, localDateKey, zonedParts } from "./zone.js";
 
 export type ReminderView = {
   id: string;
@@ -54,12 +54,27 @@ function wouldNextSend(reminder: Reminder, now: Date): string | null {
 
 export const NOT_DELIVERED_NOTE = "This ping was not delivered. It was delayed and could not be sent.";
 
+/** "Your 9:00 AM ping on Oct 12 couldn't be sent." Clock and date are in the reminder's timezone. */
+function missedEmailLine(occurrenceAt: string, timeZone: string): string {
+  const when = new Date(occurrenceAt);
+  const parts = zonedParts(when, timeZone);
+  const clock = formatClock(parts.hour, parts.minute);
+  const month = new Intl.DateTimeFormat("en-US", { timeZone, month: "short" }).format(when);
+  return `Your ${clock} ping on ${month} ${parts.day} couldn't be sent.`;
+}
+
 function recoveryPresentation(reminder: Reminder, marks: DeliveryMark[]): { note: string | null; status?: "delayed" } {
   const mine = marks.filter((mark) => mark.reminderId === reminder.id);
   const missed = mine.filter((mark) => typeof mark.error === "string" && /not delivered|could not|delayed|not sent|\bfail/i.test(mark.error));
   const open = missed.filter((miss) => !mine.some((mark) => mark.status === "sent" && mark.occurrenceAt > miss.occurrenceAt));
   if (!open.length) return { note: null };
-  return { note: open.map((mark) => mark.error).filter(Boolean).join(" "), status: "delayed" };
+  const lines = open.map((mark) => {
+    const plain = reminder.recurrence && reminder.channel !== "telegram"
+      ? missedEmailLine(mark.occurrenceAt, reminder.timezone)
+      : null;
+    return [plain, mark.error].filter(Boolean).join(" ");
+  });
+  return { note: lines.join(" "), status: "delayed" };
 }
 
 function view(reminder: Reminder, now: Date, extra?: { corrected?: boolean; note?: string | null; status?: ReminderView["status"] }): ReminderView {

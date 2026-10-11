@@ -320,7 +320,7 @@ describe("QA round 4 real Postgres concurrency", () => {
     expect(active.length, `resume returned ${resumed.status} ${resumed.note ?? ""}`).toBeLessThanOrEqual(10);
   });
 
-  it("QA-FAIL: the post-insert cap pass can delete an older row when timestamps match and still report success", async () => {
+  it("QA-FAIL: an over-cap read with matching timestamps refuses and deletes no row", async () => {
     const owner = actor.id;
     const stamp = "2026-10-11T16:00:00.000Z";
     const freshId = "00000000-0000-4000-8000-000000000010";
@@ -357,7 +357,7 @@ describe("QA round 4 real Postgres concurrency", () => {
       cap: 10,
       message: "The free plan allows 10 open reminders."
     })).rejects.toThrow(/The free plan allows 10 open reminders/);
-    expect(deleted, "only the reminder just inserted may be removed").toEqual([freshId]);
+    expect(deleted, "an over-cap read deletes nothing, including an older row").toEqual([]);
   });
 
   it("QA-FAIL: a caller that loses the open cap is told the reminder was not saved", async () => {

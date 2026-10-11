@@ -129,8 +129,14 @@ async function sendUndeliveredNotice(input: {
 }): Promise<void> {
   if (!input.contact.emailVerified || !input.contact.email || input.contact.unsubscribed) return;
   const key = `fillip/${input.reminder.id}/${input.reminder.fireAt}/not-delivered`;
-  if (!input.store.beginSend(key)) return;
   try {
+    const claimed = await input.store.claimNotice({
+      ownerId: input.reminder.ownerId,
+      reminderId: input.reminder.id,
+      fireAt: input.reminder.fireAt,
+      nowIso: input.now.toISOString()
+    });
+    if (!claimed) return;
     const to = assertSingleRecipient(input.contact.email);
     const when = formatWhen(new Date(input.reminder.fireAt), input.reminder.timezone);
     const stopUrl = stopLink(input.appBaseUrl, input.reminder.ownerId, input.unsubscribeSecret, input.now);
@@ -148,8 +154,6 @@ async function sendUndeliveredNotice(input: {
     });
   } catch {
     // The occurrence is already marked. A notice that cannot leave is not a second Telegram send.
-  } finally {
-    input.store.finishSend(key);
   }
 }
 

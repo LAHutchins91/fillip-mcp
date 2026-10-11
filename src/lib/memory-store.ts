@@ -227,6 +227,31 @@ export class MemoryFillipStore implements ServiceStore {
     else this.deliveries[index] = delivery;
   }
 
+  /**
+   * Synchronous on the shared delivery list, so parallel workers cannot all
+   * pass the check before any of them writes. saveDelivery on a worker waits
+   * before its write is visible; this claim does not.
+   */
+  claimNotice(input: { ownerId: string; reminderId: string; fireAt: string; nowIso: string }): boolean {
+    const dedupeKey = `reminder:${input.reminderId}:${input.fireAt}:not-delivered`;
+    if (this.deliveries.some((row) => row.dedupeKey === dedupeKey)) return false;
+    this.deliveries.push({
+      id: dedupeKey,
+      ownerId: input.ownerId,
+      reminderId: input.reminderId,
+      dedupeKey,
+      occurrenceAt: input.fireAt,
+      status: "sending",
+      idempotencyKey: `fillip/${input.reminderId}/${input.fireAt}/not-delivered`,
+      channel: "email",
+      providerId: null,
+      startedAt: input.nowIso,
+      sentAt: null,
+      error: null
+    });
+    return true;
+  }
+
   async countSentSince(ownerId: string, sinceIso: string): Promise<number> {
     return this.deliveries.filter((row) => row.ownerId === ownerId && row.status === "sent" && (row.sentAt ?? "") >= sinceIso).length;
   }

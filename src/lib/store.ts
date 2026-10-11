@@ -78,6 +78,17 @@ export interface ServiceStore extends ReminderStore {
   ownerIdForCalendarToken(token: string): Promise<string | null>;
   claimTelegramLink(token: string, chatId: string, nowIso: string): Promise<string | null>;
   saveDelivery(delivery: Delivery): Promise<void>;
+  /**
+   * Claim the one not-delivered notice for this occurrence.
+   * True only for the caller that inserted the row. A unique
+   * (reminder, fire time, kind) constraint makes the loser fail.
+   */
+  claimNotice(input: {
+    ownerId: string;
+    reminderId: string;
+    fireAt: string;
+    nowIso: string;
+  }): boolean | Promise<boolean>;
   countSentSince(ownerId: string, sinceIso: string): Promise<number>;
   countAllSentSince(sinceIso: string): Promise<number>;
   getProviderBackoffUntil(): Promise<string | null>;
