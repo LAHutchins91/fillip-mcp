@@ -1,33 +1,52 @@
-# Fillip QA round 12
+# Fillip post-launch QA
 
-Head: `89d9e4f` (`89d9e4f0b29034c893853eb564138aee552ad10b`) on `cursor/fillip-reminders-55db`.
-Product code was not changed. The round-12 tests and this report are the only additions.
+Head: `d4ba5ee` (`d4ba5ee002645f9c8ff0dcd272ec34361320744a`) on `cursor/fillip-reminders-55db`.
+Product code was not changed. `tests/qa/postlaunch.test.ts` and this report are the only additions.
 
-The author said 351 tests pass. On Postgres 16.15, with `supabase/schema.sql` applied, that tree is **351 passed, 0 failed**. `npx tsc -p tsconfig.json --noEmit` exits 0. With `tests/qa/round12.test.ts` the suite is **357 passed, 0 failed (357)**.
+Production is `https://fillip-mcp.vercel.app`. Its public OAuth resource is `https://fillip-mcp.vercel.app/mcp`. `supabase/schema.sql` did not change in this diff.
 
-Severity: **0 blockers, 0 majors, 0 minors**.
+The author said 360 tests pass. On Postgres 16.15, with the schema applied, that tree is **360 passed, 0 failed**, twice in a row (54.84s, then 54.15s). `npx tsc -p tsconfig.json --noEmit` exits 0. With the post-launch tests the suite is **374 passed, 4 failed (378)**.
 
-Fillip passes code QA.
+Severity: **0 blockers, 1 major, 3 minors**.
+
+Do not ship this.
 
 ## Assertion diff
 
-Compared test files from `70519a5` (merged round 11) to `89d9e4f`. Three test files changed: `tests/http.test.ts`, `tests/remove-restore.test.ts`, and `tests/schema-reapply.test.ts`. No `it.skip`, `describe.skip`, or `test.skip`. No test file was deleted. `supabase/schema.sql` did change: `fillip_confirm_send`, the `reminders_cancel_inflight` trigger, delivery status `cancelled`, and `fillip_runtime.last_purge_count` / `last_purge_at`.
+Compared with the merged round-12 tree (`5b765e2`). No `it.skip`, `describe.skip`, or `test.skip`. No test file was deleted. Schema files are unchanged.
 
 Not weakened:
 
-- The missing-provider response in `tests/http.test.ts` is still 503 and now also requires `purged: 4`. The purge RPC must be called exactly once, so `GET /internal/status` cannot purge again. Resend is still not called.
-- `tests/remove-restore.test.ts` now requires an in-progress delivery to become `cancelled` on remove, pause, and cancel, and requires the following job to send 0.
-- `tests/schema-reapply.test.ts` requires `fillip_confirm_send`, `cancelled` in `deliveries_status_check`, the cancel trigger, and a Postgres check: a removed update cancels the sending row, and a completed update leaves it sending until `fillip_confirm_send` returns false and sets `skipped`.
-- The round-10 QA-FAIL body is unchanged (`expect(report.sent).toBe(0)`). On this head that test passes. The round-10 restore QA-PASS strings still require 30 days, the exact prior status, and purge before the provider check.
+- Repeating reminders that the older tests needed in the `completed` status now pass `end_series: true`. Without that flag, complete no longer ends the series, so those setups would not be testing a completed row.
+- Cap messages now require the site address. The free and trial sentences still have to include the upgrade note. A Pro cap still does not.
+- The round-10 in-flight QA-FAIL still expects `report.sent` to be 0.
 
-## What was checked
+## Major
 
-A granted `send` that is removed, paused, cancelled, or completed before the provider call sends nothing. For each of those four statuses, a both-channel reminder is claimed, the status is changed, and the job is released. Email and Telegram each contain 0 messages for that reminder. The delivery row is `skipped`. A sibling reminder under a daily cap of 1 still sends and becomes `fired`, so the reserved ping was released.
+Completing the same occurrence twice skips the next one.
 
-Remove, pause, and cancel mark the in-progress claim `cancelled` before the job continues. On Postgres that update and the delivery change are one transaction: rollback restores the reminder to `active` and the delivery to `sending`. Completed does not cancel the claim. `fillip_confirm_send` then returns false and the row becomes `skipped`.
+Repro: a daily 9am reminder, complete at 10:00 UTC on that day. The next time is the following day at 9am. Complete again at that same 10:00 UTC. The stored time jumps another day, to two days out. Twelve completes that all read the row before any of them writes land on one next time, so the race itself is fine. A second call after the first has saved is not idempotent.
 
-Twelve parallel workers on one still-active reminder send exactly one email, the summed `sent` count is 1, and the one-time becomes `fired`. Twelve gated remove-versus-send races send 0 for the removed reminder, the claim is `cancelled` before the gate opens, and a later reminder under a daily cap of 1 still sends. Twelve Postgres races of `fillip_confirm_send` against `status = removed` never leave a delivery as `sent` and never leave a still-active reminder without its `sending` row. A deadlock (`40P01`) from the lock order is allowed; any other error is not.
+## Minors
 
-`GET /internal/status` with no `CRON_SECRET` is 503 `Status is not configured.` and issues no fetch. A wrong bearer is 401 `Status authorization failed.` and issues no fetch. The right bearer returns 200 with the recorded purge count, and every request is a GET. None is a POST, PATCH, DELETE, purge, reserve, or confirm.
+A weekly, monthly, or every-N complete says "Done for today." A Tuesday series comes back `Done for today. Next: Tue Oct 20 at 9:00 AM.` The date is the right next Tuesday. "Today" is not. Use one sentence for every repeat: `Done. Next reminder: Tue Oct 20 at 9:00 AM.`
 
-Copy walk of `README.md`, `src`, `public`, `glama.json`, `server.json`, and `supabase/README-oauth.md` found no `$` prices, `USD`, `dollars`, `SMS`, Slack notification, push notification, WhatsApp, or iMessage. README still says the purge runs before the email provider check, that `GET /internal/status` does not delete anything, and that account deletion removes rows immediately. The earlier Postgres restore, cap, RLS, sign-out, lockout, and PKCE cases passed on this head.
+An in-flight email is rewritten to the next occurrence. Repro: the daily reminder is claimed for Sunday, October 11 at 9:00 AM, then complete runs before the provider call. One email goes out, and the next day still sends once, so the next occurrence is not lost. The email that already went out says `Due Monday, October 12, 2026 at 9:00 AM.` The user hears about Monday early, and again on Monday.
+
+A daily 1:30am reminder completed during the fall-back hour is scheduled for the second 1:30 that same morning, not the next day. Repro: the occurrence is Sunday, November 1, 2026 at the first 1:30am Eastern (`2026-11-01T05:30:00.000Z`). Complete one minute later. The next time is `2026-11-01T06:30:00.000Z`, the repeated hour. The note still says 1:30 AM, so it looks like the next morning. The delivery job uses the same next-time function, so a send in that hour already did this. The new complete path copies it.
+
+## What passed
+
+One complete moves a single step for daily, weekly, weekdays, the first Monday, the last Friday, the 31st (January 31 to February 28, then March 31), every 3 days, and every 2 weeks. Daily 9am stays 9:00 local across the spring-forward and fall-back nights. A 2:30am series says 3:30 AM on the missing hour and is back to 2:30 the next day.
+
+"Until Oct 13" keeps October 13 and does not create October 14. A series "for 2 times" ends on the second complete. `end_series` and cancel do not move the time.
+
+Complete between the claim and the provider sends that occurrence once and leaves the next day in place. Complete after the provider has accepted does not skip an extra day. `end_series` before the provider sends nothing, marks the delivery skipped, lets a sibling reminder use the freed daily ping, and does not send later. `end_series` after the provider accepts sends that one ping and nothing after it. Finishing the last counted occurrence before the provider also releases the held ping.
+
+A paused series stays paused, keeps its hold, and moves one step. A removed reminder is refused and stays removed. Cancel does not advance. Completing a cancelled series does not make it active and does not move the time.
+
+Remove, then restore, brings back the next time complete just scheduled. If that time has already passed, restore picks the next future 9am rather than the occurrence that was just finished.
+
+On Postgres, an account already at 10 open reminders can still advance an active series. Ending that series frees the slot, and a new reminder can then be saved. An 11th active insert is refused while the count is 10.
+
+With `APP_BASE_URL` set to `https://fillip-mcp.vercel.app`, the free and trial cap sentence is `Upgrade to Pro at https://fillip-mcp.vercel.app/. The trial is 14 days, then Pro.` It is plain text, it is the home page, and it has no dollar amount. A Pro cap does not include the address. A trailing slash on the setting does not double.
