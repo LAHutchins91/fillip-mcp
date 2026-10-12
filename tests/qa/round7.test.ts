@@ -17,7 +17,7 @@ import { MemoryFillipStore } from "../../src/lib/memory-store.js";
 import { SupabaseFillipStore, type Db } from "../../src/lib/supabase-store.js";
 import { pkceRejection } from "../../src/plugin-auth.js";
 import type { Actor, Reminder } from "../../src/lib/types.js";
-import { blankContact, STAND_IN_CAPS } from "../../src/lib/usage.js";
+import { blankContact, STAND_IN_CAPS, upgradePrompt } from "../../src/lib/usage.js";
 
 const actor: Actor = { id: "22222222-2222-4222-8222-222222222222", email: "owner@example.com", emailVerified: true };
 const caps = STAND_IN_CAPS;
@@ -411,7 +411,7 @@ describe("QA round 7 over-cap read-back", () => {
     } else {
       expect(view?.status).toBe("active");
       expect(view?.id).toBe(ownId);
-      expect(view?.note).toMatch(/You're over the free plan's 10 open reminders\. Upgrade to Pro for a higher allowance\. The trial is 14 days, then Pro\./);
+      expect(view?.note).toContain(`You're over the free plan's 10 open reminders. ${upgradePrompt()}`);
       expect(view?.note ?? "").not.toMatch(/may not have been saved/);
       expect(kept?.status).toBe("active");
     }

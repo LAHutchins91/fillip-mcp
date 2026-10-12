@@ -1,4 +1,4 @@
-import { UPGRADE_PROMPT } from "./usage.js";
+import { upgradePrompt } from "./usage.js";
 
 export const UNCONFIRMED_SAVE = "Fillip couldn't confirm whether this reminder was saved. Please list your reminders.";
 
@@ -51,7 +51,8 @@ export function openCapMessage(error: unknown): string | null {
   }
   if (!sentence && (message.startsWith("The free plan") || message.startsWith("Too many reminders"))) sentence = message;
   if (sentence.startsWith("The free plan")) {
-    return sentence.includes(UPGRADE_PROMPT) ? sentence : `${sentence} ${UPGRADE_PROMPT}`;
+    const prompt = upgradePrompt();
+    return sentence.includes(prompt) ? sentence : `${sentence} ${prompt}`;
   }
   if (sentence.startsWith("Too many reminders")) return sentence;
   return null;

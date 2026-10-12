@@ -397,6 +397,8 @@ describe("server-side emailed codes and sign-out everywhere", () => {
     expect(missing.text).not.toContain("bad-upstream-detail");
     const oauth = await post("/auth/sign-out-everywhere", {}, { authorization: `Bearer ${mcpToken}` });
     expect(oauth.status).toBe(403);
+    expect(JSON.parse(oauth.text).message).toBe("Sign out everywhere needs the session from signing in, not a connection token.");
+    expect(oauth.text).not.toContain("Fillip could not sign out every session");
     expect(oauth.text).not.toContain("upstream-oauth-detail");
     expect(oauth.text).not.toContain(mcpToken);
     expect(oauth.text).not.toContain("gotrue");

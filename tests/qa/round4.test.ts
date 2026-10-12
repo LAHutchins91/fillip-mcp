@@ -21,7 +21,7 @@ import { validateMcpClaims } from "../../src/mcp-claims.js";
 import { pkceRejection } from "../../src/plugin-auth.js";
 import { WhenError } from "../../src/lib/time.js";
 import type { Actor, Reminder } from "../../src/lib/types.js";
-import { blankContact, STAND_IN_CAPS } from "../../src/lib/usage.js";
+import { blankContact, STAND_IN_CAPS, upgradePrompt } from "../../src/lib/usage.js";
 
 const ny = "America/New_York";
 const actor: Actor = { id: "22222222-2222-4222-8222-222222222222", email: "owner@example.com", emailVerified: true };
@@ -356,7 +356,7 @@ describe("QA round 4 real Postgres concurrency", () => {
     await expect(store.createReminder(row(freshId, stamp) as unknown as Reminder, {
       cap: 10,
       message: "The free plan allows 10 open reminders."
-    })).rejects.toThrow(/You're over the free plan's 10 open reminders\. Upgrade to Pro for a higher allowance\. The trial is 14 days, then Pro\./);
+    })).rejects.toThrow(`You're over the free plan's 10 open reminders. ${upgradePrompt()}`);
     expect(deleted, "only the row this call inserted is removed").toEqual([freshId]);
     for (const id of olderIds) expect(deleted, "an older row stays").not.toContain(id);
   });

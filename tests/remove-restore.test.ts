@@ -248,7 +248,7 @@ describe("remove and restore", () => {
       const store = new MemoryFillipStore();
       const created = await setReminder(store, actor, { what: "Standup", when: "every day at 11am", timezone: "UTC" }, earlier);
       if (status === "paused") await snoozeOrReschedule(store, actor.id, created.id, undefined, "UTC", now, "pause");
-      else if (status === "completed") await completeOrCancel(store, actor.id, created.id, "complete", now);
+      else if (status === "completed") await completeOrCancel(store, actor.id, created.id, "complete", now, true);
       else if (status === "cancelled") await completeOrCancel(store, actor.id, created.id, "cancel", now);
       else if (status === "fired") {
         const row = await store.getReminder(actor.id, created.id);

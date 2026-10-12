@@ -19,7 +19,7 @@ import { FILLIP_EMPTY_REPRESENTATION, SupabaseFillipStore, type Db } from "../..
 import { UNCONFIRMED_SAVE } from "../../src/lib/errors.js";
 import { pkceRejection } from "../../src/plugin-auth.js";
 import type { Actor, Reminder } from "../../src/lib/types.js";
-import { STAND_IN_CAPS } from "../../src/lib/usage.js";
+import { STAND_IN_CAPS, upgradePrompt } from "../../src/lib/usage.js";
 
 const actor: Actor = { id: "22222222-2222-4222-8222-222222222222", email: "owner@example.com", emailVerified: true };
 const caps = STAND_IN_CAPS;
@@ -31,8 +31,6 @@ const resource = "https://fillip.example/mcp";
 const hookUser = "11111111-1111-4111-8111-111111111111";
 const clientA = "33333333-3333-4333-8333-333333333333";
 const clientB = "44444444-4444-4444-8444-444444444444";
-const KEPT_NOTE = "You're over the free plan's 10 open reminders. Upgrade to Pro for a higher allowance. The trial is 14 days, then Pro.";
-
 function pgClient(db = database) {
   return new pg.Client({ host: "127.0.0.1", user: "fillip_qa", password: "fillip_qa", database: db });
 }
@@ -435,7 +433,8 @@ describe("QA round 8 over-cap delete and read combinations", () => {
     }
     if (view?.note?.includes("You're over the free plan") && gone) throw new Error("mismatch: kept note but the row is gone");
     let verdict: Verdict | "other" = "other";
-    if (view?.status === "active" && view.note?.includes(KEPT_NOTE)) verdict = "kept";
+    const keptNote = `You're over the free plan's 10 open reminders. ${upgradePrompt()}`;
+    if (view?.status === "active" && view.note?.includes(keptNote)) verdict = "kept";
     else if (error === UNCONFIRMED_SAVE) verdict = "unconfirmed";
     else if (/The free plan allows 10 open reminders/.test(error) && !view) verdict = "cap";
     return { verdict, error, view, row, writerDeletes: hosted.writerDeletes() };

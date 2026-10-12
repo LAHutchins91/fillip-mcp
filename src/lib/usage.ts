@@ -24,7 +24,19 @@ export const STAND_IN_CAPS: TierCaps = {
 };
 
 export const ALLOWANCE_REACHED = "This plan's reminder pings for the month are used up. Fillip will not send more until the allowance resets. Telegram counts toward this allowance, and a reminder delivered to both channels counts as 2.";
-export const UPGRADE_PROMPT = "Upgrade to Pro for a higher allowance. The trial is 14 days, then Pro.";
+
+/**
+ * The trial and yearly buttons are on GET /. There is no separate /account or /upgrade route.
+ * The URL is read when the message is built so it follows APP_BASE_URL.
+ */
+export function upgradePageUrl(env: NodeJS.ProcessEnv = process.env): string {
+  const base = (env.APP_BASE_URL || "http://localhost:3000").replace(/\/$/, "");
+  return `${base}/`;
+}
+
+export function upgradePrompt(env: NodeJS.ProcessEnv = process.env): string {
+  return `Upgrade to Pro at ${upgradePageUrl(env)}. The trial is 14 days, then Pro.`;
+}
 
 export type Allowance = {
   tier: PlanTier;
@@ -61,12 +73,12 @@ export function freeOpenReminders(caps: TierCaps): number {
 }
 
 export function allowanceReachedMessage(tier: PlanTier): string {
-  if (tier === "free" || tier === "trial") return `${ALLOWANCE_REACHED} ${UPGRADE_PROMPT}`;
+  if (tier === "free" || tier === "trial") return `${ALLOWANCE_REACHED} ${upgradePrompt()}`;
   return ALLOWANCE_REACHED;
 }
 
 export function freeOpenMessage(limit: number): string {
-  return `The free plan allows ${limit} open reminders. ${UPGRADE_PROMPT}`;
+  return `The free plan allows ${limit} open reminders. ${upgradePrompt()}`;
 }
 
 export function usageCapsConfigured(env: NodeJS.ProcessEnv = process.env): boolean {

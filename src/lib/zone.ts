@@ -158,6 +158,19 @@ export function formatShortWhen(date: Date, timeZone: string): string {
   return formatted.replace(",", " at");
 }
 
+/** "Tue Oct 13 at 9:00 AM" in the reminder's timezone. */
+export function formatNextOccurrence(date: Date, timeZone: string): string {
+  const formatted = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  }).format(date);
+  return formatted.replace(/,/g, "").replace(/(\d{1,2}:\d{2}\s*[AP]M)$/, "at $1");
+}
+
 export function formatWhen(date: Date, timeZone: string): string {
   return new Intl.DateTimeFormat("en-US", {
     timeZone,

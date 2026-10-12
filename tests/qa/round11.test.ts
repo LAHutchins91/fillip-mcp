@@ -213,7 +213,7 @@ describe("QA round 11 restore returns the exact prior status", () => {
       const store = new MemoryFillipStore();
       free(store, actor);
       const created = await setReminder(store, actor, { what: spec.what, when: "every day at 11am", timezone: "UTC" }, earlier);
-      if (spec.status === "completed") await completeOrCancel(store, actor.id, created.id, "complete", now);
+      if (spec.status === "completed") await completeOrCancel(store, actor.id, created.id, "complete", now, true);
       if (spec.status === "cancelled") await completeOrCancel(store, actor.id, created.id, "cancel", now);
       const before = await rowOf(store, created.id);
       if (spec.status === "fired") {

@@ -20,7 +20,7 @@ import { NOT_DELIVERED_NOTE, listReminders, setReminder } from "../../src/lib/re
 import { MemoryFillipStore } from "../../src/lib/memory-store.js";
 import { SupabaseFillipStore, type Db } from "../../src/lib/supabase-store.js";
 import type { Actor, Delivery, Reminder } from "../../src/lib/types.js";
-import { blankContact, STAND_IN_CAPS } from "../../src/lib/usage.js";
+import { blankContact, STAND_IN_CAPS, upgradePrompt } from "../../src/lib/usage.js";
 
 const actor: Actor = { id: "22222222-2222-4222-8222-222222222222", email: "owner@example.com", emailVerified: true };
 const caps = STAND_IN_CAPS;
@@ -566,7 +566,7 @@ describe("QA round 5 cap refusals and the post-insert pass", () => {
       const text = JSON.stringify(result);
       expect(result.isError, text).toBeFalsy();
       expect(text).toMatch(/You're over the free plan's 10 open reminders\./);
-      expect(text).toMatch(/Upgrade to Pro for a higher allowance\. The trial is 14 days, then Pro\./);
+      expect(text).toContain(upgradePrompt());
       expect(text).toMatch(/"status":"active"/);
       expect(text).not.toMatch(/may not have been saved|secret-note|owner@example.com|delete failed|token=secret/);
       expect(lines.join("\n")).toContain("open_cap_delete_failed");
@@ -645,7 +645,7 @@ describe("QA round 5 cap refusals and the post-insert pass", () => {
       const view = await setReminder(store, actor, { what: "still due", when: "tomorrow 9am", timezone: "UTC" }, now, caps);
       expect(serviceDeletes).toBe(1);
       expect(view.status).toBe("active");
-      expect(view.note).toMatch(/You're over the free plan's 10 open reminders\. Upgrade to Pro for a higher allowance\. The trial is 14 days, then Pro\./);
+      expect(view.note).toContain(`You're over the free plan's 10 open reminders. ${upgradePrompt()}`);
       expect(view.note).not.toMatch(/may not have been saved/);
       expect((await store.getReminder(actor.id, view.id))?.status).toBe("active");
       expect(lines.join("\n")).toContain("open_cap_delete_failed");
@@ -670,7 +670,7 @@ describe("QA round 5 cap refusals and the post-insert pass", () => {
     const olderId = randomUUID();
     const hosted = hostedOverCap(actor.id, olderId);
     const store = new SupabaseFillipStore(null, hosted.db, "service");
-    await expect(setReminder(store, actor, { what: "should not stick", when: "tomorrow 9am", timezone: "UTC" }, now, caps)).rejects.toThrow(/The free plan allows 10 open reminders\. Upgrade to Pro for a higher allowance\. The trial is 14 days, then Pro\./);
+    await expect(setReminder(store, actor, { what: "should not stick", when: "tomorrow 9am", timezone: "UTC" }, now, caps)).rejects.toThrow(`The free plan allows 10 open reminders. ${upgradePrompt()}`);
     expect(hosted.deleted).toHaveLength(1);
     const ownId = hosted.deleted[0];
     expect(hosted.deleted).toEqual([ownId]);

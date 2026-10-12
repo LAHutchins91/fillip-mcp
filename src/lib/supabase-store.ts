@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { ClaimResult, Delivery, DeliveryChannel, DigestSettings, OwnerContact, OwnerIdentity, PlanName, Recurrence, Reminder, ReminderStatus } from "./types.js";
 import { openCapMessage, UNCONFIRMED_SAVE } from "./errors.js";
 import { OpenCapError, OpenCapKeptError, ReminderConflictError, type ListQuery, type OpenCap, type SendReserve, type SendReserveResult, type ServiceStore } from "./store.js";
-import { sentThisMonth, UPGRADE_PROMPT, usagePeriodCurrent } from "./usage.js";
+import { sentThisMonth, upgradePrompt, usagePeriodCurrent } from "./usage.js";
 import { zonedParts, zonedTimeToUtc } from "./zone.js";
 
 export type Db = (pathname: string, options?: RequestInit) => Promise<unknown>;
@@ -259,7 +259,7 @@ export class SupabaseFillipStore implements ServiceStore {
 
     this.logCapDeleteFailed(failure);
     const limit = open.cap;
-    throw new OpenCapKeptError(saved, `You're over the free plan's ${limit} open reminders. ${UPGRADE_PROMPT}`);
+    throw new OpenCapKeptError(saved, `You're over the free plan's ${limit} open reminders. ${upgradePrompt()}`);
   }
 
   /** DELETE ... WHERE id = this row RETURNING id. An empty body is not proof the row is gone. */
@@ -297,8 +297,9 @@ export class SupabaseFillipStore implements ServiceStore {
   }
 
   private capError(open: OpenCap): OpenCapError {
-    const message = open.message.startsWith("The free plan") && !open.message.includes(UPGRADE_PROMPT)
-      ? `${open.message} ${UPGRADE_PROMPT}`
+    const prompt = upgradePrompt();
+    const message = open.message.startsWith("The free plan") && !open.message.includes(prompt)
+      ? `${open.message} ${prompt}`
       : open.message;
     return new OpenCapError(message);
   }

@@ -2,10 +2,10 @@ import { openCapMessage } from "./errors.js";
 import { calendarFeed } from "./ics.js";
 import { newId, OpenCapError, OpenCapKeptError, type DeliveryMark, type OpenCap, type ReminderStore, type ServiceStore } from "./store.js";
 import { newSecretToken, telegramDeepLink, telegramUsername } from "./telegram.js";
-import { applyRepeat, attachEndDate, describeRecurrence, nextFire, parseClock, recurrenceFromCadence, resolveWhen, WhenError, type RepeatChoice, type ResolvedWhen } from "./time.js";
+import { advanceSeries, applyRepeat, attachEndDate, describeRecurrence, nextFire, parseClock, recurrenceFromCadence, resolveWhen, WhenError, type RepeatChoice, type ResolvedWhen } from "./time.js";
 import { MAX_ACTIVE_REMINDERS, MAX_CREATES_PER_HOUR, type Actor, type DeliveryChannel, type DigestSettings, type Reminder, type ReminderStatus } from "./types.js";
 import { allowanceFor, assertWithinAllowance, freeOpenMessage, freeOpenReminders, STAND_IN_CAPS, tierFor, type Allowance, type TierCaps } from "./usage.js";
-import { assertTimeZone, formatClock, formatShortWhen, formatWhen, localDateKey, zonedParts } from "./zone.js";
+import { assertTimeZone, formatClock, formatNextOccurrence, formatShortWhen, formatWhen, localDateKey, zonedParts } from "./zone.js";
 
 /** A removed reminder can be restored until this long after removed_at. The delivery cron then deletes it. */
 export const REMOVE_RETAIN_MS = 30 * 24 * 60 * 60 * 1000;
@@ -142,7 +142,7 @@ function followNote(channel: DeliveryChannel, recurrence: Reminder["recurrence"]
   const ended = Boolean(recurrence?.ends && (recurrence.ends.until || recurrence.ends.count));
   const stop = ended
     ? "It stops at that limit even if it is not marked done."
-    : "It keeps going until you mark it done.";
+    : "It keeps going until you stop the series.";
   if (channel === "telegram") return `Fillip will keep pinging your Telegram chat ${repeats}. ${stop}`;
   if (channel === "both") return `Fillip will keep emailing you and pinging Telegram ${repeats}. ${stop}`;
   return `Fillip will keep emailing you ${repeats}. ${stop}`;
@@ -445,10 +445,37 @@ export async function restoreReminder(store: ReminderStore, ownerId: string, id:
   return view(saved, now, { note });
 }
 
-export async function completeOrCancel(store: ReminderStore, ownerId: string, id: string, action: "complete" | "cancel", now: Date): Promise<ReminderView> {
+export async function completeOrCancel(store: ReminderStore, ownerId: string, id: string, action: "complete" | "cancel", now: Date, endSeries = false): Promise<ReminderView> {
   const reminder = await store.getReminder(ownerId, id);
   if (!reminder) throw new Error("Reminder not found");
   if (reminder.status === "removed") throw new Error("That reminder was removed. Restore it to change it.");
+  const finishOccurrence = action === "complete" && Boolean(reminder.recurrence) && !endSeries && reminder.status !== "completed" && reminder.status !== "cancelled";
+  if (finishOccurrence && reminder.recurrence) {
+    const series = advanceSeries(reminder.recurrence);
+    const after = new Date(Math.max(new Date(reminder.fireAt).getTime(), now.getTime()));
+    const next = series.done ? null : nextFire(series.recurrence, reminder.timezone, after);
+    if (next) {
+      const paused = reminder.status === "paused";
+      const saved = await store.saveReminder({
+        ...reminder,
+        recurrence: series.recurrence,
+        status: paused ? "paused" : "active",
+        fireAt: next.toISOString(),
+        holdUntil: paused ? reminder.holdUntil : null,
+        updatedAt: now.toISOString()
+      });
+      return view(saved, now, { note: `Done for today. Next: ${formatNextOccurrence(next, reminder.timezone)}.` });
+    }
+    const saved = await store.saveReminder({
+      ...reminder,
+      recurrence: series.recurrence,
+      status: "completed",
+      holdUntil: null,
+      completedAt: now.toISOString(),
+      updatedAt: now.toISOString()
+    });
+    return view(saved, now, { note: "Done. That was the last one." });
+  }
   const status: ReminderStatus = action === "complete" ? "completed" : "cancelled";
   const saved = await store.saveReminder({
     ...reminder,
@@ -457,9 +484,11 @@ export async function completeOrCancel(store: ReminderStore, ownerId: string, id
     completedAt: action === "complete" ? now.toISOString() : reminder.completedAt,
     updatedAt: now.toISOString()
   });
-  const note = action === "complete"
-    ? "Marked done. Fillip will stop nudging you about this."
-    : "Cancelled. Fillip will not email you about this.";
+  const note = action === "cancel"
+    ? "Cancelled. Fillip will not email you about this."
+    : reminder.recurrence
+      ? "Marked done. Fillip will stop this series."
+      : "Marked done. Fillip will stop nudging you about this.";
   return view(saved, now, { note });
 }
 

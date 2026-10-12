@@ -759,11 +759,14 @@ describe("QA round 10 sign-out, lock copy, and tool text", () => {
     expect(forged.text).not.toContain("bad-upstream-detail");
     const client = await post(mcp);
     expect(client.status).toBe(403);
+    expect(JSON.parse(client.text).message).toBe("Sign out everywhere needs the session from signing in, not a connection token.");
+    expect(client.text).not.toContain("Fillip could not sign out every session");
     expect(client.text).not.toContain("upstream-user-detail");
     expect(client.text).not.toContain(mcp);
     expect(client.text).not.toContain("gotrue");
     const audience = await post(audOnly);
     expect(audience.status).toBe(403);
+    expect(JSON.parse(audience.text).message).toBe("Sign out everywhere needs the session from signing in, not a connection token.");
     expect(audience.text).not.toContain("upstream-user-detail");
     expect(logouts).toEqual([]);
     const signedOut = await post(session);

@@ -4,7 +4,7 @@ import { completeOrCancel, followUp, listReminders, removeReminder, saveDigestSe
 import { ReminderConflictError } from "../src/lib/store.js";
 import { WhenError } from "../src/lib/time.js";
 import { MAX_ACTIVE_REMINDERS, type Actor, type Delivery, type Reminder } from "../src/lib/types.js";
-import { ALLOWANCE_REACHED, freeEmailsPerMonth, freeOpenMessage, freeOpenReminders, monthStart, tierCapsFromEnv, UPGRADE_PROMPT } from "../src/lib/usage.js";
+import { ALLOWANCE_REACHED, allowanceReachedMessage, freeEmailsPerMonth, freeOpenMessage, freeOpenReminders, monthStart, tierCapsFromEnv, upgradePageUrl, upgradePrompt } from "../src/lib/usage.js";
 
 const now = new Date("2026-10-11T18:00:00.000Z");
 const actor: Actor = { id: "11111111-1111-4111-8111-111111111111", email: "owner@example.com", emailVerified: true };
@@ -43,6 +43,73 @@ describe("reminder CRUD", () => {
     await expect(snoozeOrReschedule(store, actor.id, other.id, "tomorrow 9am", undefined, now)).rejects.toThrow(/already cancelled/);
   });
 
+  it("completes one occurrence of a series and ends it only when asked", async () => {
+    const store = storeWithActor();
+    const created = await setReminder(store, actor, {
+      what: "Standup",
+      when: "every day at 9am",
+      timezone: "America/New_York"
+    }, new Date("2026-10-11T16:00:00.000Z"));
+    const before = await store.getReminder(actor.id, created.id);
+    if (!before) throw new Error("missing reminder");
+    const done = await completeOrCancel(store, actor.id, created.id, "complete", new Date("2026-10-12T14:00:00.000Z"));
+    expect(done.status).toBe("active");
+    expect(done.id).toBe(created.id);
+    expect(done.fireAt).not.toBe(before.fireAt);
+    expect(new Date(done.fireAt).getTime()).toBeGreaterThan(new Date(before.fireAt).getTime());
+    expect(done.note).toBe("Done for today. Next: Tue Oct 13 at 9:00 AM.");
+    const stored = await store.getReminder(actor.id, created.id);
+    expect(stored?.status).toBe("active");
+    expect(stored?.fireAt).toBe(done.fireAt);
+
+    const stopped = await completeOrCancel(store, actor.id, created.id, "complete", new Date("2026-10-12T14:00:00.000Z"), true);
+    expect(stopped.status).toBe("completed");
+    expect(stopped.note).toBe("Marked done. Fillip will stop this series.");
+    expect((await store.getReminder(actor.id, created.id))?.status).toBe("completed");
+
+    const series = await setReminder(store, actor, {
+      what: "Daily until stopped",
+      when: "every day at 9am",
+      timezone: "UTC"
+    }, new Date("2026-10-11T16:00:00.000Z"));
+    const seriesBefore = await store.getReminder(actor.id, series.id);
+    const cancelled = await completeOrCancel(store, actor.id, series.id, "cancel", new Date("2026-10-12T14:00:00.000Z"));
+    expect(cancelled.status).toBe("cancelled");
+    expect(cancelled.fireAt).toBe(seriesBefore?.fireAt);
+
+    const last = await setReminder(store, actor, {
+      what: "One last standup",
+      when: "every day at 9am for 1 times",
+      timezone: "UTC"
+    }, new Date("2026-10-11T16:00:00.000Z"));
+    const finished = await completeOrCancel(store, actor.id, last.id, "complete", new Date("2026-10-12T14:00:00.000Z"));
+    expect(finished.status).toBe("completed");
+    expect(finished.note).toBe("Done. That was the last one.");
+  });
+
+  it("names the upgrade page when a free monthly ping cap is hit", async () => {
+    const store = storeWithActor();
+    await store.rememberOwner({
+      id: actor.id,
+      email: actor.email,
+      emailVerified: true,
+      plan: "free",
+      subscriptionStatus: "none"
+    });
+    const contact = store.contacts.get(actor.id);
+    if (!contact) throw new Error("missing contact");
+    contact.emailsSentInPeriod = 2;
+    contact.emailPeriodStart = monthStart(now).toISOString();
+    const caps = { trialEmailsPerMonth: 30, proEmailsPerMonth: 60, annualEmailsPerMonth: 60, freeEmailsPerMonth: 2 };
+    await expect(setReminder(store, actor, {
+      what: "Over the month",
+      when: "tomorrow 9am",
+      timezone: "UTC"
+    }, now, caps)).rejects.toThrow(allowanceReachedMessage("free"));
+    expect(allowanceReachedMessage("free")).toContain(upgradePageUrl());
+    expect(allowanceReachedMessage("pro")).toBe(ALLOWANCE_REACHED);
+  });
+
   it("keeps a follow-up repeating until it is marked done", async () => {
     const store = storeWithActor();
     const follow = await followUp(store, actor, {
@@ -53,7 +120,7 @@ describe("reminder CRUD", () => {
     }, now);
     expect(follow.kind).toBe("follow_up");
     expect(follow.repeats).toMatch(/weekday/);
-    expect(follow.note).toMatch(/until you mark it done/);
+    expect(follow.note).toMatch(/until you stop the series/);
     const saved = await store.getReminder(actor.id, follow.id);
     expect(saved?.recurrence).toEqual({ kind: "weekdays", hour: 9, minute: 0 });
 
@@ -215,7 +282,10 @@ describe("reminder CRUD", () => {
     await expect(setReminder(store, actor, { what: "Three", when: "tomorrow 11am", timezone: "UTC" }, now, caps))
       .rejects.toThrow(freeOpenMessage(2));
     await expect(setReminder(store, actor, { what: "Three", when: "tomorrow 11am", timezone: "UTC" }, now, caps))
-      .rejects.toThrow(UPGRADE_PROMPT);
+      .rejects.toThrow(upgradePrompt());
+    expect(freeOpenMessage(2)).toBe(`The free plan allows 2 open reminders. ${upgradePrompt()}`);
+    expect(upgradePrompt()).toBe(`Upgrade to Pro at ${upgradePageUrl()}. The trial is 14 days, then Pro.`);
+    expect(upgradePageUrl()).toMatch(/^https?:\/\/[^ ]+\/$/);
     expect(freeOpenReminders(tierCapsFromEnv({}))).toBe(10);
     expect(freeEmailsPerMonth(tierCapsFromEnv({}))).toBe(30);
     expect(tierCapsFromEnv({ FILLIP_CAP_FREE_OPEN_REMINDERS: "4", FILLIP_CAP_FREE_EMAILS_PER_MONTH: "12" }))

@@ -17,8 +17,8 @@ After you approve the connection, the server exposes these tools:
 - `set_reminder` — “next Tue 2pm”, “every weekday 9am”, “first Monday of every month”, or “every 2 weeks until Dec”, in your timezone. Fillip reads the time itself. A past date or a wrong year is rejected or moved forward, and the assistant is told which. Repeats can be every N days or weeks, a calendar date each month, or the nth weekday each month, and they can stop on a date or after a count. Leave `repeat` off when the words already include the schedule. A `repeat` value that disagrees is rejected, so a monthly rule or an end date is not replaced.
 - `list_reminders` — includes a delayed state when a ping was held past its due time
 - `snooze_or_reschedule` — move a reminder, pause it so it does not send, or resume it onto the next future occurrence
-- `complete_or_cancel` — marking a follow-up done stops the nudges
-- `follow_up` — without an end, it nags until you mark it done. “until Dec” or “for 6 times” stops the follow-up at that limit even if it is not marked done
+- `complete_or_cancel` — complete finishes this occurrence of a repeating reminder and schedules the next one. Pass `end_series` when they ask to stop the whole series. A one-time reminder is marked done. Cancel stops it.
+- `follow_up` — without an end, it nags until you stop the series with `end_series`. “until Dec” or “for 6 times” stops the follow-up at that limit even if it is not marked done
 - `digest_settings` — an optional once-a-day email summary
 - `calendar_feed` — a private calendar subscription link, and a way to rotate it
 - `delivery_settings` — only when Telegram is configured: link the bot, unlink it, or set the default channel
@@ -27,7 +27,7 @@ Creating a reminder opts you in. Fillip emails only the verified address on that
 
 If the shared mail guard or the email provider holds a reminder past its due time, the email says it was delayed and by how long. `list_reminders` shows that same delayed state. The reminder stays queued. It is not marked sent and it is not dropped.
 
-Each plan has its own monthly ping allowance. A ping is one reminder send. Telegram counts, and a reminder delivered to both email and Telegram counts as 2. The free plan also caps how many reminders can stay open. The numbers are configuration, not printed here. When a free or trial cap is hit, the tool says so and tells you that Pro has a higher allowance. A heavier month cannot cost more than that plan pays for. After the trial, an account that does not continue stays on the free plan and keeps using reminders inside those caps.
+Each plan has its own monthly ping allowance. A ping is one reminder send. Telegram counts, and a reminder delivered to both email and Telegram counts as 2. The free plan also caps how many reminders can stay open. The numbers are configuration, not printed here. When a free or trial cap is hit, the tool says so and includes the address of this site, where the trial starts. A heavier month cannot cost more than that plan pays for. After the trial, an account that does not continue stays on the free plan and keeps using reminders inside those caps.
 
 When Telegram is configured, a reminder can go by email, Telegram, or both. Each of those is a ping, so both counts as 2. Telegram does not count toward the shared email guard. Unlinking stops that chat. If the bot token is unset, Telegram tools and the webhook are absent.
 
