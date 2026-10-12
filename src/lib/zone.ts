@@ -167,8 +167,10 @@ export function formatNextOccurrence(date: Date, timeZone: string): string {
     day: "numeric",
     hour: "numeric",
     minute: "2-digit"
-  }).format(date);
-  return formatted.replace(/,/g, "").replace(/(\d{1,2}:\d{2}\s*[AP]M)$/, "at $1");
+  }).format(date).replace(/,/g, "");
+  const clockAt = formatted.search(/\d{1,2}:\d{2}\s*[AP]M$/);
+  if (clockAt < 0) return formatted;
+  return `${formatted.slice(0, clockAt).trimEnd()} at ${formatted.slice(clockAt)}`;
 }
 
 export function formatWhen(date: Date, timeZone: string): string {
