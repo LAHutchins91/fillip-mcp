@@ -46,6 +46,10 @@ export function delayLength(reminder: Pick<Reminder, "fireAt" | "holdUntil" | "s
   return formatDelay(late);
 }
 
+function nextReminderNote(when: Date, timeZone: string): string {
+  return `Done. Next reminder: ${formatNextOccurrence(when, timeZone)}.`;
+}
+
 function wouldNextSend(reminder: Reminder, now: Date): string | null {
   if (reminder.status !== "paused") return null;
   let when = new Date(reminder.fireAt);
@@ -451,8 +455,14 @@ export async function completeOrCancel(store: ReminderStore, ownerId: string, id
   if (reminder.status === "removed") throw new Error("That reminder was removed. Restore it to change it.");
   const finishOccurrence = action === "complete" && Boolean(reminder.recurrence) && !endSeries && reminder.status !== "completed" && reminder.status !== "cancelled";
   if (finishOccurrence && reminder.recurrence) {
+    const occurrenceAt = new Date(reminder.fireAt);
+    // The stored time is already the next occurrence. Completing again, including
+    // a second call in the same moment, must not skip another step.
+    if (occurrenceAt.getTime() > now.getTime()) {
+      return view(reminder, now, { note: nextReminderNote(occurrenceAt, reminder.timezone) });
+    }
     const series = advanceSeries(reminder.recurrence);
-    const after = new Date(Math.max(new Date(reminder.fireAt).getTime(), now.getTime()));
+    const after = new Date(Math.max(occurrenceAt.getTime(), now.getTime()));
     const next = series.done ? null : nextFire(series.recurrence, reminder.timezone, after);
     if (next) {
       const paused = reminder.status === "paused";
@@ -464,7 +474,7 @@ export async function completeOrCancel(store: ReminderStore, ownerId: string, id
         holdUntil: paused ? reminder.holdUntil : null,
         updatedAt: now.toISOString()
       });
-      return view(saved, now, { note: `Done for today. Next: ${formatNextOccurrence(next, reminder.timezone)}.` });
+      return view(saved, now, { note: nextReminderNote(next, reminder.timezone) });
     }
     const saved = await store.saveReminder({
       ...reminder,

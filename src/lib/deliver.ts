@@ -534,7 +534,7 @@ export async function runDueJob(options: {
                 if (!(await options.store.confirmActiveSend(marked))) {
                   report.skipped += 1;
                 } else {
-                  const result = await options.telegram.sender.send(contact.telegramChatId, telegramText(reminder, options.now), idempotencyKey);
+                  const result = await options.telegram.sender.send(contact.telegramChatId, telegramText({ ...reminder, fireAt: claim.delivery.occurrenceAt }, options.now), idempotencyKey);
                   keep = true;
                   await options.store.saveDelivery({ ...marked, status: "sent", providerId: result.id, sentAt: nowIso, error: null });
                   await noteSent(options.store, contact, options.now, reminder.timezone);
@@ -677,7 +677,8 @@ export async function runDueJob(options: {
               marked = await markAttempt(options.store, claim.delivery);
               const stopUrl = stopLink(options.appBaseUrl, reminder.ownerId, options.unsubscribeSecret, options.now);
               const fresh = await options.store.getReminder(reminder.ownerId, reminder.id) ?? reminder;
-              const message = messageForReminder(fresh, options.from, to, stopUrl, options.now);
+              const claimed = { ...fresh, fireAt: claim.delivery.occurrenceAt };
+              const message = messageForReminder(claimed, options.from, to, stopUrl, options.now);
               await takeSlot();
               if (!(await options.store.confirmActiveSend(marked))) {
                 report.skipped += 1;

@@ -137,7 +137,10 @@ function withinEnd(recurrence: Recurrence, instant: Date): Date | null {
 
 function instantAfter(year: number, month: number, day: number, hour: number, minute: number, timeZone: string, after: Date): Date | null {
   const wall = interpretWall(year, month, day, hour, minute, timeZone);
-  for (const instant of wall.instants) {
+  // A fall-back hour happens twice. That clock is one occurrence, the earlier
+  // instant. The later one is the same morning, not the next day.
+  const candidates = wall.ambiguous ? wall.instants.slice(0, 1) : wall.instants;
+  for (const instant of candidates) {
     if (instant.getTime() > after.getTime()) return instant;
   }
   return null;

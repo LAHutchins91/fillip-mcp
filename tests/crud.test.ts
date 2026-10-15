@@ -57,7 +57,7 @@ describe("reminder CRUD", () => {
     expect(done.id).toBe(created.id);
     expect(done.fireAt).not.toBe(before.fireAt);
     expect(new Date(done.fireAt).getTime()).toBeGreaterThan(new Date(before.fireAt).getTime());
-    expect(done.note).toBe("Done for today. Next: Tue Oct 13 at 9:00 AM.");
+    expect(done.note).toBe("Done. Next reminder: Tue Oct 13 at 9:00 AM.");
     const stored = await store.getReminder(actor.id, created.id);
     expect(stored?.status).toBe("active");
     expect(stored?.fireAt).toBe(done.fireAt);
