@@ -1,0 +1,12 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.LAHutchins91/fillip",
+  "title": "Fillip by Ouroboros",
+  "description": "Reminders and follow-ups that fire from any AI chat, even when the laptop is off.",
+  "version": "1.0.0",
+  "websiteUrl": "https://ouroborosapps.com",
+  "repository": {
+    "url": "https://github.com/LAHutchins91/fillip-mcp",
+    "source": "github"
+  }
+}
