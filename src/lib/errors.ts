@@ -28,6 +28,7 @@ const KNOWN = [
   "Name a time to move this reminder",
   "That reminder changed while a ping was going out",
   "Choose a timezone",
+  "is an abbreviation, not a timezone",
   "Digest time",
   "That date is not a real calendar day",
   "Follow-ups need a first time or a cadence",

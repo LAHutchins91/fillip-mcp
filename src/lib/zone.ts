@@ -20,17 +20,19 @@ const IANA_ZONE_ERROR = "Choose a timezone from the IANA list, such as America/N
 export function assertTimeZone(timeZone: string): string {
   const zone = timeZone.trim();
   if (!zone) throw new Error(IANA_ZONE_ERROR);
-  if (CANONICAL_UTC.has(zone)) return zone;
+  let canonical: string;
   try {
     // supportedValuesOf("timeZone") on Node 22 omits current IANA names
     // (Asia/Kolkata, Europe/Kyiv, and others) that ICU still accepts.
-    new Intl.DateTimeFormat("en-US", { timeZone: zone });
+    canonical = new Intl.DateTimeFormat("en-US", { timeZone: zone }).resolvedOptions().timeZone;
   } catch {
     throw new Error(IANA_ZONE_ERROR);
   }
   // Intl also accepts abbreviations such as EST and PST. Those are not IANA ids.
-  if (!zone.includes("/")) throw new Error(IANA_ZONE_ERROR);
-  return zone;
+  if (!zone.includes("/") && !CANONICAL_UTC.has(zone)) {
+    throw new Error(`${zone} is an abbreviation, not a timezone; use a city like America/New_York`);
+  }
+  return canonical;
 }
 
 export function zonedParts(date: Date, timeZone: string): ZonedParts {

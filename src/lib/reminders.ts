@@ -187,14 +187,15 @@ export async function setReminder(store: ReminderStore, actor: Actor, input: {
   channel?: DeliveryChannel;
   acceptShiftedTime?: boolean;
 }, now: Date, caps: TierCaps = STAND_IN_CAPS, telegramEnabled = false): Promise<ReminderView> {
-  let resolved = applyRepeat(resolveWhen(input.when, input.timezone, now), input.repeat, input.timezone);
-  if (input.until?.trim()) resolved = attachEndDate(resolved, input.until, input.timezone, now);
-  refuseSilentShift(resolved, input.acceptShiftedTime, input.timezone);
+  const timezone = assertTimeZone(input.timezone.trim());
+  let resolved = applyRepeat(resolveWhen(input.when, timezone, now), input.repeat, timezone);
+  if (input.until?.trim()) resolved = attachEndDate(resolved, input.until, timezone, now);
+  refuseSilentShift(resolved, input.acceptShiftedTime, timezone);
   await gate(store, actor, now, caps);
   await assertWithinAllowance(store, actor.id, now, caps);
   const usage = await store.getUsage(actor.id);
   const channel = chosenChannel(input.channel, usage?.defaultChannel, telegramEnabled);
-  const draft = stamp(actor, input.what, input.context ?? null, input.timezone, resolved, "reminder", channel, now);
+  const draft = stamp(actor, input.what, input.context ?? null, timezone, resolved, "reminder", channel, now);
   const note = [resolved.note, channelNote(channel)].filter(Boolean).join(" ");
   return createOrRefuse(store, draft, openCapFor(usage, caps), now, { corrected: resolved.corrected, note });
 }
@@ -313,7 +314,8 @@ export async function snoozeOrReschedule(store: ReminderStore, ownerId: string, 
   if (reminder.status === "cancelled" || reminder.status === "completed") {
     throw new Error(`That reminder is already ${reminder.status}.`);
   }
-  const zone = timezone || reminder.timezone;
+  const requested = timezone?.trim();
+  const zone = requested ? assertTimeZone(requested) : reminder.timezone;
   const repeat = schedule?.repeat?.trim();
   const end = schedule?.end?.trim();
   const text = schedule?.what?.trim();
@@ -512,32 +514,33 @@ export async function followUp(store: ReminderStore, actor: Actor, input: {
   channel?: DeliveryChannel;
   acceptShiftedTime?: boolean;
 }, now: Date, caps: TierCaps = STAND_IN_CAPS, telegramEnabled = false): Promise<ReminderView> {
+  const timezone = assertTimeZone(input.timezone.trim());
   if (!input.after && !input.cadence) throw new Error("Follow-ups need a first time or a cadence, such as next Tuesday at 2pm.");
   let first: ResolvedWhen;
   if (input.after) {
-    first = resolveWhen(input.after, input.timezone, now);
-    if (input.cadence) first = { ...first, recurrence: recurrenceFromCadence(input.cadence, input.timezone, now) };
+    first = resolveWhen(input.after, timezone, now);
+    if (input.cadence) first = { ...first, recurrence: recurrenceFromCadence(input.cadence, timezone, now) };
   } else {
-    const recurrence = recurrenceFromCadence(input.cadence ?? "", input.timezone, now);
-    const fireAt = nextFire(recurrence, input.timezone, now);
+    const recurrence = recurrenceFromCadence(input.cadence ?? "", timezone, now);
+    const fireAt = nextFire(recurrence, timezone, now);
     if (!fireAt) throw new Error("That repeating reminder has already ended.");
     first = { fireAt, recurrence, corrected: false, note: null };
   }
   if (!first.recurrence) {
-    const parts = zonedParts(first.fireAt, input.timezone);
+    const parts = zonedParts(first.fireAt, timezone);
     first = {
       ...first,
       recurrence: { kind: "weekly", weekday: parts.weekday, hour: parts.hour, minute: parts.minute }
     };
   }
-  if (input.until?.trim()) first = attachEndDate(first, input.until, input.timezone, now);
-  refuseSilentShift(first, input.acceptShiftedTime, input.timezone);
+  if (input.until?.trim()) first = attachEndDate(first, input.until, timezone, now);
+  refuseSilentShift(first, input.acceptShiftedTime, timezone);
   await gate(store, actor, now, caps);
   await assertWithinAllowance(store, actor.id, now, caps);
   const usage = await store.getUsage(actor.id);
   const channel = chosenChannel(input.channel, usage?.defaultChannel, telegramEnabled);
-  const draft = stamp(actor, input.topic, input.context ?? null, input.timezone, first, "follow_up", channel, now);
-  const note = [first.note, followNote(channel, draft.recurrence, input.timezone)].filter(Boolean).join(" ");
+  const draft = stamp(actor, input.topic, input.context ?? null, timezone, first, "follow_up", channel, now);
+  const note = [first.note, followNote(channel, draft.recurrence, timezone)].filter(Boolean).join(" ");
   return createOrRefuse(store, draft, openCapFor(usage, caps), now, { corrected: first.corrected, note });
 }
 

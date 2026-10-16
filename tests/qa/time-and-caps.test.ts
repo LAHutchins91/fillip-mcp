@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import { runDueJob } from "../../src/lib/deliver.js";
 import type { MailSender, OutboundEmail } from "../../src/lib/email.js";
 import { MemoryFillipStore } from "../../src/lib/memory-store.js";
-import { listReminders, setReminder } from "../../src/lib/reminders.js";
+import { followUp, listReminders, setReminder, snoozeOrReschedule } from "../../src/lib/reminders.js";
 import { nextFire, resolveWhen, WhenError } from "../../src/lib/time.js";
 import type { Actor } from "../../src/lib/types.js";
 import { STAND_IN_CAPS, tierCapsFromEnv, type TierCaps } from "../../src/lib/usage.js";
@@ -134,15 +134,47 @@ describe("QA time parsing", () => {
     const listed = new Set(Intl.supportedValuesOf("timeZone"));
     expect(listed.has("EST")).toBe(false);
     expect(listed.has("PST")).toBe(false);
-    expect(() => assertTimeZone("EST")).toThrow(/IANA/);
-    expect(() => assertTimeZone("PST")).toThrow(/IANA/);
+    expect(() => assertTimeZone("EST")).toThrow("EST is an abbreviation, not a timezone; use a city like America/New_York");
+    expect(() => assertTimeZone("PST")).toThrow("PST is an abbreviation, not a timezone; use a city like America/New_York");
   });
 
   it("accepts current IANA names missing from Node's timezone list", () => {
     for (const zone of ["Asia/Kolkata", "Asia/Kathmandu", "Europe/Kyiv", "Asia/Ho_Chi_Minh", "America/Argentina/Buenos_Aires"]) {
-      expect(assertTimeZone(zone)).toBe(zone);
+      const canonical = new Intl.DateTimeFormat("en-US", { timeZone: zone }).resolvedOptions().timeZone;
+      expect(assertTimeZone(zone)).toBe(canonical);
     }
     expect(() => assertTimeZone("Mars/Olympus")).toThrow(/IANA/);
+  });
+
+  it("trims a padded timezone on set, follow-up, and snooze", async () => {
+    const now = new Date("2026-10-12T12:00:00.000Z");
+    const store = new MemoryFillipStore();
+    const canonical = new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Kolkata" }).resolvedOptions().timeZone;
+    const set = await setReminder(store, actor, { what: "Pad", when: "tomorrow at 9am", timezone: " Asia/Kolkata " }, now, statedCaps);
+    expect(set.timezone).toBe(canonical);
+    const follow = await followUp(store, actor, { topic: "Pad", after: "tomorrow at 9am", timezone: " Asia/Kolkata " }, now, statedCaps);
+    expect(follow.timezone).toBe(canonical);
+    const moved = await snoozeOrReschedule(store, actor.id, set.id, "tomorrow at 10am", " Asia/Kolkata ", now);
+    expect(moved.timezone).toBe(canonical);
+  });
+
+  it("names the abbreviation that was passed", () => {
+    expect(() => assertTimeZone("CET")).toThrow("CET is an abbreviation, not a timezone; use a city like America/New_York");
+    expect(() => assertTimeZone("HST")).toThrow("HST is an abbreviation, not a timezone; use a city like America/New_York");
+  });
+
+  it("stores the canonical zone for lowercase input", async () => {
+    const now = new Date("2026-10-12T12:00:00.000Z");
+    const store = new MemoryFillipStore();
+    const canonical = new Intl.DateTimeFormat("en-US", { timeZone: "asia/kolkata" }).resolvedOptions().timeZone;
+    const set = await setReminder(store, actor, { what: "Case", when: "tomorrow at 9am", timezone: "asia/kolkata" }, now, statedCaps);
+    expect(set.timezone).toBe(canonical);
+    const follow = await followUp(store, actor, { topic: "Case", after: "tomorrow at 9am", timezone: "asia/kolkata" }, now, statedCaps);
+    expect(follow.timezone).toBe(canonical);
+    const moved = await snoozeOrReschedule(store, actor.id, set.id, "tomorrow at 11am", "asia/kolkata", now);
+    expect(moved.timezone).toBe(canonical);
+    const row = await store.getReminder(actor.id, set.id);
+    expect(row?.timezone).toBe(canonical);
   });
 
   it("QA-FAIL: in 1 day keeps the local clock across spring forward, or explains the shift", () => {
