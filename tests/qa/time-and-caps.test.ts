@@ -138,6 +138,13 @@ describe("QA time parsing", () => {
     expect(() => assertTimeZone("PST")).toThrow(/IANA/);
   });
 
+  it("accepts current IANA names missing from Node's timezone list", () => {
+    for (const zone of ["Asia/Kolkata", "Asia/Kathmandu", "Europe/Kyiv", "Asia/Ho_Chi_Minh", "America/Argentina/Buenos_Aires"]) {
+      expect(assertTimeZone(zone)).toBe(zone);
+    }
+    expect(() => assertTimeZone("Mars/Olympus")).toThrow(/IANA/);
+  });
+
   it("QA-FAIL: in 1 day keeps the local clock across spring forward, or explains the shift", () => {
     const at230 = new Date("2026-03-07T07:30:00.000Z");
     const resolved = resolveWhen("in 1 day", ny, at230);

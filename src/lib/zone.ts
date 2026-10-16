@@ -12,20 +12,24 @@ const WEEKDAY_INDEX: Record<string, number> = {
   sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6
 };
 
-/** Zones ICU accepts that some Node builds omit from supportedValuesOf. */
+/** UTC-family names that are valid zones but are not Area/Location ids. */
 const CANONICAL_UTC = new Set(["UTC", "Etc/UTC", "GMT", "Etc/GMT"]);
+
+const IANA_ZONE_ERROR = "Choose a timezone from the IANA list, such as America/New_York.";
 
 export function assertTimeZone(timeZone: string): string {
   const zone = timeZone.trim();
-  if (!zone) throw new Error("Choose a timezone from the IANA list, such as America/New_York.");
+  if (!zone) throw new Error(IANA_ZONE_ERROR);
   if (CANONICAL_UTC.has(zone)) return zone;
-  let listed = false;
   try {
-    listed = Intl.supportedValuesOf("timeZone").includes(zone);
+    // supportedValuesOf("timeZone") on Node 22 omits current IANA names
+    // (Asia/Kolkata, Europe/Kyiv, and others) that ICU still accepts.
+    new Intl.DateTimeFormat("en-US", { timeZone: zone });
   } catch {
-    listed = false;
+    throw new Error(IANA_ZONE_ERROR);
   }
-  if (!listed) throw new Error("Choose a timezone from the IANA list, such as America/New_York.");
+  // Intl also accepts abbreviations such as EST and PST. Those are not IANA ids.
+  if (!zone.includes("/")) throw new Error(IANA_ZONE_ERROR);
   return zone;
 }
 
